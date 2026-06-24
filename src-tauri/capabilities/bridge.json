@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "bridge",
+  "description": "Allow the hidden MISUMI bridge webview (remote jp.misumi-ec.com) to emit lookup results back to the app via the event system.",
+  "windows": ["bridge"],
+  "remote": {
+    "urls": ["https://jp.misumi-ec.com", "https://*.misumi-ec.com"]
+  },
+  "permissions": ["core:event:allow-emit"]
+}
