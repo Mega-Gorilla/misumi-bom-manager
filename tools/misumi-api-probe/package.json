@@ -1,0 +1,15 @@
+{
+  "name": "misumi-api-probe",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Reproducible probe for MISUMI internal price/delivery API (browser-based, Akamai-aware). See ../../docs/misumi-api/.",
+  "scripts": {
+    "lookup": "node probe.mjs lookup",
+    "batch": "node probe.mjs batch",
+    "sweep": "node probe.mjs sweep"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  }
+}
