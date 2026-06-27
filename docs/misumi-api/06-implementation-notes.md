@@ -33,7 +33,7 @@
        {
          method: "POST",
          headers: { "Content-Type": "application/json" },
-         credentials: "include",
+         // ⚠ credentials は付けない（下記「CORS の落とし穴」参照）
          body: JSON.stringify({ detailList: parts }) // [{qty, inputProductCode, brandCode}]
        }
      );
@@ -41,6 +41,15 @@
    }
    ```
 4. 結果を IPC でメイン UI に返す。
+
+> 🛑 **CORS の落とし穴（実装時に必ず踏む）**
+> api-jp への POST に **`credentials: "include"` を付けると `TypeError: Failed to fetch` で失敗する**。
+> api-jp は `Access-Control-Allow-Origin: *` を返すため、資格情報付きリクエストはブラウザの CORS チェックで拒否される。
+> **資格情報なし（既定 / omit）で呼ぶ**こと。未ログインの標準価格に Cookie は不要。
+> （`suggest` は同一オリジンなので credentials は無関係。）詳細は [05 §CORS](./05-akamai-and-auth.md)。
+
+> 🧩 **実装の単一ソース**：この fetch 連鎖は [`shared/misumi-lookup.js`](../../../shared/misumi-lookup.js) に一本化され、
+> Tauri 本体（`include_str!`）と CLI（`tools/misumi-cli`）が共用する。仕様変更時はそこ 1 か所を直す。テストは [08](./08-testing.md)。
 
 > `brandCode` が不明な型番は、先に
 > `GET https://jp.misumi-ec.com/api/v1/partNumber/suggest?applicationId=...&keyword=<型番>`

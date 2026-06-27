@@ -38,6 +38,23 @@ MISUMI EC サイトは **Akamai Bot Manager** で全面的に保護されてい�
 - したがって、**`jp.misumi-ec.com` オリジン上で動く WebView から fetch すれば CORS は通る**。
   逆に、自前の `tauri://localhost` や `http://localhost` オリジンから直接叩くと CORS で弾かれる可能性が高い。
 
+### 🛑 credentials の落とし穴（実測で確認）
+
+`api-jp` への POST を **`credentials: "include"` で送ると `TypeError: Failed to fetch`** になる。
+実測比較（`jp.misumi-ec.com` ページ内 `fetch`）:
+
+| 呼び出し | 結果 |
+|---|---|
+| `suggest`（同一オリジン, include） | ✅ 200 |
+| `price` を `credentials: "include"` | ❌ Failed to fetch |
+| `price` を **資格情報なし（既定/omit）** | ✅ 200（単価取得） |
+
+理由：`api-jp` は `Access-Control-Allow-Origin: *` を返す。CORS 仕様上、`*` と資格情報付き（`include`）は **併用不可**のためブラウザがブロックする。
+→ **価格 API は資格情報なしで呼ぶ**こと（未ログインの標準価格に Cookie は不要）。
+本家アプリも api-jp 呼び出しは資格情報なし。`suggest` は同一オリジンなので影響なし。
+
+> 補足：Playwright の APIRequestContext や素の HTTP クライアントは CORS 非対象のため、`include` 相当でも通ってしまい、この罠は**ブラウザ内 fetch 特有**。WebView 実装（Tauri 本体）では必ず踏むので注意。
+
 ## 設計への含意（要点）
 
 1. **本物のブラウザエンジンを経由する**こと（= Tauri 内蔵 WebView2）。
