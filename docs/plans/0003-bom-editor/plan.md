@@ -48,7 +48,7 @@ type ColumnKey =
   | string; // custom.* / supplier.*
 
 interface ColumnLink {     // サプライヤ連携設定（任意）。設定した列はサプライヤ値で駆動される
-  field: string;           // 正規化フィールドのパス。例 "quote.unitPrice" / "product.name"
+  field: string;           // SupplierQuote 上のドットパス。例 "quote.unitPrice" / "product.name" / "raw.<provider固有>"
   write: "overwrite" | "fillEmpty" | "suggest"; // 列ごとに選択（既定 fillEmpty）
 }
 
@@ -62,23 +62,32 @@ interface ColumnDef {
 }
 
 // 各 EC の応答を共通形（正規化 quote）へ写像する。EC 固有データは raw に保持。
+// ColumnLink.field はこの構造上のドットパス（"product.*" / "quote.*" / "raw.*"）で解決する。
 interface SupplierQuote {
-  supplierCode: string;      // "MISUMI" など
+  supplierCode: string;        // "MISUMI" など
   status: "idle" | "pending" | "ok" | "error";
-  currency?: string;         // "JPY"/"USD" 等（多通貨）
-  unitPrice?: string;        // 税別
-  unitPriceTax?: string;     // 税込
-  taxRate?: string;
-  shipDate?: string;         // 出荷予定日（MISUMI: vsd）
-  leadTimeDays?: number;     // 出荷/納期日数
-  stock?: number;            // 即納可能数
-  moq?: number;              // 最小注文数
-  packQty?: number;          // 入数
-  subtotal?: number;         // 単価 × Qty × 倍率
+  product?: {                  // 品目同定・カタログ情報
+    name?: string;             // 商品/系列名（MISUMI: seriesName / productName）
+    brand?: string;            // メーカー（MISUMI: brandName）
+    partNo?: string;           // 正規化型番
+    category?: string;
+  };
+  quote?: {                    // 価格・納期・在庫
+    currency?: string;         // "JPY"/"USD" 等（多通貨）
+    unitPrice?: string;        // 税別
+    unitPriceTax?: string;     // 税込
+    taxRate?: string;
+    shipDate?: string;         // 出荷予定日（MISUMI: vsd）
+    leadTimeDays?: number;     // 出荷/納期日数
+    stock?: number;            // 即納可能数（MISUMI: immediateShippableQty）
+    moq?: number;              // 最小注文数（MISUMI: minSoQty）
+    packQty?: number;          // 入数
+    subtotal?: number;         // 単価 × Qty × 倍率
+  };
   errors: string[];
   warnings: string[];
-  fetchedAt?: string;        // ISO
-  raw?: unknown;             // プロバイダ固有の生レスポンス
+  fetchedAt?: string;          // ISO
+  raw?: unknown;               // プロバイダ固有の生レスポンス
 }
 
 interface BomRow {
@@ -195,10 +204,11 @@ interface SupplierProvider {
 ### 7.5 MISUMI プロバイダ実装（Phase 1）
 MISUMI は `transport:"webview"`。既存ブリッジ＋共有コア（`suggest`→`sales-price-delivery/check`、`MisumiCore.lookupMany`、≤100 件チャンク）。応答→正規化 quote の写像例：
 
-| 正規化フィールド | MISUMI ソース |
+| 正規化フィールド（`SupplierQuote` パス） | MISUMI ソース |
 |---|---|
 | `product.name` | `seriesName` / `productName` |
-| `quote.unitPrice` / `unitPriceTax` | `salesUnitPrice` / `…IncludingTax` |
+| `product.brand` | `brandName` |
+| `quote.unitPrice` / `quote.unitPriceTax` | `salesUnitPrice` / `salesUnitPriceIncludingTax` |
 | `quote.shipDate` | `vsd` |
 | `quote.stock` | `immediateShippableQty` |
 | `quote.moq` | `minSoQty` |
