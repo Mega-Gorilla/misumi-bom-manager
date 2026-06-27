@@ -25,6 +25,7 @@ BOM（部品表）を編集・管理し、`ORDER=MISUMI` の行に単価・出�
 - 編集グリッド: **AG Grid Community**
 - Excel 読込: **SheetJS (`xlsx`)**
 - 一括取得: バックエンド `lookup_parts`（`MisumiCore.lookupMany`、≤100件チャンク）
+- MISUMI 連携: フィールド→列のリンクは**ユーザー設定**（手動/リンク/追加 ＋ 書込ポリシー `overwrite`/`fillEmpty`/`suggest`、差異ハイライト）
 - 永続化: BOM はローカル JSON、列マッピングは再利用テンプレ
 
 関連: MISUMI API 仕様は [`../../misumi-api/`](../../misumi-api/)、バッチ上限は [`../../misumi-api/07-batch-and-limits.md`](../../misumi-api/07-batch-and-limits.md)。

@@ -27,14 +27,15 @@
 ### 機能要件
 - [ ] 編集表：行の追加・複製・削除・並べ替え、セルのインライン編集。
 - [ ] 列：既知列（No/PartsName/PartsNo/ORDER/Qty/MATERIAL）＋ **任意列の追加・改名・削除**。
-- [ ] MISUMI データ列（読み取り専用）：単価（税別/税込）・出荷日・在庫・小計・状態・メッセージ・取得日時。
+- [ ] MISUMI データ列：単価（税別/税込）・出荷日・在庫・小計・状態・メッセージ・取得日時 等を**追加列**として表示。
 - [ ] `ORDER=MISUMI` の行を **一括取得**（行ごとに結果/エラーを反映、進捗表示）。手動「再取得」あり。
+- [ ] **MISUMI フィールド → 列のリンク設定**：列ごとに 手動／リンク／追加 と書込ポリシー（`overwrite`/`fillEmpty`/`suggest`）をユーザー設定し、テンプレ保存（→ 7. MISUMI 連携）。
 - [ ] Excel 取込：シート選択 → ヘッダ行選択 → 列マッピング → プレビュー → 取込。マッピングは**テンプレ保存**で再利用。
 - [ ] 数量倍率（シートのパラメータ由来）を BOM 設定として保持し、小計に反映。
 - [ ] 保存・読込：BOM をローカル JSON 文書として保存／復元。
 
 ### 非機能要件
-- 数百行規模（実ファイルは ~200 行）で実用的な編集レスポンス。
+- 数百行規模で実用的な編集レスポンス。
 - 価格・出荷日は揮発性 → **取得日時を保持**し、価格を「真実の源」として永続化しない（再取得前提）。
 - MISUMI への配慮：一括は **≤100 件/リクエスト・低並列**（[misumi-api/07](../../misumi-api/07-batch-and-limits.md)）。
 
@@ -46,12 +47,18 @@ type ColumnKey =
   | "no" | "partsName" | "partsNo" | "order" | "qty" | "material" // core
   | string; // custom.* / misumi.*
 
+interface ColumnLink {     // MISUMI 連携設定（任意）。設定した列は MISUMI 値で駆動される
+  misumiField: string;     // 例 "product.seriesName" / "salesPrice.salesUnitPrice"
+  write: "overwrite" | "fillEmpty" | "suggest"; // 列ごとに選択（既定 fillEmpty）
+}
+
 interface ColumnDef {
   key: ColumnKey;
   label: string;
-  kind: ColumnKind;
-  editable: boolean;       // misumi 列は false
+  kind: ColumnKind;        // 由来: core / custom / misumi(追加列)
+  editable: boolean;
   width?: number;
+  link?: ColumnLink;       // 設定があれば MISUMI リンク列（手動列は undefined）
 }
 
 interface MisumiData {
@@ -119,12 +126,38 @@ Rust backend (既存ブリッジ WebView)
 
 ## 7. MISUMI 連携
 
+### 7.1 取得対象
 - 対象：`order` が MISUMI（既定は完全一致 "MISUMI"、設定で前方一致等に拡張可）の行。
 - 解決：`partsNo` を `suggest`（共有コア）で正規化し `brandCode` を得てから `lookupMany`。
-- 反映：行ごとに `MisumiData`（単価・出荷日・在庫・状態・`errorMessageList`/`warningMessageList`）。
-  - 行レベルエラー（例: 最小注文数 `【数量エラー】…`）は #1 と同様に明示表示。
+- 取得日時を保持し「再取得」で更新。行レベルエラー（例: 最小注文数 `【数量エラー】…`）は #1 と同様に明示表示。
+
+### 7.2 MISUMI フィールド → 列のマッピング（ユーザー設定）
+MISUMI は多数のフィールドを返すため、「どのフィールドをどの列に結ぶか」を**固定せずユーザー設定**にする（Excel 取込マッピングと対の概念）。各列は 3 つの役割を持つ：
+- **手動(manual)**：MISUMI は書き込まない（REMARKS / FILE NAME / MATERIAL 等）。
+- **リンク(linked)**：`ColumnLink` で指定した MISUMI フィールド値で駆動（例: Parts Name ← `product.seriesName`）。
+- **追加(added)**：既存列に対応しない MISUMI データを新規列に（単価・出荷日 等）。「利用可能フィールド一覧」から追加。
+
+取得できる主なフィールド（詳細は [misumi-api/03](../../misumi-api/03-price-delivery-check.md) / 04）：
+
+| 区分 | フィールド（例） |
+|---|---|
+| リンク候補 | `seriesName`/`productName`（名称）、`partNumber`（正規化型番）、`brandName`（メーカー） |
+| 追加データ | `salesUnitPrice`/`…IncludingTax`（単価）、`vsd`（出荷日）、`crd`（着荷）、`immediateShippableQty`（即納数）、`minSoQty`（最小注文数）、`shippingPlantNameNative`（出荷元）、`weight`、`categoryName`、CAD/画像/PDF、状態/`errorMessageList` |
+| 内部キー（既定で列にしない） | `innerCode`/`ginnerCode`/`seriesCode`/`supplierCode`/`brandCode` |
+
+> ⚠ `MATERIAL` は本 API から構造化フィールドとして取得できない（名称や説明文に含まれることはあるが非構造）→ 既定では手動列。**リンク可能な列とそうでない列が実在する**点に留意。
+
+### 7.3 書込ポリシー（列ごとに選択）
+リンク列は `ColumnLink.write` で挙動を選べる。**`fillEmpty` と `overwrite` の両方**に対応する：
+- `fillEmpty`（既定）：セルが空のときだけ MISUMI 値で補完。
+- `overwrite`：常に MISUMI 値で上書き。
+- `suggest`：セルには書かず、MISUMI 値を提案表示（ユーザーが反映）。
+- いずれのモードでも、**ユーザー編集値と MISUMI 値が食い違う行はハイライト**し、サイレント上書き/不一致を可視化する。
+
+### 7.4 集計
 - 小計：`単価(税別) × Qty × qtyMultiplier`。合計・最大リードタイム（出荷見込み）は Phase 3。
-- 取得日時を保持し、「再取得」で更新。
+
+リンク設定（`ColumnLink`）も `BomDoc` の `columns` に保持し、**テンプレ保存**で再利用する。
 
 ## 8. グリッド選定：AG Grid Community
 
@@ -162,6 +195,7 @@ Rust backend (既存ブリッジ WebView)
 | Excel 読込 | SheetJS (`xlsx`) |
 | Excel 書込 | `write-excel-file`（既存）/ Phase 3 で検討 |
 | 一括取得 | `lookup_parts`（`MisumiCore.lookupMany`、≤100件チャンク、進捗イベント） |
+| MISUMI 連携マッピング | `ColumnLink`（`misumiField` + `write: overwrite/fillEmpty/suggest`）。列ごとに 手動/リンク/追加 を設定、差異ハイライト、テンプレ保存 |
 | 永続化 | BomDoc=ローカル JSON、マッピング=app config テンプレ |
 | 数量倍率 | `BomDoc.meta.qtyMultiplier`（シートパラメータ由来） |
 
