@@ -16,9 +16,9 @@ BOM（部品表）を編集・管理し、`ORDER=MISUMI` の行に単価・出�
 
 | Phase | 内容 |
 |---|---|
-| 1 | 編集表（データモデル + AG Grid、行/任意列の追加・編集・削除、JSON 保存）+ `ORDER=MISUMI` 一括ルックアップ |
-| 2 | Excel 取込 UI（シート + ヘッダ行 + 列マッピング + プレビュー + テンプレ保存、`発注セット数` 対応） |
-| 3 | Excel エクスポート・全行再取得・キャッシュ・合計（小計合計 / 最大リードタイム） |
+| 1 | **SQLite データ層** + 編集表（AG Grid、行/任意列の追加・編集・削除）+ `ORDER=MISUMI` 一括ルックアップ + **MISUMI 横断キャッシュ** |
+| 2 | Excel 取込 UI（シート + ヘッダ行 + 列マッピング + プレビュー + テンプレ保存、数量倍率対応） |
+| 3 | 複数 BOM ライブラリ（検索・絞り込み）・価格/納期履歴・Excel エクスポート・全行再取得・合計 |
 
 ## 決定事項（要約）
 
@@ -26,6 +26,7 @@ BOM（部品表）を編集・管理し、`ORDER=MISUMI` の行に単価・出�
 - Excel 読込: **SheetJS (`xlsx`)**
 - 一括取得: バックエンド `lookup_parts`（`MisumiCore.lookupMany`、≤100件チャンク）
 - MISUMI 連携: フィールド→列のリンクは**ユーザー設定**（手動/リンク/追加 ＋ 書込ポリシー `overwrite`/`fillEmpty`/`suggest`、差異ハイライト）
-- 永続化: BOM はローカル JSON、列マッピングは再利用テンプレ
+- 永続化: **SQLite を正(system-of-record)**（rusqlite、任意列/MISUMI 値は JSON1）。**JSON は import/export 専用**
+- キャッシュ: EC 取得結果を `misumi_cache`（型番キー・**全 BOM 共有**）に保持し、型番入力時はキャッシュ優先
 
 関連: MISUMI API 仕様は [`../../misumi-api/`](../../misumi-api/)、バッチ上限は [`../../misumi-api/07-batch-and-limits.md`](../../misumi-api/07-batch-and-limits.md)。
