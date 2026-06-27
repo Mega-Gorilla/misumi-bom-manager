@@ -1,0 +1,17 @@
+{
+  "name": "misumi-cli",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Headless CLI to exercise the MISUMI price/delivery lookup (same shared core as the Tauri app). For testing/automation from CLI or Claude Code.",
+  "bin": {
+    "misumi": "cli.mjs"
+  },
+  "scripts": {
+    "lookup": "node cli.mjs lookup",
+    "batch": "node cli.mjs batch"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  }
+}

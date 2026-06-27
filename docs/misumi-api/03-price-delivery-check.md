@@ -12,6 +12,7 @@ Content-Type: application/json
 - ホストは EC フロントとは別の **`api-jp.misumi-ec.com`**。
 - Akamai Cookie（`_abck`, `bm_sz` 等）が有効である必要がある（[05](./05-akamai-and-auth.md)）。
 - `applicationId` クエリは不要（観測時点）。
+- ⚠ **ブラウザ内 `fetch` から呼ぶ場合、`credentials: "include"` を付けない**こと（`api-jp` は `Access-Control-Allow-Origin: *` を返し、資格情報付きだと CORS で `Failed to fetch`）。詳細は [05 §credentials の落とし穴](./05-akamai-and-auth.md)。
 
 ## リクエストボディ
 

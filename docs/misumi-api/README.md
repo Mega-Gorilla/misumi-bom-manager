@@ -22,6 +22,7 @@ MISUMI（ミスミ）EC サイトが、型番から単価・出荷日を自動�
 | [05-akamai-and-auth.md](./05-akamai-and-auth.md) | Akamai Bot Manager・Cookie・ログインの扱い |
 | [06-implementation-notes.md](./06-implementation-notes.md) | 本アプリでの実装方針・注意事項・ToS |
 | [07-batch-and-limits.md](./07-batch-and-limits.md) | バッチ（複数同時問い合わせ）の可否・件数/レイテンシ上限の実測 |
+| [08-testing.md](./08-testing.md) | テスト基盤：共有コア（単一ソース）+ ヘッドレス CLI |
 
 ## 調査メタ情報
 
