@@ -1,6 +1,11 @@
-# 08. テスト基盤（共有コア + ヘッドレス CLI）
+# 08. テスト基盤（共有コア + CLI）
 
-MISUMI 連携ロジックを **CLI / Claude Code / CI からヘッドレスに検証**するための仕組み。
+MISUMI 連携ロジックを **CLI から（手動・半自動で）検証**するための仕組み。
+
+> ⚠️ **前提**：実 Edge/Chromium が **Akamai を通過できる環境**が必要（既定は headed 起動）。
+> ヘッドレスや CI・制限環境では Akamai に弾かれて**データ取得に失敗し得る**。
+> その場合でも CLI は**必ずタイムアウトして `{ok:false,error}` を出力し exit 1 で終了**する（ハングしない）。
+> 「どこでも CI で価格が取れる」ことは保証しない — “環境が許せば自動アサートに使える” 位置づけ。
 
 ## 単一ソース：`shared/misumi-lookup.js`
 
@@ -31,14 +36,22 @@ cd tools/misumi-cli && npm install
 node cli.mjs lookup CBT3-8                       # stdout に JSON、失敗時 exit 1
 node cli.mjs batch CBT3-8 CBTB5-12 E-GBSCB4-20   # バッチ
 node cli.mjs lookup CBT3-8 --pretty              # 人間向けサマリを stderr に併記
+node cli.mjs lookup CBT3-8 --timeout=45          # 全体デッドライン（秒）
 ```
 
 なぜブラウザ経由か：Akamai のため素の HTTP では 403。実 Edge を起動し共有コアを注入して叩く（[05](./05-akamai-and-auth.md)）。
 
-### Claude Code / CI からのアサート例
+### 終了保証（ハングしない）
+
+各実行は**全体デッドライン**（既定 60 秒、`--timeout=SEC` / `TIMEOUT_MS`）で必ず終了する。
+`page.evaluate` には標準タイムアウトが無いため、Akamai が fetch を保留すると無限待ちになり得る。
+これを防ぐため **(1) Node 側の全体デッドライン**、**(2) ページ内呼び出しの JS タイマーとの `Promise.race`**、
+**(3) `browser.close()` も詰まった場合の強制 `process.exit`** の三重で、**JSON を出して exit 1**で抜ける。
+
+### アサート例（実 Edge が Akamai を通過できる環境でのみ成功）
 
 ```bash
-# 単価が正の数で取れることを確認
+# 単価が正の数で取れることを確認（取れない環境ではこの行は失敗する＝それも検知できる）
 node tools/misumi-cli/cli.mjs lookup CBT3-8 \
   | jq -e '.ok and (.price.detailList[0].salesPrice.salesUnitPrice|tonumber > 0)'
 ```

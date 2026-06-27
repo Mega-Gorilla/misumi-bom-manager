@@ -1,7 +1,11 @@
 # misumi-cli
 
-MISUMI の型番→単価・出荷日ルックアップを **CLI からヘッドレスに実行**するためのツール。
-CI や Claude Code からの自動テスト・回帰確認・MISUMI 仕様変更の検知に使う。
+MISUMI の型番→単価・出荷日ルックアップを **CLI から実行**するためのツール。
+ローカルでの自動/手動テスト・回帰確認・MISUMI 仕様変更の検知に使う。
+
+> ⚠️ **前提**：実 Edge/Chromium が **Akamai を通過できる環境**が必要（既定は headed 起動）。
+> ヘッドレスや CI・制限環境では Akamai に弾かれてデータ取得に失敗し得る。
+> ただし CLI は**必ず全体デッドラインで終了**し、失敗時も `{ok:false,error}` を出して `exit 1` する（ハングしない）。
 
 ## 単一ソース
 
@@ -36,7 +40,17 @@ node cli.mjs batch CBT3-8 CBTB5-12 E-GBSCB4-20
 
 # 人間向けサマリを stderr に併記（stdout は JSON のまま）
 node cli.mjs lookup CBT3-8 --pretty
+
+# 全体デッドライン（秒）を指定
+node cli.mjs lookup CBT3-8 --timeout=45
 ```
+
+### 終了保証（ハングしない）
+
+`page.evaluate` には標準タイムアウトが無く、Akamai が fetch を保留すると無限待ちになり得る。
+これを防ぐため、各実行は **(1) Node 側の全体デッドライン**・**(2) ページ内呼び出しと JS タイマーの `Promise.race`**・
+**(3) `browser.close()` も詰まった場合の強制 `process.exit`** の三重で必ず終了する。
+タイムアウト時は `{ "ok": false, "error": "timeout after <ms>ms" }` を出力して `exit 1`。
 
 出力（`lookup` の主要フィールド）:
 - `ok` … 成功可否（型番不一致などは `false` + `error`）
@@ -50,11 +64,12 @@ node cli.mjs lookup CBT3-8 --pretty
 | 変数 | 既定 | 説明 |
 |---|---|---|
 | `HEADLESS` | `0`（headed） | `1` でヘッドレス起動（Akamai に弾かれる可能性あり・実験的） |
+| `TIMEOUT_MS` | `60000` | 全体デッドライン（ミリ秒）。`--timeout=SEC` でも指定可 |
 
-## Claude Code / CI からの利用例
+## アサート例（実 Edge が Akamai を通過できる環境でのみ成功）
 
 ```bash
-# 単価が取れることをアサート
+# 単価が取れることをアサート（取れない環境ではこの行が失敗する＝検知できる）
 node tools/misumi-cli/cli.mjs lookup CBT3-8 | jq -e '.ok and (.price.detailList[0].salesPrice.salesUnitPrice|tonumber > 0)'
 ```
 
