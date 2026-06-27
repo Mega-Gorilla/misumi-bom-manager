@@ -27,4 +27,4 @@ BOM（部品表）を編集・管理し、`ORDER=MISUMI` の行に単価・出�
 - 一括取得: バックエンド `lookup_parts`（`MisumiCore.lookupMany`、≤100件チャンク）
 - 永続化: BOM はローカル JSON、列マッピングは再利用テンプレ
 
-関連: MISUMI API 仕様は [`../misumi-api/`](../misumi-api/)、バッチ上限は [`../misumi-api/07-batch-and-limits.md`](../misumi-api/07-batch-and-limits.md)。
+関連: MISUMI API 仕様は [`../../misumi-api/`](../../misumi-api/)、バッチ上限は [`../../misumi-api/07-batch-and-limits.md`](../../misumi-api/07-batch-and-limits.md)。

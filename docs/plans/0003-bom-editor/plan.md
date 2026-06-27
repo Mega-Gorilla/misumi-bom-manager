@@ -47,7 +47,7 @@
 ### 非機能要件
 - 数百行規模（実ファイルは ~200 行）で実用的な編集レスポンス。
 - 価格・出荷日は揮発性 → **取得日時を保持**し、価格を「真実の源」として永続化しない（再取得前提）。
-- MISUMI への配慮：一括は **≤100 件/リクエスト・低並列**（[misumi-api/07](../misumi-api/07-batch-and-limits.md)）。
+- MISUMI への配慮：一括は **≤100 件/リクエスト・低並列**（[misumi-api/07](../../misumi-api/07-batch-and-limits.md)）。
 
 ## 4. データモデル（案）
 
@@ -181,7 +181,7 @@ Rust backend (既存ブリッジ WebView)
 - AG Grid Community のバンドルサイズ増（Tauri なので影響は限定的だが要計測）。
 - マッピングテンプレの同定キー（ファイル名 / ヘッダ構成のどちらを優先するか）→ Phase 2 で確定。
 - `ORDER` 判定ルール（完全一致 "MISUMI" vs 前方一致/別名）→ 既定は完全一致、設定で拡張。
-- 大規模 BOM（数千行）時の一括取得レイテンシ（[07](../misumi-api/07-batch-and-limits.md)）→ チャンク＋進捗で吸収、必要なら上限警告。
+- 大規模 BOM（数千行）時の一括取得レイテンシ（[07](../../misumi-api/07-batch-and-limits.md)）→ チャンク＋進捗で吸収、必要なら上限警告。
 - 価格の揮発性 → 永続化は「取得日時付き」。発注の最終確定値は都度再取得を促す。
 
 ## 12. スコープ外（当面）
@@ -192,5 +192,5 @@ Rust backend (既存ブリッジ WebView)
 
 ## 13. 参考
 
-- MISUMI API 仕様: [`../misumi-api/`](../misumi-api/)（連鎖 02 / 価格 03 / バッチ上限 07 / テスト 08）
-- 共有コア: [`../../shared/misumi-lookup.js`](../../shared/misumi-lookup.js)（`window.MisumiCore.lookupMany` を Phase 1 で活用）
+- MISUMI API 仕様: [`../../misumi-api/`](../../misumi-api/)（連鎖 02 / 価格 03 / バッチ上限 07 / テスト 08）
+- 共有コア: [`../../../shared/misumi-lookup.js`](../../../shared/misumi-lookup.js)（`window.MisumiCore.lookupMany` を Phase 1 で活用）
