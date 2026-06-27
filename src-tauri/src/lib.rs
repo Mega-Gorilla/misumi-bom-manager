@@ -5,6 +5,10 @@
 // WebView that has actually loaded jp.misumi-ec.com (a real browser context that
 // satisfies Akamai), and execute the fetch chain there via `eval`.
 //
+// The fetch chain itself lives in shared/misumi-lookup.js (single source of truth,
+// also used by the headless CLI in tools/misumi-cli). We inject it here and call
+// window.MisumiCore.lookupOne(...).
+//
 // The bridge returns its result through one of two channels (whichever works):
 //   1. Tauri event `mbm-result` (when IPC is injected into the remote page), or
 //   2. a `mbm://` navigation that we intercept in `on_navigation` (fallback).
@@ -20,8 +24,11 @@ use serde_json::Value;
 use tauri::{AppHandle, Listener, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::oneshot;
 
-const APP_ID: &str = "de30e2b2-db86-435d-9929-646c11a3c4cd";
 const BRIDGE_URL: &str = "https://jp.misumi-ec.com/order/part-number/create";
+
+/// Single source of truth for the suggest -> price/delivery fetch chain, shared
+/// with the headless CLI (tools/misumi-cli). Defines `window.MisumiCore`.
+const LOOKUP_CORE_JS: &str = include_str!("../../shared/misumi-lookup.js");
 
 #[derive(Default)]
 struct Bridge {
@@ -45,14 +52,15 @@ fn route(bridge: &Bridge, value: Value) {
 }
 
 /// Build the JS executed inside the bridge (a jp.misumi-ec.com page context):
-/// suggest (型番正規化 → brandCode) → sales-price-delivery/check (単価・出荷日).
+/// inject the shared core, then call `MisumiCore.lookupOne` and ship the result
+/// back via IPC event or `mbm://` navigation.
 fn build_lookup_script(id: u64, part_number: &str) -> String {
     let kw = serde_json::to_string(part_number).unwrap_or_else(|_| "\"\"".into());
     format!(
-        r#"(async () => {{
+        r#"{core}
+(async () => {{
   const id = "{id}";
   const kw = {kw};
-  const APP_ID = "{app_id}";
   async function done(obj) {{
     obj.__id = id;
     try {{
@@ -63,42 +71,22 @@ fn build_lookup_script(id: u64, part_number: &str) -> String {
     }} catch (e) {{}}
     try {{ window.location.href = "mbm://result?payload=" + encodeURIComponent(JSON.stringify(obj)); }} catch (e) {{}}
   }}
-  async function getJson(url, opts) {{
-    const res = await fetch(url, opts);
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    return await res.json();
-  }}
-  async function run() {{
-    const sUrl = "https://jp.misumi-ec.com/api/v1/partNumber/suggest?applicationId=" + APP_ID
-      + "&keyword=" + encodeURIComponent(kw.toLowerCase())
-      + "&field=%40default%2CpartNumberList.checkCFlag";
-    const sjson = await getJson(sUrl, {{ credentials: "include" }});
-    const first = (sjson.partNumberList || [])[0];
-    if (!first) return {{ ok: false, error: "型番が見つかりません: " + kw }};
-    const body = {{ detailList: [{{ qty: 1, inputProductCode: first.partNumber, brandCode: first.brandCode }}] }};
-    const pjson = await getJson("https://api-jp.misumi-ec.com/price-delivery-calculation/v1/sales-price-delivery/check", {{
-      method: "POST",
-      headers: {{ "Content-Type": "application/json" }},
-      credentials: "include",
-      body: JSON.stringify(body)
-    }});
-    return {{ ok: true, suggest: first, price: pjson }};
-  }}
   try {{
     let out;
-    try {{ out = await run(); }} catch (e1) {{
+    try {{ out = await window.MisumiCore.lookupOne(kw); }}
+    catch (e1) {{
       // cold start (Akamai cookie not ready yet) -> wait and retry once
       await new Promise(function (r) {{ setTimeout(r, 2500); }});
-      out = await run();
+      out = await window.MisumiCore.lookupOne(kw);
     }}
     await done(out);
   }} catch (e) {{
     await done({{ ok: false, error: String((e && e.message) || e) }});
   }}
 }})();"#,
+        core = LOOKUP_CORE_JS,
         id = id,
-        kw = kw,
-        app_id = APP_ID
+        kw = kw
     )
 }
 
