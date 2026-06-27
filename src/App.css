@@ -168,6 +168,13 @@ h1 {
 .messages li {
   margin: 4px 0;
 }
+.messages.errors {
+  color: var(--error);
+  font-weight: 600;
+}
+.messages.warnings {
+  color: var(--wait);
+}
 
 .note {
   margin-top: 26px;

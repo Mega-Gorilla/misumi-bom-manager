@@ -20,9 +20,30 @@ type Row = {
   plant: string;
 };
 
-function extract(res: LookupResponse): { row: Row | null; messages: string[] } {
+type Messages = { errors: string[]; warnings: string[]; infos: string[] };
+
+function collect(list: any): string[] {
+  return (Array.isArray(list) ? list : [])
+    .map((m: any) => m?.message)
+    .filter(Boolean);
+}
+
+// 価格 API は全体と行（detailList[]）の双方に error/warning/info メッセージを返す。
+// 行単位の errorMessageList（例: 最小注文数エラー）を取りこぼさないよう両方をまとめる。
+function gatherMessages(res: LookupResponse): Messages {
+  const price = res.price;
+  const d = price?.detailList?.[0];
+  return {
+    errors: [...collect(price?.errorMessageList), ...collect(d?.errorMessageList)],
+    warnings: [...collect(price?.warningMessageList), ...collect(d?.warningMessageList)],
+    infos: [...collect(price?.infoMessageList), ...collect(d?.infoMessageList)],
+  };
+}
+
+function extract(res: LookupResponse): { row: Row | null; msgs: Messages } {
+  const msgs = gatherMessages(res);
   const d = res.price?.detailList?.[0];
-  if (!d) return { row: null, messages: [] };
+  if (!d) return { row: null, msgs };
   const row: Row = {
     partNumber: d.product?.inputProductCode ?? res.suggest?.partNumber ?? "",
     brandName: d.product?.brandName ?? res.suggest?.brandName ?? "",
@@ -33,10 +54,7 @@ function extract(res: LookupResponse): { row: Row | null; messages: string[] } {
     stock: String(d.trade?.immediateShippableQty ?? "-"),
     plant: d.trade?.shippingPlantNameNative ?? "",
   };
-  const messages: string[] = (d.infoMessageList ?? [])
-    .map((m: any) => m.message)
-    .filter(Boolean);
-  return { row, messages };
+  return { row, msgs };
 }
 
 function App() {
@@ -45,7 +63,7 @@ function App() {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [row, setRow] = useState<Row | null>(null);
-  const [messages, setMessages] = useState<string[]>([]);
+  const [msgs, setMsgs] = useState<Messages>({ errors: [], warnings: [], infos: [] });
 
   // Poll the bridge readiness so the user knows when lookups can run.
   useEffect(() => {
@@ -73,20 +91,21 @@ function App() {
     setLoading(true);
     setError(null);
     setRow(null);
-    setMessages([]);
+    setMsgs({ errors: [], warnings: [], infos: [] });
     try {
       const res = await invoke<LookupResponse>("lookup_part", { partNumber });
       if (!res.ok) {
         setError(res.error ?? "取得に失敗しました");
         return;
       }
-      const { row, messages } = extract(res);
+      const { row, msgs } = extract(res);
+      setMsgs(msgs);
       if (!row) {
-        setError("価格・出荷日が取得できませんでした");
+        // 価格行が無い場合でも、行/全体エラーがあれば必ず表面化する
+        setError(msgs.errors[0] ?? "価格・出荷日が取得できませんでした");
         return;
       }
       setRow(row);
-      setMessages(messages);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -149,10 +168,24 @@ function App() {
               </div>
             )}
           </div>
-          {messages.length > 0 && (
-            <ul className="messages">
-              {messages.map((m, i) => (
-                <li key={i}>{m}</li>
+          {msgs.errors.length > 0 && (
+            <ul className="messages errors">
+              {msgs.errors.map((m, i) => (
+                <li key={`e${i}`}>⚠ {m}</li>
+              ))}
+            </ul>
+          )}
+          {msgs.warnings.length > 0 && (
+            <ul className="messages warnings">
+              {msgs.warnings.map((m, i) => (
+                <li key={`w${i}`}>{m}</li>
+              ))}
+            </ul>
+          )}
+          {msgs.infos.length > 0 && (
+            <ul className="messages infos">
+              {msgs.infos.map((m, i) => (
+                <li key={`i${i}`}>{m}</li>
               ))}
             </ul>
           )}
