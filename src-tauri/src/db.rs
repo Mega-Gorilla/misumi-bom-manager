@@ -104,7 +104,7 @@ CREATE TABLE mapping_template (
 );
 "#;
 
-fn new_id() -> String {
+pub fn new_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
