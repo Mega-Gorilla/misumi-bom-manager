@@ -176,7 +176,11 @@ fn bom_delete(db: State<DbState>, id: String) -> Result<(), String> {
 fn bom_import(db: State<DbState>, path: String) -> Result<String, String> {
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let mut doc: model::BomDoc = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    // Ensure every row has an id (BomRow.id is required); assign if missing.
+    // Import always creates a NEW BOM (list "JSON取込" = 新規作成). Drop any embedded
+    // id so save_bom assigns a fresh one — re-importing an export yields a new copy,
+    // never an overwrite of an existing BOM.
+    doc.id = None;
+    // BomRow.id is `#[serde(default)]`, so rows lacking an id parse to ""; assign here.
     for row in &mut doc.rows {
         if row.id.trim().is_empty() {
             row.id = db::new_id();
