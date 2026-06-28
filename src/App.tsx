@@ -2,11 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgGridReact } from "ag-grid-react";
 import "./App.css";
 import type { BomDoc, BomRow, BomSummary } from "./types/bom";
-import { newBom, newRow } from "./types/bom";
+import { newBom, newRow, nextNo } from "./types/bom";
 import * as api from "./api/bom";
 import { BomEditor } from "./bom/BomEditor";
 import { Toolbar } from "./bom/Toolbar";
 import { BomList } from "./bom/BomList";
+import { ColumnManager } from "./bom/ColumnManager";
 
 function slug(s: string): string {
   return (
@@ -31,6 +32,7 @@ export default function App() {
   const [doc, setDoc] = useState<BomDoc | null>(null);
   const [list, setList] = useState<BomSummary[]>([]);
   const [status, setStatus] = useState("");
+  const [showColumns, setShowColumns] = useState(false);
   const gridRef = useRef<AgGridReact<BomRow>>(null);
 
   const reloadList = useCallback(async () => {
@@ -67,16 +69,25 @@ export default function App() {
   const selectedRows = (): BomRow[] => gridRef.current?.api?.getSelectedRows() ?? [];
 
   const addRow = () =>
-    setDoc((d) => (d ? { ...d, rows: [...d.rows, newRow(d.rows.length + 1)] } : d));
+    setDoc((d) => (d ? { ...d, rows: [...d.rows, newRow(nextNo(d.rows))] } : d));
 
   const dupRows = () => {
+    if (!doc) return;
     const sel = selectedRows();
-    if (!doc || sel.length === 0) {
+    if (sel.length === 0) {
       setStatus("複製する行を選択してください");
       return;
     }
-    const clones = sel.map((r) => ({ ...r, id: crypto.randomUUID() }));
+    // Duplicate values but assign fresh ids and sequential No. (No. must not duplicate).
+    let n = nextNo(doc.rows);
+    const clones = sel.map((r) => ({ ...r, id: crypto.randomUUID(), no: n++ }));
     setDoc({ ...doc, rows: [...doc.rows, ...clones] });
+  };
+
+  const renumberNo = () => {
+    if (!doc) return;
+    setDoc({ ...doc, rows: doc.rows.map((r, i) => ({ ...r, no: i + 1 })) });
+    setStatus("No. を振り直しました");
   };
 
   const delRows = () => {
@@ -88,44 +99,38 @@ export default function App() {
     setDoc({ ...doc, rows: doc.rows.filter((r) => !ids.has(r.id)) });
   };
 
-  const addColumn = () => {
-    if (!doc) return;
-    const label = window.prompt("追加する列名");
-    if (!label) return;
+  const addColumn = (label: string) => {
+    if (!doc || !label.trim()) return;
     const key = uniqueKey(doc, slug(label));
     setDoc({
       ...doc,
-      columns: [...doc.columns, { key, label, kind: "custom", editable: true, width: 140 }],
+      columns: [
+        ...doc.columns,
+        { key, label: label.trim(), kind: "custom", editable: true, width: 140 },
+      ],
     });
   };
 
-  const renameColumn = () => {
+  const renameColumn = (key: string, label: string) => {
     if (!doc) return;
-    const key = window.prompt(`改名する列のキー\n(${doc.columns.map((c) => c.key).join(", ")})`);
-    if (!key) return;
-    if (!doc.columns.some((c) => c.key === key)) {
-      setStatus(`列が見つかりません: ${key}`);
-      return;
-    }
-    const label = window.prompt("新しい列名");
-    if (!label) return;
     setDoc({ ...doc, columns: doc.columns.map((c) => (c.key === key ? { ...c, label } : c)) });
   };
 
-  const deleteColumn = () => {
+  const deleteColumn = (key: string) => {
     if (!doc) return;
-    const custom = doc.columns.filter((c) => c.kind === "custom").map((c) => c.key);
-    if (custom.length === 0) {
-      setStatus("削除できる任意列がありません（core 列は削除不可）");
-      return;
-    }
-    const key = window.prompt(`削除する任意列のキー\n(${custom.join(", ")})`);
-    if (!key) return;
-    if (!custom.includes(key)) {
-      setStatus("core 列は削除できません（任意列のみ削除可）");
-      return;
-    }
+    const col = doc.columns.find((c) => c.key === key);
+    if (!col || col.kind !== "custom") return; // core / supplier are not deletable
     setDoc({ ...doc, columns: doc.columns.filter((c) => c.key !== key) });
+  };
+
+  const moveColumn = (key: string, dir: -1 | 1) => {
+    if (!doc) return;
+    const i = doc.columns.findIndex((c) => c.key === key);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= doc.columns.length) return;
+    const cols = [...doc.columns];
+    [cols[i], cols[j]] = [cols[j], cols[i]];
+    setDoc({ ...doc, columns: cols });
   };
 
   const saveBom = async () => {
@@ -198,13 +203,22 @@ export default function App() {
             onAddRow={addRow}
             onDupRows={dupRows}
             onDelRows={delRows}
-            onAddCol={addColumn}
-            onRenameCol={renameColumn}
-            onDelCol={deleteColumn}
+            onRenumber={renumberNo}
+            onManageColumns={() => setShowColumns(true)}
             onExport={doExport}
             onRename={(name) => setDoc({ ...doc, meta: { ...doc.meta, name } })}
           />
           <BomEditor doc={doc} onChange={setDoc} gridRef={gridRef} />
+          {showColumns && (
+            <ColumnManager
+              columns={doc.columns}
+              onAdd={addColumn}
+              onRename={renameColumn}
+              onDelete={deleteColumn}
+              onMove={moveColumn}
+              onClose={() => setShowColumns(false)}
+            />
+          )}
         </>
       )}
     </div>

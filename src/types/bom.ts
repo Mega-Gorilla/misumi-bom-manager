@@ -89,8 +89,8 @@ export const NUMERIC_CORE_KEYS = new Set<string>(["no", "qty"]);
 
 export const CORE_COLUMNS: ColumnDef[] = [
   { key: "no", label: "No.", kind: "core", editable: true, width: 72 },
-  { key: "partsName", label: "Parts Name", kind: "core", editable: true, width: 200 },
   { key: "partsNo", label: "Parts No", kind: "core", editable: true, width: 180 },
+  { key: "partsName", label: "Parts Name", kind: "core", editable: true, width: 200 },
   { key: "order", label: "ORDER", kind: "core", editable: true, width: 120 },
   { key: "qty", label: "Qty", kind: "core", editable: true, width: 90 },
   { key: "material", label: "MATERIAL", kind: "core", editable: true, width: 160 },
@@ -102,6 +102,11 @@ export function newRowId(): string {
 
 export function newRow(no?: number): BomRow {
   return { id: newRowId(), no, custom: {} };
+}
+
+/** Next sequential No. = max existing No. + 1 (avoids duplicates on add/duplicate). */
+export function nextNo(rows: BomRow[]): number {
+  return rows.reduce((m, r) => Math.max(m, r.no ?? 0), 0) + 1;
 }
 
 export function newBom(name = "新規 BOM"): BomDoc {

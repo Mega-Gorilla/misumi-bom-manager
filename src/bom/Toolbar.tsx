@@ -6,9 +6,8 @@ interface Props {
   onAddRow: () => void;
   onDupRows: () => void;
   onDelRows: () => void;
-  onAddCol: () => void;
-  onRenameCol: () => void;
-  onDelCol: () => void;
+  onRenumber: () => void;
+  onManageColumns: () => void;
   onExport: () => void;
   onRename: (name: string) => void;
 }
@@ -27,10 +26,9 @@ export function Toolbar(p: Props) {
       <button onClick={p.onAddRow}>行追加</button>
       <button onClick={p.onDupRows}>複製</button>
       <button onClick={p.onDelRows}>行削除</button>
+      <button onClick={p.onRenumber}>No.振り直し</button>
       <span className="sep" />
-      <button onClick={p.onAddCol}>列追加</button>
-      <button onClick={p.onRenameCol}>列改名</button>
-      <button onClick={p.onDelCol}>列削除</button>
+      <button onClick={p.onManageColumns}>列管理</button>
       <span className="sep" />
       <button className="primary" onClick={p.onSave}>
         保存

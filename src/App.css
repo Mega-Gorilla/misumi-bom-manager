@@ -157,3 +157,71 @@ button.link {
 .bom-table .muted {
   color: var(--muted);
 }
+
+/* ---- column manager ---- */
+.col-mgr-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(16, 24, 40, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+.col-mgr {
+  width: 460px;
+  max-height: 80vh;
+  overflow: auto;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 18px;
+  box-shadow: 0 10px 30px rgba(16, 24, 40, 0.2);
+}
+.col-mgr-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.col-list {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+}
+.col-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.col-list .col-label {
+  flex: 1;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.col-list .kind {
+  font-size: 0.7rem;
+  color: var(--muted);
+  width: 64px;
+  text-align: center;
+}
+.col-list .kind-custom {
+  color: var(--accent);
+}
+.col-add {
+  display: flex;
+  gap: 8px;
+}
+.col-add input {
+  flex: 1;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

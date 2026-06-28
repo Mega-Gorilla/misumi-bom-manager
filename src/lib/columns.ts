@@ -50,6 +50,7 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
   return {
     ...base,
     field: c.key as keyof BomRow & string,
+    rowDrag: c.key === "no", // drag handle on the No. column for row reordering
     valueParser: numeric
       ? (p: ValueParserParams<BomRow>) => {
           const n = Number(p.newValue);

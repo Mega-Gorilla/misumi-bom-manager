@@ -2,7 +2,7 @@ import { useCallback, useMemo } from "react";
 import type { Ref } from "react";
 import { AgGridReact } from "ag-grid-react";
 import { themeQuartz } from "ag-grid-community";
-import type { CellValueChangedEvent } from "ag-grid-community";
+import type { CellValueChangedEvent, RowDragEndEvent } from "ag-grid-community";
 import type { BomDoc, BomRow } from "../types/bom";
 import { buildColumnDefs } from "../lib/columns";
 
@@ -26,6 +26,18 @@ export function BomEditor({ doc, onChange, gridRef }: Props) {
     [doc, onChange],
   );
 
+  // Managed row drag: read the grid's new order back into the doc.
+  const onRowDragEnd = useCallback(
+    (e: RowDragEndEvent<BomRow>) => {
+      const rows: BomRow[] = [];
+      e.api.forEachNode((n) => {
+        if (n.data) rows.push(n.data);
+      });
+      onChange({ ...doc, rows });
+    },
+    [doc, onChange],
+  );
+
   return (
     <div className="grid-wrap">
       <AgGridReact<BomRow>
@@ -36,6 +48,8 @@ export function BomEditor({ doc, onChange, gridRef }: Props) {
         getRowId={(p) => p.data.id}
         rowSelection={{ mode: "multiRow" }}
         onCellValueChanged={onCellValueChanged}
+        rowDragManaged
+        onRowDragEnd={onRowDragEnd}
         defaultColDef={{ resizable: true, sortable: false, minWidth: 80 }}
         singleClickEdit
         stopEditingWhenCellsLoseFocus
