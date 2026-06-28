@@ -187,8 +187,9 @@ pub fn load_bom(conn: &Connection, id: &str) -> rusqlite::Result<Option<BomDoc>>
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
-            let supplier: Option<SupplierQuote> =
-                supplier_json.as_deref().and_then(|s| serde_json::from_str(s).ok());
+            let supplier: Option<SupplierQuote> = supplier_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
             Ok(BomRow {
                 id: r.get(0)?,
                 no: r.get(1)?,
@@ -222,7 +223,12 @@ pub fn save_bom(conn: &mut Connection, doc: &BomDoc) -> rusqlite::Result<String>
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, \
            qty_multiplier = excluded.qty_multiplier, imported_from = excluded.imported_from, \
            updated_at = datetime('now')",
-        params![id, doc.meta.name, doc.meta.qty_multiplier, doc.meta.imported_from],
+        params![
+            id,
+            doc.meta.name,
+            doc.meta.qty_multiplier,
+            doc.meta.imported_from
+        ],
     )?;
 
     tx.execute("DELETE FROM bom_column WHERE bom_id = ?1", [&id])?;
@@ -315,7 +321,10 @@ mod tests {
         assert_eq!(loaded.columns.len(), 1);
         assert_eq!(loaded.rows.len(), 1);
         assert_eq!(loaded.rows[0].parts_no.as_deref(), Some("CBT3-8"));
-        assert_eq!(loaded.rows[0].custom.get("note").map(String::as_str), Some("x"));
+        assert_eq!(
+            loaded.rows[0].custom.get("note").map(String::as_str),
+            Some("x")
+        );
 
         let list = list_boms(&conn).unwrap();
         assert_eq!(list.len(), 1);
