@@ -11,6 +11,17 @@
     "Yu Gothic UI", Meiryo, sans-serif;
 }
 
+:root[data-theme="dark"] {
+  --bg: #181f2a;
+  --card: #222b39;
+  --border: #36425a;
+  --text: #e6e9ef;
+  --muted: #9aa6b6;
+  --accent: #4d8bf0;
+  --accent-dark: #3b73cf;
+  --error: #ff6b61;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -35,13 +46,17 @@ body {
 }
 
 /* ---- buttons ---- */
-button {
+button,
+.toolbar select {
   font-size: 0.88rem;
   padding: 6px 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--card);
   color: var(--text);
+  cursor: pointer;
+}
+.toolbar select {
   cursor: pointer;
 }
 button:hover {
@@ -77,18 +92,20 @@ button.link {
   background: var(--card);
   flex-wrap: wrap;
 }
-.toolbar .bom-name {
-  font-size: 0.95rem;
+.toolbar .bom-name,
+.toolbar .quick-filter {
   padding: 6px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
+  background: var(--card);
+  color: var(--text);
+}
+.toolbar .bom-name {
+  font-size: 0.95rem;
   min-width: 220px;
 }
 .toolbar .quick-filter {
   font-size: 0.88rem;
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
   min-width: 160px;
 }
 .toolbar .sep {
@@ -150,7 +167,7 @@ button.link {
   font-size: 0.9rem;
 }
 .bom-table th {
-  background: #f8f9fb;
+  background: var(--bg);
   color: var(--muted);
   font-weight: 600;
 }
@@ -208,6 +225,8 @@ button.link {
   padding: 5px 8px;
   border: 1px solid var(--border);
   border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
 }
 .col-list .kind {
   font-size: 0.7rem;
@@ -227,6 +246,8 @@ button.link {
   padding: 7px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
+  background: var(--card);
+  color: var(--text);
 }
 button:disabled {
   opacity: 0.5;
