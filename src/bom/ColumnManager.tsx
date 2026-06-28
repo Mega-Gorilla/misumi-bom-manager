@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { X, ChevronUp, ChevronDown, Trash2, Plus } from "lucide-react";
 import type { ColumnDef } from "../types/bom";
 
 interface Props {
@@ -25,7 +26,9 @@ export function ColumnManager(p: Props) {
       <div className="col-mgr" onClick={(e) => e.stopPropagation()}>
         <div className="col-mgr-head">
           <strong>列の管理</strong>
-          <button onClick={p.onClose}>✕</button>
+          <button className="icon-btn" onClick={p.onClose} title="閉じる">
+            <X size={16} />
+          </button>
         </div>
 
         <ul className="col-list">
@@ -37,23 +40,29 @@ export function ColumnManager(p: Props) {
                 onChange={(e) => p.onRename(c.key, e.currentTarget.value)}
               />
               <span className={`kind kind-${c.kind}`}>{c.kind}</span>
-              <button disabled={i === 0} onClick={() => p.onMove(c.key, -1)} title="上へ">
-                ↑
+              <button
+                className="icon-btn"
+                disabled={i === 0}
+                onClick={() => p.onMove(c.key, -1)}
+                title="上へ"
+              >
+                <ChevronUp size={15} />
               </button>
               <button
+                className="icon-btn"
                 disabled={i === p.columns.length - 1}
                 onClick={() => p.onMove(c.key, 1)}
                 title="下へ"
               >
-                ↓
+                <ChevronDown size={15} />
               </button>
               <button
-                className="danger"
+                className="icon-btn danger"
                 disabled={c.kind !== "custom"}
                 title={c.kind !== "custom" ? "core / supplier 列は削除不可" : "削除"}
                 onClick={() => p.onDelete(c.key)}
               >
-                削除
+                <Trash2 size={15} />
               </button>
             </li>
           ))}
@@ -69,7 +78,7 @@ export function ColumnManager(p: Props) {
             }}
           />
           <button className="primary" disabled={!newLabel.trim()} onClick={add}>
-            列を追加
+            <Plus size={15} /> 列を追加
           </button>
         </div>
       </div>

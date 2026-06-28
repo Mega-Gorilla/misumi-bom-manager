@@ -16,6 +16,7 @@
     "@tauri-apps/plugin-opener": "^2",
     "ag-grid-community": "^36.0.0",
     "ag-grid-react": "^36.0.0",
+    "lucide-react": "^1.21.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "write-excel-file": "^4.1.1"

@@ -1,3 +1,4 @@
+import { FilePlus2, Upload, Trash2, FileSpreadsheet } from "lucide-react";
 import type { BomSummary } from "../types/bom";
 
 interface Props {
@@ -16,9 +17,11 @@ export function BomList(p: Props) {
         <h1>BOM 一覧</h1>
         <div className="actions">
           <button className="primary" onClick={p.onNew}>
-            新規 BOM
+            <FilePlus2 size={16} /> 新規 BOM
           </button>
-          <button onClick={p.onImport}>JSON 取込</button>
+          <button onClick={p.onImport}>
+            <Upload size={16} /> JSON 取込
+          </button>
         </div>
       </header>
 
@@ -43,6 +46,7 @@ export function BomList(p: Props) {
               <tr key={b.id}>
                 <td>
                   <button className="link" onClick={() => p.onOpen(b.id)}>
+                    <FileSpreadsheet size={15} />
                     {b.name || "(無題)"}
                   </button>
                 </td>
@@ -50,12 +54,13 @@ export function BomList(p: Props) {
                 <td className="muted">{b.updatedAt ?? ""}</td>
                 <td>
                   <button
-                    className="danger"
+                    className="icon-btn danger"
+                    title="削除"
                     onClick={() => {
                       if (confirm("この BOM を削除しますか？")) p.onDelete(b.id);
                     }}
                   >
-                    削除
+                    <Trash2 size={15} />
                   </button>
                 </td>
               </tr>

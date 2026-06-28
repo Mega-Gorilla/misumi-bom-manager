@@ -36,16 +36,39 @@ body {
 
 /* ---- buttons ---- */
 button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
   font-size: 0.88rem;
-  padding: 6px 12px;
+  padding: 6px 11px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--card);
   color: var(--text);
   cursor: pointer;
+  transition: border-color 0.12s, background 0.12s, box-shadow 0.12s;
 }
-button:hover {
+button:hover:not(:disabled) {
   border-color: var(--accent);
+  box-shadow: 0 1px 3px rgba(16, 24, 40, 0.08);
+}
+button:active:not(:disabled) {
+  background: #eef2f8;
+}
+button svg {
+  flex: none;
+}
+/* icon-only buttons (square) */
+.icon-btn {
+  padding: 6px;
+  color: var(--muted);
+}
+.icon-btn:hover:not(:disabled) {
+  color: var(--accent);
+}
+.icon-btn.danger {
+  color: var(--error);
 }
 button.primary {
   background: var(--accent);
@@ -59,12 +82,18 @@ button.danger {
   color: var(--error);
 }
 button.link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   border: none;
   background: none;
   color: var(--accent);
   padding: 2px 0;
-  text-decoration: underline;
   cursor: pointer;
+}
+button.link:hover {
+  text-decoration: underline;
+  box-shadow: none;
 }
 
 /* ---- toolbar ---- */
@@ -92,6 +121,20 @@ button.link {
 .toolbar .quick-filter {
   font-size: 0.88rem;
   min-width: 160px;
+}
+.search-box {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.search-box svg {
+  position: absolute;
+  left: 9px;
+  color: var(--muted);
+  pointer-events: none;
+}
+.search-box .quick-filter {
+  padding-left: 30px;
 }
 .toolbar .sep {
   width: 1px;
