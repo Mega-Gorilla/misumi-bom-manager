@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgGridReact } from "ag-grid-react";
 import "./App.css";
 import type { BomDoc, BomRow, BomSummary } from "./types/bom";
@@ -8,7 +8,6 @@ import { BomEditor } from "./bom/BomEditor";
 import { Toolbar } from "./bom/Toolbar";
 import { BomList } from "./bom/BomList";
 import { ColumnManager } from "./bom/ColumnManager";
-import { resolveTheme, type ThemeId } from "./lib/agTheme";
 
 function slug(s: string): string {
   return (
@@ -35,20 +34,7 @@ export default function App() {
   const [status, setStatus] = useState("");
   const [showColumns, setShowColumns] = useState(false);
   const [quickFilter, setQuickFilter] = useState("");
-  const [themeId, setThemeId] = useState<ThemeId>(
-    () => (localStorage.getItem("bom.theme") as ThemeId) || "quartz",
-  );
-  const [dark, setDark] = useState(() => localStorage.getItem("bom.dark") === "1");
   const gridRef = useRef<AgGridReact<BomRow>>(null);
-
-  useEffect(() => {
-    localStorage.setItem("bom.theme", themeId);
-  }, [themeId]);
-  useEffect(() => {
-    localStorage.setItem("bom.dark", dark ? "1" : "0");
-    document.documentElement.dataset.theme = dark ? "dark" : "light";
-  }, [dark]);
-  const gridTheme = useMemo(() => resolveTheme(themeId, dark), [themeId, dark]);
 
   const reloadList = useCallback(async () => {
     try {
@@ -231,18 +217,8 @@ export default function App() {
             onUndo={undo}
             onRedo={redo}
             onAutoSize={autoSize}
-            themeId={themeId}
-            dark={dark}
-            onThemeId={setThemeId}
-            onToggleDark={() => setDark((v) => !v)}
           />
-          <BomEditor
-            doc={doc}
-            onChange={setDoc}
-            gridRef={gridRef}
-            quickFilter={quickFilter}
-            theme={gridTheme}
-          />
+          <BomEditor doc={doc} onChange={setDoc} gridRef={gridRef} quickFilter={quickFilter} />
           {showColumns && (
             <ColumnManager
               columns={doc.columns}

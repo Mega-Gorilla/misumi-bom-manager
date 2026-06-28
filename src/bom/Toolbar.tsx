@@ -1,11 +1,7 @@
-import { THEME_OPTIONS, type ThemeId } from "../lib/agTheme";
-
 interface Props {
   title: string;
   status: string;
   quickFilter: string;
-  themeId: ThemeId;
-  dark: boolean;
   onBack: () => void;
   onSave: () => void;
   onAddRow: () => void;
@@ -19,8 +15,6 @@ interface Props {
   onUndo: () => void;
   onRedo: () => void;
   onAutoSize: () => void;
-  onThemeId: (id: ThemeId) => void;
-  onToggleDark: () => void;
 }
 
 export function Toolbar(p: Props) {
@@ -55,22 +49,6 @@ export function Toolbar(p: Props) {
         保存
       </button>
       <button onClick={p.onExport}>JSON書出</button>
-      <span className="sep" />
-      <select
-        className="theme-select"
-        value={p.themeId}
-        onChange={(e) => p.onThemeId(e.currentTarget.value as ThemeId)}
-        title="テーマ"
-      >
-        {THEME_OPTIONS.map((t) => (
-          <option key={t.id} value={t.id}>
-            {t.label}
-          </option>
-        ))}
-      </select>
-      <button onClick={p.onToggleDark} title="ライト / ダーク">
-        {p.dark ? "☀" : "🌙"}
-      </button>
       {p.status && <span className="status-msg">{p.status}</span>}
     </div>
   );

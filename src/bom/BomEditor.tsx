@@ -1,19 +1,19 @@
 import { useCallback, useMemo } from "react";
 import type { Ref } from "react";
 import { AgGridReact } from "ag-grid-react";
-import type { CellValueChangedEvent, RowDragEndEvent, Theme } from "ag-grid-community";
+import type { CellValueChangedEvent, RowDragEndEvent } from "ag-grid-community";
 import type { BomDoc, BomRow } from "../types/bom";
 import { buildColumnDefs } from "../lib/columns";
+import { bomTheme } from "../lib/agTheme";
 
 interface Props {
   doc: BomDoc;
   onChange: (d: BomDoc) => void;
   gridRef: Ref<AgGridReact<BomRow>>;
   quickFilter: string;
-  theme: Theme;
 }
 
-export function BomEditor({ doc, onChange, gridRef, quickFilter, theme }: Props) {
+export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
   // Columns only need to rebuild when the column set changes.
   const columnDefs = useMemo(() => buildColumnDefs(doc), [doc.columns]);
 
@@ -43,7 +43,7 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter, theme }: Props)
     <div className="grid-wrap">
       <AgGridReact<BomRow>
         ref={gridRef}
-        theme={theme}
+        theme={bomTheme}
         rowData={doc.rows}
         columnDefs={columnDefs}
         getRowId={(p) => p.data.id}

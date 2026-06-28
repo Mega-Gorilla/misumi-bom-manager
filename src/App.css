@@ -11,17 +11,6 @@
     "Yu Gothic UI", Meiryo, sans-serif;
 }
 
-:root[data-theme="dark"] {
-  --bg: #181f2a;
-  --card: #222b39;
-  --border: #36425a;
-  --text: #e6e9ef;
-  --muted: #9aa6b6;
-  --accent: #4d8bf0;
-  --accent-dark: #3b73cf;
-  --error: #ff6b61;
-}
-
 * {
   box-sizing: border-box;
 }
@@ -46,17 +35,13 @@ body {
 }
 
 /* ---- buttons ---- */
-button,
-.toolbar select {
+button {
   font-size: 0.88rem;
   padding: 6px 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--card);
   color: var(--text);
-  cursor: pointer;
-}
-.toolbar select {
   cursor: pointer;
 }
 button:hover {
