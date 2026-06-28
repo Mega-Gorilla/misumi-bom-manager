@@ -4,4 +4,3 @@
 fn main() {
     misumi_bom_manager_lib::run()
 }
-

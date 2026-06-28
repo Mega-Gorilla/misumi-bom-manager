@@ -21,8 +21,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
-use tauri::{AppHandle, Listener, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Listener, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::oneshot;
+
+mod db;
+mod model;
+
+/// SQLite connection (system-of-record), behind a Mutex (rusqlite::Connection is !Sync).
+/// DB commands are synchronous so the lock is never held across an `.await`.
+struct DbState(std::sync::Mutex<rusqlite::Connection>);
 
 const BRIDGE_URL: &str = "https://jp.misumi-ec.com/order/part-number/create";
 
@@ -137,6 +144,32 @@ async fn lookup_part(app: AppHandle, part_number: String) -> Result<Value, Strin
     }
 }
 
+// ---- BOM CRUD (SQLite system-of-record). JSON import/export is frontend-driven. ----
+
+#[tauri::command]
+fn bom_list(db: State<DbState>) -> Result<Vec<model::BomSummary>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::list_boms(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn bom_load(db: State<DbState>, id: String) -> Result<Option<model::BomDoc>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::load_bom(&conn, &id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn bom_save(db: State<DbState>, doc: model::BomDoc) -> Result<String, String> {
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::save_bom(&mut conn, &doc).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn bom_delete(db: State<DbState>, id: String) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::delete_bom(&conn, &id).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -144,6 +177,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            // SQLite data layer (system-of-record).
+            let db_dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&db_dir)?;
+            let conn = db::open(&db_dir.join("misumi-bom.db"))?;
+            app.manage(DbState(std::sync::Mutex::new(conn)));
+
             let bridge = Arc::new(Bridge::default());
             app.manage(bridge.clone());
 
@@ -187,7 +226,14 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![lookup_part, bridge_ready])
+        .invoke_handler(tauri::generate_handler![
+            lookup_part,
+            bridge_ready,
+            bom_list,
+            bom_load,
+            bom_save,
+            bom_delete
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
