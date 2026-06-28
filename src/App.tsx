@@ -33,6 +33,7 @@ export default function App() {
   const [list, setList] = useState<BomSummary[]>([]);
   const [status, setStatus] = useState("");
   const [showColumns, setShowColumns] = useState(false);
+  const [quickFilter, setQuickFilter] = useState("");
   const gridRef = useRef<AgGridReact<BomRow>>(null);
 
   const reloadList = useCallback(async () => {
@@ -123,6 +124,10 @@ export default function App() {
     setDoc({ ...doc, columns: doc.columns.filter((c) => c.key !== key) });
   };
 
+  const undo = () => gridRef.current?.api?.undoCellEditing();
+  const redo = () => gridRef.current?.api?.redoCellEditing();
+  const autoSize = () => gridRef.current?.api?.autoSizeAllColumns();
+
   const moveColumn = (key: string, dir: -1 | 1) => {
     if (!doc) return;
     const i = doc.columns.findIndex((c) => c.key === key);
@@ -198,6 +203,7 @@ export default function App() {
           <Toolbar
             title={doc.meta.name ?? ""}
             status={status}
+            quickFilter={quickFilter}
             onBack={back}
             onSave={saveBom}
             onAddRow={addRow}
@@ -207,8 +213,12 @@ export default function App() {
             onManageColumns={() => setShowColumns(true)}
             onExport={doExport}
             onRename={(name) => setDoc({ ...doc, meta: { ...doc.meta, name } })}
+            onQuickFilter={setQuickFilter}
+            onUndo={undo}
+            onRedo={redo}
+            onAutoSize={autoSize}
           />
-          <BomEditor doc={doc} onChange={setDoc} gridRef={gridRef} />
+          <BomEditor doc={doc} onChange={setDoc} gridRef={gridRef} quickFilter={quickFilter} />
           {showColumns && (
             <ColumnManager
               columns={doc.columns}

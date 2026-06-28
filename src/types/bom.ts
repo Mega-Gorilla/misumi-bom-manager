@@ -87,6 +87,9 @@ export interface BomSummary {
 export const CORE_KEYS = ["no", "partsName", "partsNo", "order", "qty", "material"] as const;
 export const NUMERIC_CORE_KEYS = new Set<string>(["no", "qty"]);
 
+/** ORDER (supplier/source) dropdown choices. "MISUMI" drives the PR-C bulk lookup. */
+export const ORDER_OPTIONS = ["", "MISUMI", "3D-PRINTED", "OTHER"];
+
 export const CORE_COLUMNS: ColumnDef[] = [
   { key: "no", label: "No.", kind: "core", editable: true, width: 72 },
   { key: "partsNo", label: "Parts No", kind: "core", editable: true, width: 180 },

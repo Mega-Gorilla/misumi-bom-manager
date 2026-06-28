@@ -1,6 +1,7 @@
 interface Props {
   title: string;
   status: string;
+  quickFilter: string;
   onBack: () => void;
   onSave: () => void;
   onAddRow: () => void;
@@ -10,6 +11,10 @@ interface Props {
   onManageColumns: () => void;
   onExport: () => void;
   onRename: (name: string) => void;
+  onQuickFilter: (text: string) => void;
+  onUndo: () => void;
+  onRedo: () => void;
+  onAutoSize: () => void;
 }
 
 export function Toolbar(p: Props) {
@@ -22,13 +27,23 @@ export function Toolbar(p: Props) {
         onChange={(e) => p.onRename(e.currentTarget.value)}
         placeholder="BOM 名"
       />
+      <input
+        className="quick-filter"
+        value={p.quickFilter}
+        onChange={(e) => p.onQuickFilter(e.currentTarget.value)}
+        placeholder="🔍 検索"
+      />
       <span className="sep" />
       <button onClick={p.onAddRow}>行追加</button>
       <button onClick={p.onDupRows}>複製</button>
       <button onClick={p.onDelRows}>行削除</button>
       <button onClick={p.onRenumber}>No.振り直し</button>
       <span className="sep" />
+      <button onClick={p.onUndo} title="元に戻す (Ctrl+Z)">↶</button>
+      <button onClick={p.onRedo} title="やり直し (Ctrl+Y)">↷</button>
+      <span className="sep" />
       <button onClick={p.onManageColumns}>列管理</button>
+      <button onClick={p.onAutoSize} title="列幅を内容に合わせる">列幅自動</button>
       <span className="sep" />
       <button className="primary" onClick={p.onSave}>
         保存

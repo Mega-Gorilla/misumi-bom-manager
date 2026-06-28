@@ -1,18 +1,19 @@
 import { useCallback, useMemo } from "react";
 import type { Ref } from "react";
 import { AgGridReact } from "ag-grid-react";
-import { themeQuartz } from "ag-grid-community";
 import type { CellValueChangedEvent, RowDragEndEvent } from "ag-grid-community";
 import type { BomDoc, BomRow } from "../types/bom";
 import { buildColumnDefs } from "../lib/columns";
+import { bomTheme } from "../lib/agTheme";
 
 interface Props {
   doc: BomDoc;
   onChange: (d: BomDoc) => void;
   gridRef: Ref<AgGridReact<BomRow>>;
+  quickFilter: string;
 }
 
-export function BomEditor({ doc, onChange, gridRef }: Props) {
+export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
   // Columns only need to rebuild when the column set changes.
   const columnDefs = useMemo(() => buildColumnDefs(doc), [doc.columns]);
 
@@ -42,7 +43,7 @@ export function BomEditor({ doc, onChange, gridRef }: Props) {
     <div className="grid-wrap">
       <AgGridReact<BomRow>
         ref={gridRef}
-        theme={themeQuartz}
+        theme={bomTheme}
         rowData={doc.rows}
         columnDefs={columnDefs}
         getRowId={(p) => p.data.id}
@@ -50,7 +51,10 @@ export function BomEditor({ doc, onChange, gridRef }: Props) {
         onCellValueChanged={onCellValueChanged}
         rowDragManaged
         onRowDragEnd={onRowDragEnd}
-        defaultColDef={{ resizable: true, sortable: false, minWidth: 80 }}
+        quickFilterText={quickFilter}
+        undoRedoCellEditing
+        undoRedoCellEditingLimit={50}
+        defaultColDef={{ resizable: true, sortable: false, filter: true, minWidth: 80 }}
         singleClickEdit
         stopEditingWhenCellsLoseFocus
       />

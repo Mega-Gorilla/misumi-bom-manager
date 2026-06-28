@@ -10,7 +10,7 @@ import type {
   ValueSetterParams,
 } from "ag-grid-community";
 import type { BomDoc, BomRow, ColumnDef } from "../types/bom";
-import { NUMERIC_CORE_KEYS } from "../types/bom";
+import { NUMERIC_CORE_KEYS, ORDER_OPTIONS } from "../types/bom";
 
 export function buildColumnDefs(doc: BomDoc): ColDef<BomRow>[] {
   return doc.columns.map(toColDef);
@@ -47,10 +47,11 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
 
   // core
   const numeric = NUMERIC_CORE_KEYS.has(c.key);
-  return {
+  const core: ColDef<BomRow> = {
     ...base,
     field: c.key as keyof BomRow & string,
     rowDrag: c.key === "no", // drag handle on the No. column for row reordering
+    pinned: c.key === "no" ? "left" : undefined, // keep No. visible while scrolling
     valueParser: numeric
       ? (p: ValueParserParams<BomRow>) => {
           const n = Number(p.newValue);
@@ -58,6 +59,12 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
         }
       : undefined,
   };
+  if (c.key === "order") {
+    // dropdown editor for the supplier/source (canonical values aid PR-C matching)
+    core.cellEditor = "agSelectCellEditor";
+    core.cellEditorParams = { values: ORDER_OPTIONS };
+  }
+  return core;
 }
 
 function resolvePath(obj: unknown, path?: string): unknown {
