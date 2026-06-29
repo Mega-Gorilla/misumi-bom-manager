@@ -17,6 +17,14 @@ interface Props {
 // Supplier data fields that can drive an existing editable column (write policy).
 const LINKABLE = SUPPLIER_FIELDS.filter((f) => f.linkable);
 
+// User-facing labels for the column kind (the raw "core/custom/supplier" is unclear).
+const KIND_LABEL: Record<string, string> = { core: "基本", custom: "任意", supplier: "取得" };
+const KIND_TITLE: Record<string, string> = {
+  core: "基本列（BOM の標準項目）",
+  custom: "任意列（ユーザー追加）",
+  supplier: "取得列（MISUMI 取得データ・読取専用）",
+};
+
 // Editable columns that may be linked to a MISUMI field. ORDER is excluded (it is the
 // supplier dispatch / gate / dropdown key, not a fill target). Parts No is allowed so
 // it can be normalized to MISUMI's canonical part number.
@@ -53,7 +61,9 @@ export function ColumnManager(p: Props) {
                   value={c.label}
                   onChange={(e) => p.onRename(c.key, e.currentTarget.value)}
                 />
-                <span className={`kind kind-${c.kind}`}>{c.kind}</span>
+                <span className={`kind kind-${c.kind}`} title={KIND_TITLE[c.kind] ?? c.kind}>
+                  {KIND_LABEL[c.kind] ?? c.kind}
+                </span>
                 <button
                   className="icon-btn"
                   disabled={i === 0}
