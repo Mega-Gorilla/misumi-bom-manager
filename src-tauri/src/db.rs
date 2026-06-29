@@ -319,6 +319,11 @@ pub fn now_string(conn: &Connection) -> rusqlite::Result<String> {
     conn.query_row("SELECT datetime('now', 'localtime')", [], |r| r.get(0))
 }
 
+/// Local calendar date "YYYY-MM-DD" (for same-day cache freshness checks).
+pub fn today_local(conn: &Connection) -> rusqlite::Result<String> {
+    conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

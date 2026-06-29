@@ -94,7 +94,7 @@ export function Toolbar(p: Props) {
       <button
         onClick={() => p.onQuote(false)}
         disabled={p.quoting}
-        title="ORDER=MISUMI の行を一括取得（キャッシュ優先）"
+        title="ORDER=MISUMI の行を取得（本日取得済みはキャッシュを使用。日付が変わった型番・未取得のみ再取得）"
       >
         <DownloadCloud size={ICON} /> MISUMI 一括取得
       </button>
@@ -102,7 +102,7 @@ export function Toolbar(p: Props) {
         className="icon-btn"
         onClick={() => p.onQuote(true)}
         disabled={p.quoting}
-        title="キャッシュを無視して再取得"
+        title="最新化（キャッシュを無視して全件を再取得）"
       >
         <RefreshCw size={ICON} />
       </button>

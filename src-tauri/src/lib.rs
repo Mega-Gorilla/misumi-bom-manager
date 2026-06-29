@@ -239,6 +239,16 @@ async fn bridge_fetch(
     }
 }
 
+/// True if the cached quote was fetched on `today` (local YYYY-MM-DD). Once the
+/// calendar day changes, MISUMI price/stock may differ, so a stale entry is re-fetched
+/// on the next bulk fetch (same-day entries are served from cache).
+fn fetched_today(q: &model::SupplierQuote, today: &str) -> bool {
+    match q.fetched_at.as_deref() {
+        Some(s) if s.len() >= 10 => &s[..10] == today,
+        _ => false,
+    }
+}
+
 /// Quote `items` from `supplier`. Cache-first (cross-BOM `supplier_cache`), then
 /// fetch only the misses in `<= caps.max_batch` chunks, emitting `quote-progress`.
 /// Returns one normalized quote per input item (repeats share the cached quote).
@@ -272,12 +282,15 @@ async fn quote(
         misses = uniq.clone();
     } else {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
+        // Same-day freshness: reuse a cache entry only if it was fetched today; entries
+        // from a previous day are re-fetched (price/stock may have changed since).
+        let today = db::today_local(&conn).map_err(|e| e.to_string())?;
         for p in &uniq {
             match db::cache_get(&conn, &supplier, p).map_err(|e| e.to_string())? {
-                Some(q) => {
+                Some(q) if fetched_today(&q, &today) => {
                     map.insert(p.clone(), q);
                 }
-                None => misses.push(p.clone()),
+                _ => misses.push(p.clone()),
             }
         }
     }
