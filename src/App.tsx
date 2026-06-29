@@ -161,13 +161,16 @@ export default function App() {
     setDoc({ ...doc, columns });
   };
 
-  // Link (or unlink) an existing editable column to a MISUMI field with a write policy,
-  // then apply it immediately to the current supplier results.
-  const setColumnLink = (key: string, field: string | null, write: WritePolicy) => {
+  // Map an EC field to a target column (field-anchored, per plan §7.3「フィールドを列に結ぶ」).
+  // Each field binds at most one column; binding clears the field from any previous holder.
+  // columnKey === null unbinds the field. Applied immediately to current supplier results.
+  const setFieldLink = (field: string, columnKey: string | null, write: WritePolicy) => {
     if (!doc) return;
-    const columns = doc.columns.map((c) =>
-      c.key === key ? (field ? { ...c, link: { field, write } } : { ...c, link: undefined }) : c,
-    );
+    const columns = doc.columns.map((c) => {
+      if (c.link?.field === field && c.key !== columnKey) return { ...c, link: undefined };
+      if (columnKey && c.key === columnKey) return { ...c, link: { field, write } };
+      return c;
+    });
     setDoc(applyLinkedColumns({ ...doc, columns }));
   };
 
@@ -345,7 +348,7 @@ export default function App() {
               columns={doc.columns}
               onAdd={addColumn}
               onAddSupplier={addSupplierColumn}
-              onSetLink={setColumnLink}
+              onSetFieldLink={setFieldLink}
               onSetRole={setColumnRole}
               onRename={renameColumn}
               onDelete={deleteColumn}

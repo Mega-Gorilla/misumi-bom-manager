@@ -7,7 +7,7 @@ interface Props {
   columns: ColumnDef[];
   onAdd: (label: string) => void;
   onAddSupplier: (field: string, label: string) => void;
-  onSetLink: (key: string, field: string | null, write: WritePolicy) => void;
+  onSetFieldLink: (field: string, columnKey: string | null, write: WritePolicy) => void;
   onSetRole: (role: ColumnRole, key: string) => void;
   onRename: (key: string, label: string) => void;
   onDelete: (key: string) => void;
@@ -52,8 +52,11 @@ export function ColumnManager(p: Props) {
   const assignable = p.columns.filter((c) => c.kind !== "supplier" && c.editable);
   const canLink = (c: ColumnDef) =>
     c.kind !== "supplier" && c.editable && c.key !== partKey && c.key !== srcKey;
-  const roleNote = (c: ColumnDef) =>
-    c.key === partKey ? "（型番列）" : c.key === srcKey ? "（発注先列）" : "—";
+  // Field-anchored mapping: a field's target options are link-eligible columns that are
+  // unlinked or already linked to this field (so one column receives at most one field).
+  const targetOptions = (field: string) =>
+    p.columns.filter((c) => canLink(c) && (!c.link || c.link.field === field));
+  const linkedColumn = (field: string) => p.columns.find((c) => c.link?.field === field);
 
   return (
     <div className="col-mgr-backdrop" onClick={p.onClose}>
@@ -211,46 +214,46 @@ export function ColumnManager(p: Props) {
             <table className="col-table">
               <thead>
                 <tr>
-                  <th>列名</th>
-                  <th>EC連携</th>
+                  <th>取得項目</th>
+                  <th>反映先列</th>
                   <th>書込</th>
                 </tr>
               </thead>
               <tbody>
-                {p.columns
-                  .filter((c) => c.kind !== "supplier")
-                  .map((c) => (
-                    <tr key={c.key}>
-                      <td className="col-name-cell">{c.label}</td>
+                {LINKABLE.map((f) => {
+                  const target = linkedColumn(f.field);
+                  return (
+                    <tr key={f.field}>
+                      <td className="col-name-cell">{f.label}</td>
                       <td>
-                        {canLink(c) ? (
-                          <select
-                            value={c.link?.field ?? ""}
-                            onChange={(e) =>
-                              p.onSetLink(
-                                c.key,
-                                e.currentTarget.value || null,
-                                c.link?.write ?? "fillEmpty",
-                              )
-                            }
-                          >
-                            <option value="">連携なし</option>
-                            {LINKABLE.map((f) => (
-                              <option key={f.field} value={f.field}>
-                                {f.label}
-                              </option>
-                            ))}
-                          </select>
-                        ) : (
-                          <span className="dash">{roleNote(c)}</span>
-                        )}
+                        <select
+                          value={target?.key ?? ""}
+                          onChange={(e) =>
+                            p.onSetFieldLink(
+                              f.field,
+                              e.currentTarget.value || null,
+                              target?.link?.write ?? "fillEmpty",
+                            )
+                          }
+                        >
+                          <option value="">なし</option>
+                          {targetOptions(f.field).map((c) => (
+                            <option key={c.key} value={c.key}>
+                              {c.label}
+                            </option>
+                          ))}
+                        </select>
                       </td>
                       <td>
-                        {canLink(c) && c.link ? (
+                        {target ? (
                           <select
-                            value={c.link.write}
+                            value={target.link!.write}
                             onChange={(e) =>
-                              p.onSetLink(c.key, c.link!.field, e.currentTarget.value as WritePolicy)
+                              p.onSetFieldLink(
+                                f.field,
+                                target.key,
+                                e.currentTarget.value as WritePolicy,
+                              )
                             }
                             title="書込ポリシー"
                           >
@@ -265,7 +268,8 @@ export function ColumnManager(p: Props) {
                         )}
                       </td>
                     </tr>
-                  ))}
+                  );
+                })}
               </tbody>
             </table>
           </>
