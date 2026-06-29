@@ -50,14 +50,19 @@ export function FillHandle({ api, container, doc, onChange }: Props) {
   const dragRef = useRef<{ col: ColumnDef; srcIndex: number; colId: string; value: unknown } | null>(
     null,
   );
+  // Last row index the drag resolved to. Retained so leaving the cells (margin /
+  // scrollbar / outside the grid) doesn't reset the fill target to a no-op.
+  const lastTargetRef = useRef<number | null>(null);
 
   // Loosely-typed event (un)subscribe — AG Grid's generic event union is awkward here.
   const on = (t: string, l: () => void) => api.addEventListener(t as never, l as never);
   const off = (t: string, l: () => void) => api.removeEventListener(t as never, l as never);
 
+  // Identity comes from the official getFocusedCell() API (robust across versions);
+  // only positioning below touches the DOM, and it hides gracefully on any miss.
   function focusedEditable(): { rowIndex: number; colId: string; col: ColumnDef } | null {
     const fc = api.getFocusedCell();
-    if (!fc) return null;
+    if (!fc || fc.rowPinned) return null; // pinned rows (none here) get no handle
     const colId = fc.column.getColId();
     const col = docRef.current.columns.find((c) => c.key === colId);
     if (!col || col.kind === "supplier" || !col.editable) return null;
@@ -86,11 +91,21 @@ export function FillHandle({ api, container, doc, onChange }: Props) {
     setHandle({ left: r.right - c.left, top: r.bottom - c.top });
   }
 
-  function rowIndexAt(x: number, y: number): number | null {
+  // Resolve the pointer to a displayed row index. Prefer a direct cell hit; when the
+  // pointer is off the rows (grid margin, scrollbar, above/below the body), clamp to
+  // the first/last row so dragging past an edge still fills to the end (Excel-like).
+  function resolveTarget(x: number, y: number): number | null {
     const el = document.elementFromPoint(x, y) as HTMLElement | null;
     const rowEl = el?.closest<HTMLElement>(".ag-row");
     const idx = rowEl?.getAttribute("row-index");
-    return idx == null ? null : Number(idx);
+    if (idx != null) return Number(idx);
+    const root = container.current;
+    const count = api.getDisplayedRowCount();
+    if (!root || count <= 0) return null;
+    const r = root.getBoundingClientRect();
+    if (y <= r.top) return 0;
+    if (y >= r.bottom) return count - 1;
+    return null; // inside the body but not on a row -> keep the last target
   }
 
   function updatePreview(targetIndex: number) {
@@ -137,20 +152,21 @@ export function FillHandle({ api, container, doc, onChange }: Props) {
 
   function onMove(ev: MouseEvent) {
     if (!dragRef.current) return;
-    const target = rowIndexAt(ev.clientX, ev.clientY);
-    if (target == null) return;
+    const target = resolveTarget(ev.clientX, ev.clientY);
+    if (target == null) return; // keep the last resolved target
+    lastTargetRef.current = target;
     api.ensureIndexVisible(target);
     updatePreview(target);
   }
 
-  function onUp(ev: MouseEvent) {
+  function onUp() {
     const d = dragRef.current;
     window.removeEventListener("mousemove", onMove);
     window.removeEventListener("mouseup", onUp);
     document.body.classList.remove("fill-dragging");
     dragRef.current = null;
     setPreview(null);
-    if (d) applyFill(d, rowIndexAt(ev.clientX, ev.clientY) ?? d.srcIndex);
+    if (d) applyFill(d, lastTargetRef.current ?? d.srcIndex);
     reposition();
   }
 
@@ -167,6 +183,7 @@ export function FillHandle({ api, container, doc, onChange }: Props) {
       colId: f.colId,
       value: getCellValue(node.data, f.col),
     };
+    lastTargetRef.current = f.rowIndex;
     document.body.classList.add("fill-dragging");
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);

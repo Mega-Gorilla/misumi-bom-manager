@@ -65,7 +65,6 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
         undoRedoCellEditing
         undoRedoCellEditingLimit={50}
         defaultColDef={{ resizable: true, sortable: false, filter: true, minWidth: 80 }}
-        singleClickEdit
         stopEditingWhenCellsLoseFocus
       />
       {api && <FillHandle api={api} container={wrapRef} doc={doc} onChange={onChange} />}
