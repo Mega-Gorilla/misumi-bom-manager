@@ -29,11 +29,11 @@ const KIND_TITLE: Record<string, string> = {
   supplier: "取得列（MISUMI 取得データ・読取専用）",
 };
 
-// Editable columns that may be linked to a MISUMI field. ORDER is excluded (it is the
-// supplier dispatch / gate / dropdown key, not a fill target). Parts No is allowed so
-// it can be normalized to MISUMI's canonical part number.
+// Editable columns that may be linked to a MISUMI field. The fetch keys — ORDER (発注先)
+// and Parts No (型番) — are excluded: they are inputs, never fill targets. Filling them
+// would overwrite the part number with a name/price and corrupt the row.
 function canLink(c: ColumnDef): boolean {
-  return c.kind !== "supplier" && c.editable && c.key !== "order";
+  return c.kind !== "supplier" && c.editable && c.key !== "order" && c.key !== "partsNo";
 }
 
 export function ColumnManager(p: Props) {
