@@ -56,12 +56,14 @@ impl SupplierProvider for Misumi {
                 let mut errors: Vec<String> = Vec::new();
                 let mut warnings: Vec<String> = Vec::new();
 
-                // Attribute request-wide messages whose `lineNumber` matches this row.
+                // Attribute request-wide messages. A `lineNumber`-less ERROR is request-
+                // wide (auth/rate-limit/bad request) and applies to every row -> push to
+                // errors so each row is marked status:error, never silently ok.
                 let line = (i + 1) as i64;
                 for (ln, msg) in &top_errors {
                     match ln {
                         Some(l) if *l == line => errors.push(msg.clone()),
-                        None => warnings.push(msg.clone()), // unattributable -> non-fatal note
+                        None => errors.push(msg.clone()),
                         _ => {}
                     }
                 }
@@ -279,5 +281,27 @@ mod tests {
         let q = &Misumi.normalize(&["E-GBSCB4-20".to_string()], &raw)[0];
         assert_eq!(q.quote.as_ref().unwrap().moq, Some(200));
         assert!(q.warnings.iter().any(|w| w.contains("200")));
+    }
+
+    #[test]
+    fn normalize_request_wide_error_marks_all_rows_error() {
+        // A top-level error WITHOUT lineNumber is request-wide; every row must be error,
+        // even if a price detail came back (regression for PR #7 review).
+        let raw = json!({
+            "ok": true, "parts": ["CBT3-8"],
+            "suggests": [{ "partNumber": "CBT3-8", "brandCode": "MSM1" }],
+            "price": {
+                "ccyCode": "JPY",
+                "errorMessageList": [{ "code": "E_AUTH", "message": "リクエストが拒否されました" }],
+                "detailList": [{
+                    "lineNumber": 1,
+                    "product": { "inputProductCode": "CBT3-8" },
+                    "salesPrice": { "salesUnitPrice": "400" }
+                }]
+            }
+        });
+        let q = &Misumi.normalize(&["CBT3-8".to_string()], &raw)[0];
+        assert_eq!(q.status, "error");
+        assert!(q.errors.iter().any(|e| e.contains("拒否")));
     }
 }

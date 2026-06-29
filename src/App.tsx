@@ -129,7 +129,7 @@ export default function App() {
   const deleteColumn = (key: string) => {
     if (!doc) return;
     const col = doc.columns.find((c) => c.key === key);
-    if (!col || col.kind !== "custom") return; // core / supplier are not deletable
+    if (!col || col.kind === "core") return; // only core columns are protected
     setDoc({ ...doc, columns: doc.columns.filter((c) => c.key !== key) });
   };
 
@@ -162,16 +162,23 @@ export default function App() {
       unlisten = await api.onQuoteProgress((p) =>
         setStatus(p.total > 0 ? `取得中 ${p.done}/${p.total}…` : "キャッシュから取得中…"),
       );
-      const items = targets.map((r) => ({ partNo: r.partsNo!.trim(), qty: r.qty ?? 1 }));
+      const items = targets.map((r) => ({ partNo: r.partsNo!.trim() }));
       const quotes = await api.quote("MISUMI", items, force);
       const mult = doc.meta.qtyMultiplier || 1;
       const byId = new Map<string, SupplierQuote>();
       targets.forEach((r, idx) => {
         const q = quotes[idx];
         if (!q) return;
+        const qty = r.qty ?? 1;
         const unit = Number(q.quote?.unitPrice);
         if (q.quote && Number.isFinite(unit)) {
-          q.quote.subtotal = unit * (r.qty ?? 1) * mult;
+          q.quote.subtotal = unit * qty * mult;
+        }
+        // MOQ is qty-independent (product minSoQty); judge it against THIS row's Qty
+        // rather than the representative qty=1 fetch, so the per-row signal is accurate.
+        const moq = q.quote?.moq;
+        if (moq != null && qty < moq) {
+          q.warnings = [...(q.warnings ?? []), `最小発注数 ${moq}（現在 ${qty}）`];
         }
         byId.set(r.id, q);
       });

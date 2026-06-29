@@ -33,9 +33,10 @@ export async function exportJson(doc: BomDoc): Promise<boolean> {
   return true;
 }
 
+// The quote cache is qty-agnostic (representative qty=1), so items carry only the
+// part number. Subtotal and the per-row MOQ check use the row's Qty on the frontend.
 export interface QuoteItem {
   partNo: string;
-  qty: number;
 }
 
 export interface QuoteProgress {

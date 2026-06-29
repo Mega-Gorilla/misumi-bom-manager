@@ -13,20 +13,15 @@ use serde_json::Value;
 mod misumi;
 
 /// One requested line for `quote` (camelCase JSON from the frontend).
+///
+/// The (supplier, parts_no) cache is **qty-agnostic** (representative qty=1), so the
+/// quote request carries no qty. The frontend computes subtotal and the per-row MOQ
+/// check from the row's Qty locally. A future qty-aware "confirm" fetch (plan §11,
+/// "確定は再取得で qty 指定取得") would add qty on a separate, cache-bypassing path.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteItem {
     pub part_no: String,
-    /// Requested qty. The (supplier, parts_no) cache is qty-agnostic (representative
-    /// qty=1), so the backend doesn't read this today; the frontend computes subtotal
-    /// from it. Kept on the wire for future qty-tiered pricing.
-    #[serde(default = "one")]
-    #[allow(dead_code)]
-    pub qty: f64,
-}
-
-fn one() -> f64 {
-    1.0
 }
 
 /// Provider capabilities (batch limits, transport, currency). Most fields are part
