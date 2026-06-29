@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgGridReact } from "ag-grid-react";
 import "./App.css";
-import type { BomDoc, BomRow, BomSummary } from "./types/bom";
-import { newBom, newRow, nextNo } from "./types/bom";
+import type { BomDoc, BomRow, BomSummary, SupplierQuote } from "./types/bom";
+import { newBom, newRow, nextNo, newSupplierColumn, SUPPLIER_FIELDS } from "./types/bom";
 import * as api from "./api/bom";
 import { BomEditor } from "./bom/BomEditor";
 import { Toolbar } from "./bom/Toolbar";
@@ -34,6 +34,7 @@ export default function App() {
   const [status, setStatus] = useState("");
   const [showColumns, setShowColumns] = useState(false);
   const [quickFilter, setQuickFilter] = useState("");
+  const [quoting, setQuoting] = useState(false);
   const gridRef = useRef<AgGridReact<BomRow>>(null);
 
   const reloadList = useCallback(async () => {
@@ -132,6 +133,66 @@ export default function App() {
     setDoc({ ...doc, columns: doc.columns.filter((c) => c.key !== key) });
   };
 
+  const addSupplierColumn = (field: string, label: string) => {
+    if (!doc) return;
+    if (doc.columns.some((c) => c.kind === "supplier" && c.link?.field === field)) return;
+    const def = SUPPLIER_FIELDS.find((s) => s.field === field);
+    const col = newSupplierColumn(field, label, def?.width);
+    const keys = new Set(doc.columns.map((c) => c.key));
+    let key = col.key;
+    let i = 1;
+    while (keys.has(key)) key = `${col.key}_${i++}`;
+    setDoc({ ...doc, columns: [...doc.columns, { ...col, key }] });
+  };
+
+  // Fetch quotes for ORDER=MISUMI rows and apply them (cache-first; force re-fetch).
+  const runQuote = async (force: boolean) => {
+    if (!doc || quoting) return;
+    const targets = doc.rows.filter(
+      (r) => (r.order ?? "").toUpperCase() === "MISUMI" && (r.partsNo ?? "").trim() !== "",
+    );
+    if (targets.length === 0) {
+      setStatus("ORDER=MISUMI かつ Parts No のある行がありません");
+      return;
+    }
+    setQuoting(true);
+    setStatus("取得を開始しています…");
+    let unlisten: (() => void) | undefined;
+    try {
+      unlisten = await api.onQuoteProgress((p) =>
+        setStatus(p.total > 0 ? `取得中 ${p.done}/${p.total}…` : "キャッシュから取得中…"),
+      );
+      const items = targets.map((r) => ({ partNo: r.partsNo!.trim(), qty: r.qty ?? 1 }));
+      const quotes = await api.quote("MISUMI", items, force);
+      const mult = doc.meta.qtyMultiplier || 1;
+      const byId = new Map<string, SupplierQuote>();
+      targets.forEach((r, idx) => {
+        const q = quotes[idx];
+        if (!q) return;
+        const unit = Number(q.quote?.unitPrice);
+        if (q.quote && Number.isFinite(unit)) {
+          q.quote.subtotal = unit * (r.qty ?? 1) * mult;
+        }
+        byId.set(r.id, q);
+      });
+      setDoc((d) =>
+        d
+          ? {
+              ...d,
+              rows: d.rows.map((r) => (byId.has(r.id) ? { ...r, supplier: byId.get(r.id) } : r)),
+            }
+          : d,
+      );
+      const errs = quotes.filter((q) => q?.status === "error").length;
+      setStatus(`取得完了（${quotes.length} 件${errs ? ` / エラー ${errs}` : ""}）`);
+    } catch (e) {
+      setStatus(String(e));
+    } finally {
+      unlisten?.();
+      setQuoting(false);
+    }
+  };
+
   const undo = () => gridRef.current?.api?.undoCellEditing();
   const redo = () => gridRef.current?.api?.redoCellEditing();
   const autoSize = () => gridRef.current?.api?.autoSizeAllColumns();
@@ -225,12 +286,15 @@ export default function App() {
             onUndo={undo}
             onRedo={redo}
             onAutoSize={autoSize}
+            onQuote={runQuote}
+            quoting={quoting}
           />
           <BomEditor doc={doc} onChange={setDoc} gridRef={gridRef} quickFilter={quickFilter} />
           {showColumns && (
             <ColumnManager
               columns={doc.columns}
               onAdd={addColumn}
+              onAddSupplier={addSupplierColumn}
               onRename={renameColumn}
               onDelete={deleteColumn}
               onMove={moveColumn}

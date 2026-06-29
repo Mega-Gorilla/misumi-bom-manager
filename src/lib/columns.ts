@@ -40,8 +40,10 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
     return {
       ...base,
       editable: false,
-      valueGetter: (p: ValueGetterParams<BomRow>) =>
-        resolvePath(p.data?.supplier, c.link?.field),
+      valueGetter: (p: ValueGetterParams<BomRow>) => supplierValue(p.data, c.link?.field),
+      cellClassRules: {
+        "cell-error": (p) => p.data?.supplier?.status === "error",
+      },
     };
   }
 
@@ -65,6 +67,17 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
     core.cellEditorParams = { values: ORDER_OPTIONS };
   }
   return core;
+}
+
+/** Resolve a supplier column value: computed keys (status/messages/fetchedAt) or a
+ *  dotted path on the row's SupplierQuote (e.g. "quote.unitPrice"). */
+function supplierValue(row: BomRow | undefined, field?: string): unknown {
+  const s = row?.supplier;
+  if (!s || !field) return "";
+  if (field === "status") return s.status ?? "";
+  if (field === "messages") return [...(s.errors ?? []), ...(s.warnings ?? [])].join(" / ");
+  if (field === "fetchedAt") return s.fetchedAt ?? "";
+  return resolvePath(s, field);
 }
 
 function resolvePath(obj: unknown, path?: string): unknown {

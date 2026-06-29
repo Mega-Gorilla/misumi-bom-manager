@@ -281,3 +281,30 @@ button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* supplier-linked cells flagged as errored by the last quote */
+.cell-error {
+  color: var(--error);
+  background: #fdecea;
+}
+
+/* ColumnManager: add MISUMI fields as columns */
+.supplier-fields {
+  margin-top: 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.supplier-fields-head {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.supplier-fields-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.supplier-fields-list button {
+  font-size: 0.8rem;
+  padding: 4px 8px;
+}

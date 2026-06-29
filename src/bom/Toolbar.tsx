@@ -11,6 +11,8 @@ import {
   Save,
   Download,
   Search,
+  DownloadCloud,
+  RefreshCw,
 } from "lucide-react";
 
 interface Props {
@@ -30,6 +32,8 @@ interface Props {
   onUndo: () => void;
   onRedo: () => void;
   onAutoSize: () => void;
+  onQuote: (force: boolean) => void;
+  quoting: boolean;
 }
 
 const ICON = 16;
@@ -84,6 +88,23 @@ export function Toolbar(p: Props) {
       </button>
       <button className="icon-btn" onClick={p.onAutoSize} title="列幅を内容に合わせる">
         <MoveHorizontal size={ICON} />
+      </button>
+
+      <span className="sep" />
+      <button
+        onClick={() => p.onQuote(false)}
+        disabled={p.quoting}
+        title="ORDER=MISUMI の行を一括取得（キャッシュ優先）"
+      >
+        <DownloadCloud size={ICON} /> MISUMI 一括取得
+      </button>
+      <button
+        className="icon-btn"
+        onClick={() => p.onQuote(true)}
+        disabled={p.quoting}
+        title="キャッシュを無視して再取得"
+      >
+        <RefreshCw size={ICON} />
       </button>
 
       <span className="sep" />

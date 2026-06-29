@@ -99,6 +99,58 @@ export const CORE_COLUMNS: ColumnDef[] = [
   { key: "material", label: "MATERIAL", kind: "core", editable: true, width: 160 },
 ];
 
+/** MISUMI/supplier fields that can be added as read-only linked columns.
+ *  `field` is a dotted path on SupplierQuote, or a computed key (status/messages). */
+export interface SupplierFieldDef {
+  field: string;
+  label: string;
+  width?: number;
+}
+
+export const SUPPLIER_FIELDS: SupplierFieldDef[] = [
+  { field: "product.name", label: "品名", width: 200 },
+  { field: "quote.unitPrice", label: "単価(税別)", width: 100 },
+  { field: "quote.unitPriceTax", label: "単価(税込)", width: 100 },
+  { field: "quote.shipDate", label: "出荷日", width: 110 },
+  { field: "quote.stock", label: "在庫", width: 80 },
+  { field: "quote.moq", label: "最小数量", width: 90 },
+  { field: "quote.subtotal", label: "小計", width: 100 },
+  { field: "status", label: "状態", width: 80 },
+  { field: "messages", label: "メッセージ", width: 240 },
+  { field: "fetchedAt", label: "取得日時", width: 160 },
+];
+
+/** Fields seeded as supplier columns on a new BOM. */
+const DEFAULT_SUPPLIER_FIELDS = [
+  "quote.unitPrice",
+  "quote.shipDate",
+  "quote.stock",
+  "status",
+  "messages",
+];
+
+function supplierKey(field: string): string {
+  return "s_" + field.replace(/[^a-zA-Z0-9]+/g, "_").toLowerCase();
+}
+
+export function newSupplierColumn(field: string, label: string, width?: number): ColumnDef {
+  return {
+    key: supplierKey(field),
+    label,
+    kind: "supplier",
+    editable: false,
+    width: width ?? 120,
+    link: { field, write: "fillEmpty" },
+  };
+}
+
+function defaultSupplierColumns(): ColumnDef[] {
+  return DEFAULT_SUPPLIER_FIELDS.map((f) => {
+    const def = SUPPLIER_FIELDS.find((s) => s.field === f)!;
+    return newSupplierColumn(def.field, def.label, def.width);
+  });
+}
+
 export function newRowId(): string {
   return crypto.randomUUID();
 }
@@ -117,7 +169,7 @@ export function newBom(name = "新規 BOM"): BomDoc {
     id: crypto.randomUUID(),
     version: 1,
     meta: { name, qtyMultiplier: 1 },
-    columns: CORE_COLUMNS.map((c) => ({ ...c })),
+    columns: [...CORE_COLUMNS.map((c) => ({ ...c })), ...defaultSupplierColumns()],
     rows: [newRow(1)],
   };
 }
