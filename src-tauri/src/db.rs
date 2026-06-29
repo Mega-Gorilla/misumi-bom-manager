@@ -267,6 +267,58 @@ pub fn delete_bom(conn: &Connection, id: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
+// ---- supplier cache (cross-BOM, keyed by (supplier_code, parts_no)) ----
+
+/// Read a cached normalized quote for (supplier, parts_no), if present.
+pub fn cache_get(
+    conn: &Connection,
+    supplier: &str,
+    parts_no: &str,
+) -> rusqlite::Result<Option<SupplierQuote>> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload_json FROM supplier_cache WHERE supplier_code = ?1 AND parts_no = ?2",
+            params![supplier, parts_no],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(payload.and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+/// Upsert the cache and append a price-history row. Uses `quote.fetched_at` (set by
+/// the caller) for the timestamp so cache payload and column agree.
+pub fn cache_put(
+    conn: &Connection,
+    supplier: &str,
+    parts_no: &str,
+    quote: &SupplierQuote,
+) -> rusqlite::Result<()> {
+    let payload = serde_json::to_string(quote).unwrap_or_else(|_| "{}".into());
+    let currency = quote.quote.as_ref().and_then(|p| p.currency.clone());
+    let fetched = quote.fetched_at.clone();
+    conn.execute(
+        "INSERT INTO supplier_cache(supplier_code, parts_no, payload_json, currency, fetched_at) \
+         VALUES(?1, ?2, ?3, ?4, COALESCE(?5, datetime('now'))) \
+         ON CONFLICT(supplier_code, parts_no) DO UPDATE SET \
+           payload_json = excluded.payload_json, currency = excluded.currency, \
+           fetched_at = excluded.fetched_at",
+        params![supplier, parts_no, payload, currency, fetched],
+    )?;
+    let unit_price = quote.quote.as_ref().and_then(|p| p.unit_price.clone());
+    let ship_date = quote.quote.as_ref().and_then(|p| p.ship_date.clone());
+    conn.execute(
+        "INSERT INTO supplier_price_history(supplier_code, parts_no, unit_price, currency, ship_date, fetched_at) \
+         VALUES(?1, ?2, ?3, ?4, ?5, COALESCE(?6, datetime('now')))",
+        params![supplier, parts_no, unit_price, currency, ship_date, fetched],
+    )?;
+    Ok(())
+}
+
+/// SQLite's current timestamp string (for stamping a batch of quotes consistently).
+pub fn now_string(conn: &Connection) -> rusqlite::Result<String> {
+    conn.query_row("SELECT datetime('now')", [], |r| r.get(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
