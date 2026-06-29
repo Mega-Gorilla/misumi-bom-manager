@@ -16,6 +16,28 @@ export function buildColumnDefs(doc: BomDoc): ColDef<BomRow>[] {
   return doc.columns.map(toColDef);
 }
 
+/** Read a cell's value for a column (used by the fill handle). Supplier columns are
+ *  read-only and return undefined. */
+export function getCellValue(row: BomRow, col: ColumnDef): unknown {
+  if (col.kind === "supplier") return undefined;
+  if (col.kind === "custom") return row.custom?.[col.key] ?? "";
+  return (row as unknown as Record<string, unknown>)[col.key];
+}
+
+/** Return a new row with `col` set to `value` (immutable). Mirrors the column
+ *  valueSetter semantics (numeric parse for No./Qty, custom -> row.custom). */
+export function setCellValue(row: BomRow, col: ColumnDef, value: unknown): BomRow {
+  if (col.kind === "supplier" || !col.editable) return row;
+  if (col.kind === "custom") {
+    return { ...row, custom: { ...row.custom, [col.key]: value == null ? "" : String(value) } };
+  }
+  if (NUMERIC_CORE_KEYS.has(col.key)) {
+    const n = Number(value);
+    return { ...row, [col.key]: Number.isFinite(n) ? n : undefined };
+  }
+  return { ...row, [col.key]: value == null ? "" : String(value) };
+}
+
 function toColDef(c: ColumnDef): ColDef<BomRow> {
   const base: ColDef<BomRow> = {
     colId: c.key,

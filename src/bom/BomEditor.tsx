@@ -1,10 +1,16 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import type { Ref } from "react";
 import { AgGridReact } from "ag-grid-react";
-import type { CellValueChangedEvent, RowDragEndEvent } from "ag-grid-community";
+import type {
+  CellValueChangedEvent,
+  GridApi,
+  GridReadyEvent,
+  RowDragEndEvent,
+} from "ag-grid-community";
 import type { BomDoc, BomRow } from "../types/bom";
 import { buildColumnDefs } from "../lib/columns";
 import { bomTheme } from "../lib/agTheme";
+import { FillHandle } from "./FillHandle";
 
 interface Props {
   doc: BomDoc;
@@ -14,6 +20,9 @@ interface Props {
 }
 
 export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [api, setApi] = useState<GridApi<BomRow> | null>(null);
+
   // Columns only need to rebuild when the column set changes.
   const columnDefs = useMemo(() => buildColumnDefs(doc), [doc.columns]);
 
@@ -40,7 +49,7 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
   );
 
   return (
-    <div className="grid-wrap">
+    <div className="grid-wrap" ref={wrapRef}>
       <AgGridReact<BomRow>
         ref={gridRef}
         theme={bomTheme}
@@ -48,6 +57,7 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
         columnDefs={columnDefs}
         getRowId={(p) => p.data.id}
         rowSelection={{ mode: "multiRow" }}
+        onGridReady={(e: GridReadyEvent<BomRow>) => setApi(e.api)}
         onCellValueChanged={onCellValueChanged}
         rowDragManaged
         onRowDragEnd={onRowDragEnd}
@@ -58,6 +68,7 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
         singleClickEdit
         stopEditingWhenCellsLoseFocus
       />
+      {api && <FillHandle api={api} container={wrapRef} doc={doc} onChange={onChange} />}
     </div>
   );
 }
