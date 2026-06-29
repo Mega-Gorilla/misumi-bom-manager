@@ -219,10 +219,10 @@ pub fn save_bom(conn: &mut Connection, doc: &BomDoc) -> rusqlite::Result<String>
     let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO bom(id, name, qty_multiplier, imported_from, created_at, updated_at) \
-         VALUES(?1, ?2, ?3, ?4, datetime('now'), datetime('now')) \
+         VALUES(?1, ?2, ?3, ?4, datetime('now', 'localtime'), datetime('now', 'localtime')) \
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, \
            qty_multiplier = excluded.qty_multiplier, imported_from = excluded.imported_from, \
-           updated_at = datetime('now')",
+           updated_at = datetime('now', 'localtime')",
         params![
             id,
             doc.meta.name,
@@ -253,7 +253,7 @@ pub fn save_bom(conn: &mut Connection, doc: &BomDoc) -> rusqlite::Result<String>
             .and_then(|s| serde_json::to_string(s).ok());
         tx.execute(
             "INSERT INTO bom_row(id, bom_id, sort_no, no, parts_name, parts_no, \"order\", qty, material, custom_json, supplier_json, updated_at) \
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))",
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now', 'localtime'))",
             params![row.id, id, i as i64, row.no, row.parts_name, row.parts_no, row.order, row.qty, row.material, custom_json, supplier_json],
         )?;
     }
@@ -298,7 +298,7 @@ pub fn cache_put(
     let fetched = quote.fetched_at.clone();
     conn.execute(
         "INSERT INTO supplier_cache(supplier_code, parts_no, payload_json, currency, fetched_at) \
-         VALUES(?1, ?2, ?3, ?4, COALESCE(?5, datetime('now'))) \
+         VALUES(?1, ?2, ?3, ?4, COALESCE(?5, datetime('now', 'localtime'))) \
          ON CONFLICT(supplier_code, parts_no) DO UPDATE SET \
            payload_json = excluded.payload_json, currency = excluded.currency, \
            fetched_at = excluded.fetched_at",
@@ -308,7 +308,7 @@ pub fn cache_put(
     let ship_date = quote.quote.as_ref().and_then(|p| p.ship_date.clone());
     conn.execute(
         "INSERT INTO supplier_price_history(supplier_code, parts_no, unit_price, currency, ship_date, fetched_at) \
-         VALUES(?1, ?2, ?3, ?4, ?5, COALESCE(?6, datetime('now')))",
+         VALUES(?1, ?2, ?3, ?4, ?5, COALESCE(?6, datetime('now', 'localtime')))",
         params![supplier, parts_no, unit_price, currency, ship_date, fetched],
     )?;
     Ok(())
@@ -316,7 +316,7 @@ pub fn cache_put(
 
 /// SQLite's current timestamp string (for stamping a batch of quotes consistently).
 pub fn now_string(conn: &Connection) -> rusqlite::Result<String> {
-    conn.query_row("SELECT datetime('now')", [], |r| r.get(0))
+    conn.query_row("SELECT datetime('now', 'localtime')", [], |r| r.get(0))
 }
 
 #[cfg(test)]

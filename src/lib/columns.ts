@@ -107,7 +107,7 @@ function supplierValue(row: BomRow | undefined, field?: string): unknown {
   const s = row!.supplier!;
   if (field === "status") return s.status ?? "";
   if (field === "messages") return [...(s.errors ?? []), ...(s.warnings ?? [])].join(" / ");
-  if (field === "fetchedAt") return s.fetchedAt ?? "";
+  if (field === "fetchedAt") return (s.fetchedAt ?? "").slice(0, 16); // "YYYY-MM-DD HH:MM" (秒を除去)
   return resolvePath(s, field);
 }
 

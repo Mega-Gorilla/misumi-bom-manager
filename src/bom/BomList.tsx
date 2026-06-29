@@ -51,7 +51,7 @@ export function BomList(p: Props) {
                   </button>
                 </td>
                 <td className="num">{b.rowCount}</td>
-                <td className="muted">{b.updatedAt ?? ""}</td>
+                <td className="muted">{(b.updatedAt ?? "").slice(0, 16)}</td>
                 <td>
                   <button
                     className="icon-btn danger"
