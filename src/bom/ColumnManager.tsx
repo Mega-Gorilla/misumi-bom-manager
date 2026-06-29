@@ -60,9 +60,9 @@ export function ColumnManager(p: Props) {
           <thead>
             <tr>
               <th>列名</th>
-              <th>種別</th>
               <th>EC連携</th>
               <th>書込</th>
+              <th>種別</th>
               <th className="col-th-actions">並べ替え / 削除</th>
             </tr>
           </thead>
@@ -75,11 +75,6 @@ export function ColumnManager(p: Props) {
                     value={c.label}
                     onChange={(e) => p.onRename(c.key, e.currentTarget.value)}
                   />
-                </td>
-                <td>
-                  <span className={`kind kind-${c.kind}`} title={KIND_TITLE[c.kind] ?? c.kind}>
-                    {KIND_LABEL[c.kind] ?? c.kind}
-                  </span>
                 </td>
                 <td>
                   {canLink(c) ? (
@@ -122,6 +117,11 @@ export function ColumnManager(p: Props) {
                   ) : (
                     <span className="dash">—</span>
                   )}
+                </td>
+                <td>
+                  <span className={`kind kind-${c.kind}`} title={KIND_TITLE[c.kind] ?? c.kind}>
+                    {KIND_LABEL[c.kind] ?? c.kind}
+                  </span>
                 </td>
                 <td>
                   <div className="col-actions">
