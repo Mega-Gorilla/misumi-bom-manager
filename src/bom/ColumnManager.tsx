@@ -18,7 +18,11 @@ interface Props {
 const LINKABLE = SUPPLIER_FIELDS.filter((f) => f.linkable);
 
 // User-facing labels for the column kind (the raw "core/custom/supplier" is unclear).
-const KIND_LABEL: Record<string, string> = { core: "基本", custom: "任意", supplier: "取得" };
+const KIND_LABEL: Record<string, string> = {
+  core: "基本",
+  custom: "任意",
+  supplier: "取得データ",
+};
 const KIND_TITLE: Record<string, string> = {
   core: "基本列（BOM の標準項目）",
   custom: "任意列（ユーザー追加）",
@@ -92,7 +96,7 @@ export function ColumnManager(p: Props) {
 
               {canLink(c) && (
                 <div className="col-link">
-                  <span className="col-link-label">MISUMI 連携</span>
+                  <span className="col-link-label">EC連携</span>
                   <select
                     value={c.link?.field ?? ""}
                     onChange={(e) =>
@@ -142,7 +146,7 @@ export function ColumnManager(p: Props) {
         </div>
 
         <div className="supplier-fields">
-          <div className="supplier-fields-head">MISUMI 項目を列に追加</div>
+          <div className="supplier-fields-head">EC連携項目を列に追加</div>
           <div className="supplier-fields-list">
             {SUPPLIER_FIELDS.map((f) => {
               const added = p.columns.some(
