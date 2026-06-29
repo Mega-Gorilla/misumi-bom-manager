@@ -70,10 +70,10 @@ export function ColumnManager(p: Props) {
             className={tab === "columns" ? "active" : ""}
             onClick={() => setTab("columns")}
           >
-            列
+            列の構成
           </button>
           <button className={tab === "ec" ? "active" : ""} onClick={() => setTab("ec")}>
-            EC連携
+            取得・連携
           </button>
         </div>
 
