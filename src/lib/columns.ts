@@ -10,10 +10,13 @@ import type {
   ValueSetterParams,
 } from "ag-grid-community";
 import type { BomDoc, BomRow, ColumnDef } from "../types/bom";
-import { NUMERIC_CORE_KEYS, ORDER_OPTIONS } from "../types/bom";
+import { NUMERIC_CORE_KEYS, ORDER_OPTIONS, partNoColumn, sourceColumn } from "../types/bom";
 
 export function buildColumnDefs(doc: BomDoc): ColDef<BomRow>[] {
-  return doc.columns.map(toColDef);
+  // The source column (designated EC発注先 role) drives the ORDER gate; bake it into the
+  // column defs so getters/cellClassRules use the right column even if it's re-designated.
+  const sourceCol = sourceColumn(doc);
+  return doc.columns.map((c) => toColDef(c, sourceCol));
 }
 
 /** Apply linked-column write policies to all rows using the current supplier results.
@@ -22,21 +25,20 @@ export function buildColumnDefs(doc: BomDoc): ColDef<BomRow>[] {
  *    overwrite -> always write the fetched value; fillEmpty -> only blank cells;
  *    suggest   -> no write (shown via diff highlight / tooltip). */
 export function applyLinkedColumns(doc: BomDoc): BomDoc {
-  // The fetch keys (型番=partsNo / 発注先=order) are never fill targets.
+  const sourceCol = sourceColumn(doc);
+  // The role columns (型番列 / EC発注先列) are fetch keys, never fill targets.
+  const partKey = partNoColumn(doc)?.key;
+  const srcKey = sourceCol?.key;
   const links = doc.columns.filter(
     (c) =>
-      c.kind !== "supplier" &&
-      c.editable &&
-      c.link &&
-      c.key !== "order" &&
-      c.key !== "partsNo",
+      c.kind !== "supplier" && c.editable && c.link && c.key !== partKey && c.key !== srcKey,
   );
   if (links.length === 0) return doc;
   const rows = doc.rows.map((r) => {
-    if (!supplierActive(r)) return r;
+    if (!supplierActive(r, sourceCol)) return r;
     let nr = r;
     for (const c of links) {
-      const fetched = getSupplierFieldValue(nr, c.link!.field);
+      const fetched = getSupplierFieldValue(nr, c.link!.field, sourceCol);
       if (fetched == null || fetched === "") continue;
       if (c.link!.write === "overwrite") {
         nr = setCellValue(nr, c, fetched);
@@ -53,7 +55,7 @@ export function applyLinkedColumns(doc: BomDoc): BomDoc {
 
 /** ColDef extras for an editable column linked to a supplier field: live diff highlight
  *  (cell value vs fetched) + a "MISUMI: <value>" tooltip. Stateless. */
-function linkExtras(c: ColumnDef): Partial<ColDef<BomRow>> {
+function linkExtras(c: ColumnDef, sourceCol?: ColumnDef): Partial<ColDef<BomRow>> {
   if (!c.link || c.kind === "supplier") return {};
   const field = c.link.field;
   const policy = c.link.write;
@@ -61,7 +63,7 @@ function linkExtras(c: ColumnDef): Partial<ColDef<BomRow>> {
     cellClassRules: {
       "cell-link-diff": (p) => {
         if (!p.data) return false;
-        const fetched = getSupplierFieldValue(p.data, field);
+        const fetched = getSupplierFieldValue(p.data, field, sourceCol);
         if (fetched == null || fetched === "") return false;
         const cur = getCellValue(p.data, c);
         if (cur == null || String(cur).trim() === "") return false;
@@ -69,14 +71,14 @@ function linkExtras(c: ColumnDef): Partial<ColDef<BomRow>> {
       },
       "cell-link-suggest": (p) => {
         if (policy !== "suggest" || !p.data) return false;
-        const fetched = getSupplierFieldValue(p.data, field);
+        const fetched = getSupplierFieldValue(p.data, field, sourceCol);
         if (fetched == null || fetched === "") return false;
         const cur = getCellValue(p.data, c);
         return cur == null || String(cur).trim() === "";
       },
     },
     tooltipValueGetter: (p) => {
-      const fetched = p.data ? getSupplierFieldValue(p.data, field) : "";
+      const fetched = p.data ? getSupplierFieldValue(p.data, field, sourceCol) : "";
       return fetched != null && fetched !== "" ? `MISUMI: ${fetched}` : "";
     },
   };
@@ -107,7 +109,7 @@ export function setCellValue(row: BomRow, col: ColumnDef, value: unknown): BomRo
   return { ...r, [col.key]: value == null ? "" : String(value) };
 }
 
-function toColDef(c: ColumnDef): ColDef<BomRow> {
+function toColDef(c: ColumnDef, sourceCol?: ColumnDef): ColDef<BomRow> {
   const base: ColDef<BomRow> = {
     colId: c.key,
     headerName: c.label,
@@ -124,7 +126,7 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
         p.data.custom[c.key] = p.newValue == null ? "" : String(p.newValue);
         return true;
       },
-      ...linkExtras(c),
+      ...linkExtras(c, sourceCol),
     };
   }
 
@@ -133,9 +135,10 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
       ...base,
       editable: false,
       valueGetter: (p: ValueGetterParams<BomRow>) =>
-        supplierValue(p.data, c.link?.field, p.context?.qtyMultiplier ?? 1),
+        supplierValue(p.data, c.link?.field, p.context?.qtyMultiplier ?? 1, sourceCol),
       cellClassRules: {
-        "cell-error": (p) => supplierActive(p.data) && p.data?.supplier?.status === "error",
+        "cell-error": (p) =>
+          supplierActive(p.data, sourceCol) && p.data?.supplier?.status === "error",
       },
     };
   }
@@ -159,22 +162,27 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
     core.cellEditor = "agSelectCellEditor";
     core.cellEditorParams = { values: ORDER_OPTIONS };
   }
-  return { ...core, ...linkExtras(c) };
+  return { ...core, ...linkExtras(c, sourceCol) };
 }
 
 /** The row's supplier result applies only while its ORDER still matches the supplier
  *  it was fetched from. Changing ORDER away from MISUMI (or to blank) hides the data
  *  immediately, without needing a re-fetch; switching back re-shows the cached result. */
-export function supplierActive(row: BomRow | undefined): boolean {
+export function supplierActive(row: BomRow | undefined, sourceCol?: ColumnDef): boolean {
   const s = row?.supplier;
   if (!s) return false;
-  return (row?.order ?? "").trim().toUpperCase() === (s.supplierCode ?? "").toUpperCase();
+  const src = sourceCol && row ? getCellValue(row, sourceCol) : row?.order;
+  return String(src ?? "").trim().toUpperCase() === (s.supplierCode ?? "").toUpperCase();
 }
 
-/** Raw fetched value for a supplier data field (dotted path on the quote), gated by
- *  ORDER. Used to drive/compare linked editable columns (write policy + diff highlight). */
-export function getSupplierFieldValue(row: BomRow | undefined, field: string): unknown {
-  if (!supplierActive(row)) return "";
+/** Raw fetched value for a supplier data field (dotted path on the quote), gated by the
+ *  source (ORDER) column. Used to drive/compare linked editable columns. */
+export function getSupplierFieldValue(
+  row: BomRow | undefined,
+  field: string,
+  sourceCol?: ColumnDef,
+): unknown {
+  if (!supplierActive(row, sourceCol)) return "";
   return resolvePath(row!.supplier, field);
 }
 
@@ -182,8 +190,13 @@ export function getSupplierFieldValue(row: BomRow | undefined, field: string): u
  *  or a dotted path on the row's SupplierQuote. Gated by ORDER. Qty-derived values
  *  (subtotal, MOQ note) are computed LIVE from the row's current Qty/multiplier so they
  *  never go stale after the user edits Qty. */
-function supplierValue(row: BomRow | undefined, field?: string, qtyMultiplier = 1): unknown {
-  if (!field || !supplierActive(row)) return "";
+function supplierValue(
+  row: BomRow | undefined,
+  field?: string,
+  qtyMultiplier = 1,
+  sourceCol?: ColumnDef,
+): unknown {
+  if (!field || !supplierActive(row, sourceCol)) return "";
   const s = row!.supplier!;
   const qty = row!.qty ?? 1;
   if (field === "status") return s.status ?? "";

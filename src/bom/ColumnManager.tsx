@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { X, ChevronUp, ChevronDown, Trash2, Plus } from "lucide-react";
-import type { ColumnDef, WritePolicy } from "../types/bom";
+import type { ColumnDef, ColumnRole, WritePolicy } from "../types/bom";
 import { SUPPLIER_FIELDS, WRITE_POLICIES } from "../types/bom";
 
 interface Props {
@@ -8,6 +8,7 @@ interface Props {
   onAdd: (label: string) => void;
   onAddSupplier: (field: string, label: string) => void;
   onSetLink: (key: string, field: string | null, write: WritePolicy) => void;
+  onSetRole: (role: ColumnRole, key: string) => void;
   onRename: (key: string, label: string) => void;
   onDelete: (key: string) => void;
   onMove: (key: string, dir: -1 | 1) => void;
@@ -16,6 +17,11 @@ interface Props {
 
 // Supplier data fields that can drive an existing editable column (write policy).
 const LINKABLE = SUPPLIER_FIELDS.filter((f) => f.linkable);
+
+/** Key of the column holding a fetch role (falling back to the default core key). */
+function roleKey(columns: ColumnDef[], role: ColumnRole, fallbackKey: string): string | undefined {
+  return (columns.find((c) => c.role === role) ?? columns.find((c) => c.key === fallbackKey))?.key;
+}
 
 // User-facing labels for the column kind (the raw "core/custom/supplier" is unclear).
 const KIND_LABEL: Record<string, string> = {
@@ -29,13 +35,6 @@ const KIND_TITLE: Record<string, string> = {
   supplier: "取得列（MISUMI 取得データ・読取専用）",
 };
 
-// Editable columns that may be linked to a MISUMI field. The fetch keys — ORDER (発注先)
-// and Parts No (型番) — are excluded: they are inputs, never fill targets. Filling them
-// would overwrite the part number with a name/price and corrupt the row.
-function canLink(c: ColumnDef): boolean {
-  return c.kind !== "supplier" && c.editable && c.key !== "order" && c.key !== "partsNo";
-}
-
 export function ColumnManager(p: Props) {
   const [newLabel, setNewLabel] = useState("");
 
@@ -46,6 +45,15 @@ export function ColumnManager(p: Props) {
     setNewLabel("");
   };
 
+  // Role columns (型番列 / EC発注先列) are fetch keys, excluded from EC連携 fill targets.
+  const partKey = roleKey(p.columns, "partNo", "partsNo");
+  const srcKey = roleKey(p.columns, "source", "order");
+  const assignable = p.columns.filter((c) => c.kind !== "supplier" && c.editable);
+  const canLink = (c: ColumnDef) =>
+    c.kind !== "supplier" && c.editable && c.key !== partKey && c.key !== srcKey;
+  const roleNote = (c: ColumnDef) =>
+    c.key === partKey ? "（型番列）" : c.key === srcKey ? "（発注先列）" : "—";
+
   return (
     <div className="col-mgr-backdrop" onClick={p.onClose}>
       <div className="col-mgr" onClick={(e) => e.stopPropagation()}>
@@ -54,6 +62,34 @@ export function ColumnManager(p: Props) {
           <button className="icon-btn" onClick={p.onClose} title="閉じる">
             <X size={16} />
           </button>
+        </div>
+
+        <div className="role-config">
+          <div className="role-config-head">取得設定（EC連携の対象列）</div>
+          <div className="role-row">
+            <span className="role-label">型番列</span>
+            <select value={partKey ?? ""} onChange={(e) => p.onSetRole("partNo", e.currentTarget.value)}>
+              {assignable
+                .filter((c) => c.key !== srcKey)
+                .map((c) => (
+                  <option key={c.key} value={c.key}>
+                    {c.label}
+                  </option>
+                ))}
+            </select>
+          </div>
+          <div className="role-row">
+            <span className="role-label">EC発注先列</span>
+            <select value={srcKey ?? ""} onChange={(e) => p.onSetRole("source", e.currentTarget.value)}>
+              {assignable
+                .filter((c) => c.key !== partKey)
+                .map((c) => (
+                  <option key={c.key} value={c.key}>
+                    {c.label}
+                  </option>
+                ))}
+            </select>
+          </div>
         </div>
 
         <table className="col-table">
@@ -96,7 +132,7 @@ export function ColumnManager(p: Props) {
                       ))}
                     </select>
                   ) : (
-                    <span className="dash">—</span>
+                    <span className="dash">{roleNote(c)}</span>
                   )}
                 </td>
                 <td>

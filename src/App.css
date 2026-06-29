@@ -266,6 +266,36 @@ body.fill-dragging {
   align-items: center;
   margin-bottom: 12px;
 }
+.role-config {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.role-config-head {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.role-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0;
+}
+.role-label {
+  width: 90px;
+  font-size: 0.82rem;
+}
+.role-row select {
+  font-size: 0.8rem;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}
 .col-table {
   width: 100%;
   border-collapse: collapse;

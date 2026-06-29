@@ -1,9 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgGridReact } from "ag-grid-react";
 import "./App.css";
-import type { BomDoc, BomRow, BomSummary, SupplierQuote, WritePolicy } from "./types/bom";
-import { newBom, newRow, nextNo, newSupplierColumn, SUPPLIER_FIELDS } from "./types/bom";
-import { applyLinkedColumns } from "./lib/columns";
+import type {
+  BomDoc,
+  BomRow,
+  BomSummary,
+  ColumnRole,
+  SupplierQuote,
+  WritePolicy,
+} from "./types/bom";
+import {
+  newBom,
+  newRow,
+  nextNo,
+  newSupplierColumn,
+  SUPPLIER_FIELDS,
+  partNoColumn,
+  sourceColumn,
+} from "./types/bom";
+import { applyLinkedColumns, getCellValue } from "./lib/columns";
 import * as api from "./api/bom";
 import { BomEditor } from "./bom/BomEditor";
 import { Toolbar } from "./bom/Toolbar";
@@ -134,6 +149,18 @@ export default function App() {
     setDoc({ ...doc, columns: doc.columns.filter((c) => c.key !== key) });
   };
 
+  // Designate which column plays a fetch role (型番列 / EC発注先列). Each role has at most
+  // one column, so assigning it clears any previous holder.
+  const setColumnRole = (role: ColumnRole, key: string) => {
+    if (!doc) return;
+    const columns = doc.columns.map((c) => {
+      if (c.key === key) return { ...c, role };
+      if (c.role === role) return { ...c, role: undefined };
+      return c;
+    });
+    setDoc({ ...doc, columns });
+  };
+
   // Link (or unlink) an existing editable column to a MISUMI field with a write policy,
   // then apply it immediately to the current supplier results.
   const setColumnLink = (key: string, field: string | null, write: WritePolicy) => {
@@ -159,11 +186,20 @@ export default function App() {
   // Fetch quotes for ORDER=MISUMI rows and apply them (cache-first; force re-fetch).
   const runQuote = async (force: boolean) => {
     if (!doc || quoting) return;
-    const targets = doc.rows.filter(
-      (r) => (r.order ?? "").toUpperCase() === "MISUMI" && (r.partsNo ?? "").trim() !== "",
-    );
+    const partCol = partNoColumn(doc);
+    const srcCol = sourceColumn(doc);
+    if (!partCol || !srcCol) {
+      setStatus("型番列 / EC発注先列 が未設定です（列の管理で設定）");
+      return;
+    }
+    const partOf = (r: BomRow) => String(getCellValue(r, partCol) ?? "").trim();
+    const isMisumi = (r: BomRow) =>
+      String(getCellValue(r, srcCol) ?? "")
+        .trim()
+        .toUpperCase() === "MISUMI";
+    const targets = doc.rows.filter((r) => isMisumi(r) && partOf(r) !== "");
     if (targets.length === 0) {
-      setStatus("ORDER=MISUMI かつ Parts No のある行がありません");
+      setStatus("EC発注先=MISUMI かつ 型番のある行がありません");
       return;
     }
     setQuoting(true);
@@ -173,7 +209,7 @@ export default function App() {
       unlisten = await api.onQuoteProgress((p) =>
         setStatus(p.total > 0 ? `取得中 ${p.done}/${p.total}…` : "キャッシュから取得中…"),
       );
-      const items = targets.map((r) => ({ partNo: r.partsNo!.trim() }));
+      const items = targets.map((r) => ({ partNo: partOf(r) }));
       const quotes = await api.quote("MISUMI", items, force);
       const byId = new Map<string, SupplierQuote>();
       // Store the raw quote only. Subtotal and the MOQ note are derived LIVE in the
@@ -310,6 +346,7 @@ export default function App() {
               onAdd={addColumn}
               onAddSupplier={addSupplierColumn}
               onSetLink={setColumnLink}
+              onSetRole={setColumnRole}
               onRename={renameColumn}
               onDelete={deleteColumn}
               onMove={moveColumn}
