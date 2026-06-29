@@ -250,7 +250,8 @@ body.fill-dragging {
   z-index: 50;
 }
 .col-mgr {
-  width: 460px;
+  width: 640px;
+  max-width: 92vw;
   max-height: 80vh;
   overflow: auto;
   background: var(--card);
@@ -271,23 +272,26 @@ body.fill-dragging {
   padding: 0;
 }
 .col-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   padding: 6px 0;
   border-bottom: 1px solid var(--border);
 }
-.col-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
 .col-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.link-arrow {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.col-actions {
+  margin-left: auto;
   display: flex;
   align-items: center;
   gap: 6px;
-  margin: 5px 0 1px 2px;
-}
-.col-link-label {
-  font-size: 0.72rem;
-  color: var(--muted);
 }
 .col-link select {
   font-size: 0.78rem;
@@ -298,7 +302,7 @@ body.fill-dragging {
   color: var(--text);
 }
 .col-list .col-label {
-  flex: 1;
+  flex: 0 0 150px;
   padding: 5px 8px;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -308,8 +312,9 @@ body.fill-dragging {
 .col-list .kind {
   font-size: 0.7rem;
   color: var(--muted);
-  width: 64px;
+  width: 72px;
   text-align: center;
+  flex: none;
 }
 .col-list .kind-custom {
   color: var(--accent);

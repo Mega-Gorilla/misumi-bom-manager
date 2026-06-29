@@ -59,44 +59,19 @@ export function ColumnManager(p: Props) {
         <ul className="col-list">
           {p.columns.map((c, i) => (
             <li key={c.key}>
-              <div className="col-row">
-                <input
-                  className="col-label"
-                  value={c.label}
-                  onChange={(e) => p.onRename(c.key, e.currentTarget.value)}
-                />
-                <span className={`kind kind-${c.kind}`} title={KIND_TITLE[c.kind] ?? c.kind}>
-                  {KIND_LABEL[c.kind] ?? c.kind}
-                </span>
-                <button
-                  className="icon-btn"
-                  disabled={i === 0}
-                  onClick={() => p.onMove(c.key, -1)}
-                  title="上へ"
-                >
-                  <ChevronUp size={15} />
-                </button>
-                <button
-                  className="icon-btn"
-                  disabled={i === p.columns.length - 1}
-                  onClick={() => p.onMove(c.key, 1)}
-                  title="下へ"
-                >
-                  <ChevronDown size={15} />
-                </button>
-                <button
-                  className="icon-btn danger"
-                  disabled={c.kind === "core"}
-                  title={c.kind === "core" ? "core 列は削除不可" : "削除"}
-                  onClick={() => p.onDelete(c.key)}
-                >
-                  <Trash2 size={15} />
-                </button>
-              </div>
-
+              <input
+                className="col-label"
+                value={c.label}
+                onChange={(e) => p.onRename(c.key, e.currentTarget.value)}
+              />
+              <span className={`kind kind-${c.kind}`} title={KIND_TITLE[c.kind] ?? c.kind}>
+                {KIND_LABEL[c.kind] ?? c.kind}
+              </span>
               {canLink(c) && (
-                <div className="col-link">
-                  <span className="col-link-label">EC連携</span>
+                <span className="col-link">
+                  <span className="link-arrow" title="この列を埋める取得項目">
+                    ←
+                  </span>
                   <select
                     value={c.link?.field ?? ""}
                     onChange={(e) =>
@@ -125,8 +100,34 @@ export function ColumnManager(p: Props) {
                       ))}
                     </select>
                   )}
-                </div>
+                </span>
               )}
+              <span className="col-actions">
+                <button
+                  className="icon-btn"
+                  disabled={i === 0}
+                  onClick={() => p.onMove(c.key, -1)}
+                  title="上へ"
+                >
+                  <ChevronUp size={15} />
+                </button>
+                <button
+                  className="icon-btn"
+                  disabled={i === p.columns.length - 1}
+                  onClick={() => p.onMove(c.key, 1)}
+                  title="下へ"
+                >
+                  <ChevronDown size={15} />
+                </button>
+                <button
+                  className="icon-btn danger"
+                  disabled={c.kind === "core"}
+                  title={c.kind === "core" ? "core 列は削除不可" : "削除"}
+                  onClick={() => p.onDelete(c.key)}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </span>
             </li>
           ))}
         </ul>
