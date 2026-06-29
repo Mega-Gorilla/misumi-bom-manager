@@ -182,11 +182,19 @@ export default function App() {
         }
         byId.set(r.id, q);
       });
+      // Apply fresh quotes to targets; clear stale supplier data from rows that are no
+      // longer MISUMI targets (ORDER changed away / Parts No removed) so re-fetch resets them.
       setDoc((d) =>
         d
           ? {
               ...d,
-              rows: d.rows.map((r) => (byId.has(r.id) ? { ...r, supplier: byId.get(r.id) } : r)),
+              rows: d.rows.map((r) =>
+                byId.has(r.id)
+                  ? { ...r, supplier: byId.get(r.id) }
+                  : r.supplier
+                    ? { ...r, supplier: undefined }
+                    : r,
+              ),
             }
           : d,
       );

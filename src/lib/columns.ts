@@ -64,7 +64,7 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
       editable: false,
       valueGetter: (p: ValueGetterParams<BomRow>) => supplierValue(p.data, c.link?.field),
       cellClassRules: {
-        "cell-error": (p) => p.data?.supplier?.status === "error",
+        "cell-error": (p) => supplierActive(p.data) && p.data?.supplier?.status === "error",
       },
     };
   }
@@ -91,11 +91,20 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
   return core;
 }
 
-/** Resolve a supplier column value: computed keys (status/messages/fetchedAt) or a
- *  dotted path on the row's SupplierQuote (e.g. "quote.unitPrice"). */
-function supplierValue(row: BomRow | undefined, field?: string): unknown {
+/** The row's supplier result applies only while its ORDER still matches the supplier
+ *  it was fetched from. Changing ORDER away from MISUMI (or to blank) hides the data
+ *  immediately, without needing a re-fetch; switching back re-shows the cached result. */
+function supplierActive(row: BomRow | undefined): boolean {
   const s = row?.supplier;
-  if (!s || !field) return "";
+  if (!s) return false;
+  return (row?.order ?? "").trim().toUpperCase() === (s.supplierCode ?? "").toUpperCase();
+}
+
+/** Resolve a supplier column value: computed keys (status/messages/fetchedAt) or a
+ *  dotted path on the row's SupplierQuote (e.g. "quote.unitPrice"). Gated by ORDER. */
+function supplierValue(row: BomRow | undefined, field?: string): unknown {
+  if (!field || !supplierActive(row)) return "";
+  const s = row!.supplier!;
   if (field === "status") return s.status ?? "";
   if (field === "messages") return [...(s.errors ?? []), ...(s.warnings ?? [])].join(" / ");
   if (field === "fetchedAt") return s.fetchedAt ?? "";
