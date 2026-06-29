@@ -107,17 +107,20 @@ export interface SupplierFieldDef {
   width?: number;
 }
 
+// "EC " prefix distinguishes fetched supplier columns from the user's own BOM columns
+// (品名/出荷日 等と紛らわしいため)。"在庫" は即時出荷可能数(immediateShippableQty)
+// なので意味を明確化して "即納在庫数"。
 export const SUPPLIER_FIELDS: SupplierFieldDef[] = [
-  { field: "product.name", label: "品名", width: 200 },
-  { field: "quote.unitPrice", label: "単価(税別)", width: 100 },
-  { field: "quote.unitPriceTax", label: "単価(税込)", width: 100 },
-  { field: "quote.shipDate", label: "出荷日", width: 110 },
-  { field: "quote.stock", label: "在庫", width: 80 },
-  { field: "quote.moq", label: "最小数量", width: 90 },
-  { field: "quote.subtotal", label: "小計", width: 100 },
-  { field: "status", label: "状態", width: 80 },
-  { field: "messages", label: "メッセージ", width: 240 },
-  { field: "fetchedAt", label: "取得日時", width: 160 },
+  { field: "product.name", label: "EC 品名", width: 200 },
+  { field: "quote.unitPrice", label: "EC 単価(税別)", width: 120 },
+  { field: "quote.unitPriceTax", label: "EC 単価(税込)", width: 120 },
+  { field: "quote.shipDate", label: "EC 出荷日", width: 120 },
+  { field: "quote.stock", label: "EC 即納在庫数", width: 120 },
+  { field: "quote.moq", label: "EC 最小数量", width: 110 },
+  { field: "quote.subtotal", label: "EC 小計", width: 110 },
+  { field: "status", label: "EC 状態", width: 90 },
+  { field: "messages", label: "EC メッセージ", width: 240 },
+  { field: "fetchedAt", label: "EC 取得日時", width: 160 },
 ];
 
 /** Fields seeded as supplier columns on a new BOM. */
