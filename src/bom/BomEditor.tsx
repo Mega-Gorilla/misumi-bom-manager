@@ -1,10 +1,16 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import type { Ref } from "react";
 import { AgGridReact } from "ag-grid-react";
-import type { CellValueChangedEvent, RowDragEndEvent } from "ag-grid-community";
+import type {
+  CellValueChangedEvent,
+  GridApi,
+  GridReadyEvent,
+  RowDragEndEvent,
+} from "ag-grid-community";
 import type { BomDoc, BomRow } from "../types/bom";
 import { buildColumnDefs } from "../lib/columns";
 import { bomTheme } from "../lib/agTheme";
+import { FillHandle } from "./FillHandle";
 
 interface Props {
   doc: BomDoc;
@@ -14,6 +20,9 @@ interface Props {
 }
 
 export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [api, setApi] = useState<GridApi<BomRow> | null>(null);
+
   // Columns only need to rebuild when the column set changes.
   const columnDefs = useMemo(() => buildColumnDefs(doc), [doc.columns]);
 
@@ -21,7 +30,10 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
     (e: CellValueChangedEvent<BomRow>) => {
       // AG Grid has already mutated e.data via field / valueSetter; reflect it
       // back into the doc immutably so state stays the source of truth.
-      const rows = doc.rows.map((r) => (r.id === e.data.id ? { ...e.data } : r));
+      // Changing the part number invalidates the fetched EC result for that row.
+      const updated =
+        e.column.getColId() === "partsNo" ? { ...e.data, supplier: undefined } : { ...e.data };
+      const rows = doc.rows.map((r) => (r.id === e.data.id ? updated : r));
       onChange({ ...doc, rows });
     },
     [doc, onChange],
@@ -40,14 +52,16 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
   );
 
   return (
-    <div className="grid-wrap">
+    <div className="grid-wrap" ref={wrapRef}>
       <AgGridReact<BomRow>
         ref={gridRef}
         theme={bomTheme}
         rowData={doc.rows}
         columnDefs={columnDefs}
         getRowId={(p) => p.data.id}
+        context={{ qtyMultiplier: doc.meta.qtyMultiplier ?? 1 }}
         rowSelection={{ mode: "multiRow" }}
+        onGridReady={(e: GridReadyEvent<BomRow>) => setApi(e.api)}
         onCellValueChanged={onCellValueChanged}
         rowDragManaged
         onRowDragEnd={onRowDragEnd}
@@ -55,9 +69,9 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
         undoRedoCellEditing
         undoRedoCellEditingLimit={50}
         defaultColDef={{ resizable: true, sortable: false, filter: true, minWidth: 80 }}
-        singleClickEdit
         stopEditingWhenCellsLoseFocus
       />
+      {api && <FillHandle api={api} container={wrapRef} doc={doc} onChange={onChange} />}
     </div>
   );
 }

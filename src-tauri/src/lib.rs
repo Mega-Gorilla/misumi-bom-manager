@@ -21,11 +21,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
-use tauri::{AppHandle, Listener, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Listener, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::oneshot;
 
 mod db;
 mod model;
+mod supplier;
+
+use supplier::{provider_for, QuoteItem};
 
 /// SQLite connection (system-of-record), behind a Mutex (rusqlite::Connection is !Sync).
 /// DB commands are synchronous so the lock is never held across an `.await`.
@@ -59,15 +62,14 @@ fn route(bridge: &Bridge, value: Value) {
 }
 
 /// Build the JS executed inside the bridge (a jp.misumi-ec.com page context):
-/// inject the shared core, then call `MisumiCore.lookupOne` and ship the result
-/// back via IPC event or `mbm://` navigation.
-fn build_lookup_script(id: u64, part_number: &str) -> String {
-    let kw = serde_json::to_string(part_number).unwrap_or_else(|_| "\"\"".into());
+/// inject the shared core, evaluate `expr` (an async expression resolving to the
+/// result payload), and ship it back via IPC event or `mbm://` navigation.
+/// A single cold-start retry covers the case where Akamai cookies aren't ready yet.
+fn bridge_script(id: u64, expr: &str) -> String {
     format!(
         r#"{core}
 (async () => {{
   const id = "{id}";
-  const kw = {kw};
   async function done(obj) {{
     obj.__id = id;
     try {{
@@ -80,11 +82,11 @@ fn build_lookup_script(id: u64, part_number: &str) -> String {
   }}
   try {{
     let out;
-    try {{ out = await window.MisumiCore.lookupOne(kw); }}
+    try {{ out = await ({expr}); }}
     catch (e1) {{
       // cold start (Akamai cookie not ready yet) -> wait and retry once
       await new Promise(function (r) {{ setTimeout(r, 2500); }});
-      out = await window.MisumiCore.lookupOne(kw);
+      out = await ({expr});
     }}
     await done(out);
   }} catch (e) {{
@@ -93,8 +95,14 @@ fn build_lookup_script(id: u64, part_number: &str) -> String {
 }})();"#,
         core = LOOKUP_CORE_JS,
         id = id,
-        kw = kw
+        expr = expr
     )
+}
+
+/// Single-part lookup script: `MisumiCore.lookupOne(<part>)`.
+fn build_lookup_script(id: u64, part_number: &str) -> String {
+    let kw = serde_json::to_string(part_number).unwrap_or_else(|_| "\"\"".into());
+    bridge_script(id, &format!("window.MisumiCore.lookupOne({kw})"))
 }
 
 #[tauri::command]
@@ -201,6 +209,161 @@ fn bom_export(path: String, doc: model::BomDoc) -> Result<(), String> {
     std::fs::write(&path, json).map_err(|e| e.to_string())
 }
 
+// ---- Supplier quote (cache-first batch fetch via the bridge) ----
+
+/// Evaluate `script` in the bridge webview and await the matching `__id` result.
+/// The pending map / oneshot is never locked across the `.await`.
+async fn bridge_fetch(
+    app: &AppHandle,
+    bridge: &Arc<Bridge>,
+    id: u64,
+    script: String,
+    secs: u64,
+) -> Result<Value, String> {
+    let (tx, rx) = oneshot::channel::<Value>();
+    bridge.pending.lock().unwrap().insert(id, tx);
+    let webview = app
+        .get_webview_window("bridge")
+        .ok_or_else(|| "ブリッジWebViewが見つかりません".to_string())?;
+    if let Err(e) = webview.eval(&script) {
+        bridge.pending.lock().unwrap().remove(&id);
+        return Err(format!("スクリプト実行に失敗しました: {e}"));
+    }
+    match tokio::time::timeout(Duration::from_secs(secs), rx).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(_)) => Err("結果の受信に失敗しました".into()),
+        Err(_) => {
+            bridge.pending.lock().unwrap().remove(&id);
+            Err("問い合わせがタイムアウトしました（ネットワークまたはBot対策の可能性）".into())
+        }
+    }
+}
+
+/// True if the cached quote was fetched on `today` (local YYYY-MM-DD). Once the
+/// calendar day changes, MISUMI price/stock may differ, so a stale entry is re-fetched
+/// on the next bulk fetch (same-day entries are served from cache).
+fn fetched_today(q: &model::SupplierQuote, today: &str) -> bool {
+    match q.fetched_at.as_deref() {
+        Some(s) if s.len() >= 10 => &s[..10] == today,
+        _ => false,
+    }
+}
+
+/// Quote `items` from `supplier`. Cache-first (cross-BOM `supplier_cache`), then
+/// fetch only the misses in `<= caps.max_batch` chunks, emitting `quote-progress`.
+/// Returns one normalized quote per input item (repeats share the cached quote).
+#[tauri::command]
+async fn quote(
+    app: AppHandle,
+    db: State<'_, DbState>,
+    supplier: String,
+    items: Vec<QuoteItem>,
+    force: bool,
+) -> Result<Vec<model::SupplierQuote>, String> {
+    let provider =
+        provider_for(&supplier).ok_or_else(|| format!("未対応のサプライヤです: {supplier}"))?;
+    let caps = provider.caps();
+
+    // Unique, non-empty part numbers (a BOM may repeat a part across rows).
+    let mut uniq: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for it in &items {
+        let p = it.part_no.trim().to_string();
+        if !p.is_empty() && seen.insert(p.clone()) {
+            uniq.push(p);
+        }
+    }
+
+    let mut map: HashMap<String, model::SupplierQuote> = HashMap::new();
+
+    // 1) Cache-first (skip on force). Lock is scoped — never held across an await.
+    let mut misses: Vec<String> = Vec::new();
+    if force {
+        misses = uniq.clone();
+    } else {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        // Same-day freshness: reuse a cache entry only if it was fetched today; entries
+        // from a previous day are re-fetched (price/stock may have changed since).
+        let today = db::today_local(&conn).map_err(|e| e.to_string())?;
+        for p in &uniq {
+            match db::cache_get(&conn, &supplier, p).map_err(|e| e.to_string())? {
+                Some(q) if fetched_today(&q, &today) => {
+                    map.insert(p.clone(), q);
+                }
+                _ => misses.push(p.clone()),
+            }
+        }
+    }
+
+    let total = misses.len();
+    let _ = app.emit(
+        "quote-progress",
+        serde_json::json!({ "supplier": supplier, "done": 0, "total": total }),
+    );
+
+    if total > 0 {
+        // Wait for the bridge webview to clear Akamai (same as lookup_part).
+        let bridge = app.state::<Arc<Bridge>>().inner().clone();
+        let mut waited = 0u64;
+        while !bridge.ready.load(Ordering::Relaxed) {
+            if waited >= 30_000 {
+                return Err("ブリッジの初期化がタイムアウトしました".into());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            waited += 200;
+        }
+
+        let mut done = 0usize;
+        for chunk in misses.chunks(caps.max_batch.max(1)) {
+            let parts: Vec<String> = chunk.to_vec();
+            let id = bridge.counter.fetch_add(1, Ordering::Relaxed);
+            let script = bridge_script(id, &provider.fetch_call_js(&parts));
+            // lookupMany(N) does N suggests + 1 price POST, so allow a longer deadline.
+            let raw = bridge_fetch(&app, &bridge, id, script, 120).await?;
+            let mut quotes = provider.normalize(&parts, &raw);
+
+            // Stamp one consistent fetched_at, then write cache (lock scoped, no await).
+            {
+                let conn = db.0.lock().map_err(|e| e.to_string())?;
+                let now = db::now_string(&conn).map_err(|e| e.to_string())?;
+                for q in &mut quotes {
+                    q.fetched_at = Some(now.clone());
+                }
+                for (p, q) in parts.iter().zip(quotes.iter()) {
+                    db::cache_put(&conn, &supplier, p, q).map_err(|e| e.to_string())?;
+                }
+            }
+            for (p, q) in parts.into_iter().zip(quotes.into_iter()) {
+                map.insert(p, q);
+            }
+            done += chunk.len();
+            let _ = app.emit(
+                "quote-progress",
+                serde_json::json!({ "supplier": supplier, "done": done, "total": total }),
+            );
+        }
+    }
+
+    // 2) Align results to the input items (repeated parts share their quote).
+    let results = items
+        .iter()
+        .map(|it| {
+            let p = it.part_no.trim();
+            map.get(p).cloned().unwrap_or_else(|| model::SupplierQuote {
+                supplier_code: supplier.clone(),
+                status: "error".to_string(),
+                product: None,
+                quote: None,
+                errors: vec!["型番が空です".to_string()],
+                warnings: vec![],
+                fetched_at: None,
+                raw: None,
+            })
+        })
+        .collect();
+    Ok(results)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -265,7 +428,8 @@ pub fn run() {
             bom_save,
             bom_delete,
             bom_import,
-            bom_export
+            bom_export,
+            quote
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

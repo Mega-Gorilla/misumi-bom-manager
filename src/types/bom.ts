@@ -99,6 +99,62 @@ export const CORE_COLUMNS: ColumnDef[] = [
   { key: "material", label: "MATERIAL", kind: "core", editable: true, width: 160 },
 ];
 
+/** MISUMI/supplier fields that can be added as read-only linked columns.
+ *  `field` is a dotted path on SupplierQuote, or a computed key (status/messages). */
+export interface SupplierFieldDef {
+  field: string;
+  label: string;
+  width?: number;
+}
+
+// "EC " prefix distinguishes fetched supplier columns from the user's own BOM columns
+// (品名/出荷日 等と紛らわしいため)。"在庫" は即時出荷可能数(immediateShippableQty)
+// なので意味を明確化して "即納在庫数"。
+export const SUPPLIER_FIELDS: SupplierFieldDef[] = [
+  { field: "product.name", label: "EC 品名", width: 200 },
+  { field: "quote.unitPrice", label: "EC 単価(税別)", width: 120 },
+  { field: "quote.unitPriceTax", label: "EC 単価(税込)", width: 120 },
+  { field: "quote.shipDate", label: "EC 出荷日", width: 120 },
+  { field: "quote.stock", label: "EC 即納在庫数", width: 120 },
+  { field: "quote.moq", label: "EC 最小数量", width: 110 },
+  { field: "quote.subtotal", label: "EC 小計", width: 110 },
+  { field: "status", label: "EC 状態", width: 90 },
+  { field: "messages", label: "EC メッセージ", width: 240 },
+  { field: "fetchedAt", label: "EC 取得日時", width: 160 },
+];
+
+/** Fields seeded as supplier columns on a new BOM. `status` is intentionally NOT
+ *  seeded (redundant with the message column + red error highlight); it stays in
+ *  SUPPLIER_FIELDS so it can still be added via the column manager on demand. */
+const DEFAULT_SUPPLIER_FIELDS = [
+  "quote.unitPrice",
+  "quote.shipDate",
+  "quote.stock",
+  "messages",
+];
+
+function supplierKey(field: string): string {
+  return "s_" + field.replace(/[^a-zA-Z0-9]+/g, "_").toLowerCase();
+}
+
+export function newSupplierColumn(field: string, label: string, width?: number): ColumnDef {
+  return {
+    key: supplierKey(field),
+    label,
+    kind: "supplier",
+    editable: false,
+    width: width ?? 120,
+    link: { field, write: "fillEmpty" },
+  };
+}
+
+function defaultSupplierColumns(): ColumnDef[] {
+  return DEFAULT_SUPPLIER_FIELDS.map((f) => {
+    const def = SUPPLIER_FIELDS.find((s) => s.field === f)!;
+    return newSupplierColumn(def.field, def.label, def.width);
+  });
+}
+
 export function newRowId(): string {
   return crypto.randomUUID();
 }
@@ -117,7 +173,7 @@ export function newBom(name = "新規 BOM"): BomDoc {
     id: crypto.randomUUID(),
     version: 1,
     meta: { name, qtyMultiplier: 1 },
-    columns: CORE_COLUMNS.map((c) => ({ ...c })),
+    columns: [...CORE_COLUMNS.map((c) => ({ ...c })), ...defaultSupplierColumns()],
     rows: [newRow(1)],
   };
 }
