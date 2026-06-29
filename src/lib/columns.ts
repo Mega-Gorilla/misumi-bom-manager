@@ -22,13 +22,9 @@ export function buildColumnDefs(doc: BomDoc): ColDef<BomRow>[] {
  *    overwrite -> always write the fetched value; fillEmpty -> only blank cells;
  *    suggest   -> no write (shown via diff highlight / tooltip). */
 export function applyLinkedColumns(doc: BomDoc): BomDoc {
+  // ORDER is the fetch-dispatch / gate / dropdown key and never a fill target.
   const links = doc.columns.filter(
-    (c) =>
-      c.kind !== "supplier" &&
-      c.editable &&
-      c.link &&
-      c.key !== "partsNo" &&
-      c.key !== "order",
+    (c) => c.kind !== "supplier" && c.editable && c.link && c.key !== "order",
   );
   if (links.length === 0) return doc;
   const rows = doc.rows.map((r) => {
@@ -37,11 +33,13 @@ export function applyLinkedColumns(doc: BomDoc): BomDoc {
     for (const c of links) {
       const fetched = getSupplierFieldValue(nr, c.link!.field);
       if (fetched == null || fetched === "") continue;
+      // keepSupplier: a link-fill of partsNo is normalization of the same part, not a change.
       if (c.link!.write === "overwrite") {
-        nr = setCellValue(nr, c, fetched);
+        nr = setCellValue(nr, c, fetched, { keepSupplier: true });
       } else if (c.link!.write === "fillEmpty") {
         const cur = getCellValue(nr, c);
-        if (cur == null || String(cur).trim() === "") nr = setCellValue(nr, c, fetched);
+        if (cur == null || String(cur).trim() === "")
+          nr = setCellValue(nr, c, fetched, { keepSupplier: true });
       }
       // suggest: no write (display only)
     }
@@ -92,13 +90,22 @@ export function getCellValue(row: BomRow, col: ColumnDef): unknown {
 
 /** Return a new row with `col` set to `value` (immutable). Mirrors the column
  *  valueSetter semantics (numeric parse for No./Qty, custom -> row.custom). */
-export function setCellValue(row: BomRow, col: ColumnDef, value: unknown): BomRow {
+export function setCellValue(
+  row: BomRow,
+  col: ColumnDef,
+  value: unknown,
+  opts?: { keepSupplier?: boolean },
+): BomRow {
   if (col.kind === "supplier" || !col.editable) return row;
   if (col.kind === "custom") {
     return { ...row, custom: { ...row.custom, [col.key]: value == null ? "" : String(value) } };
   }
-  // Changing the part number invalidates any fetched EC result for this row.
-  const r = col.key === "partsNo" && row.supplier ? { ...row, supplier: undefined } : row;
+  // A manual part-number change invalidates the fetched EC result; a programmatic
+  // link-fill (normalization to the SAME part) keeps it via opts.keepSupplier.
+  const r =
+    col.key === "partsNo" && row.supplier && !opts?.keepSupplier
+      ? { ...row, supplier: undefined }
+      : row;
   if (NUMERIC_CORE_KEYS.has(col.key)) {
     const n = Number(value);
     return { ...r, [col.key]: Number.isFinite(n) ? n : undefined };

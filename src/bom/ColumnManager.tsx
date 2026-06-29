@@ -17,9 +17,11 @@ interface Props {
 // Supplier data fields that can drive an existing editable column (write policy).
 const LINKABLE = SUPPLIER_FIELDS.filter((f) => f.linkable);
 
-// Editable, non-key columns that may be linked to a MISUMI field.
+// Editable columns that may be linked to a MISUMI field. ORDER is excluded (it is the
+// supplier dispatch / gate / dropdown key, not a fill target). Parts No is allowed so
+// it can be normalized to MISUMI's canonical part number.
 function canLink(c: ColumnDef): boolean {
-  return c.kind !== "supplier" && c.editable && c.key !== "partsNo" && c.key !== "order";
+  return c.kind !== "supplier" && c.editable && c.key !== "order";
 }
 
 export function ColumnManager(p: Props) {
