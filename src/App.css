@@ -266,6 +266,33 @@ body.fill-dragging {
   align-items: center;
   margin-bottom: 12px;
 }
+.col-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 14px;
+}
+.col-tabs button {
+  border: none;
+  background: none;
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  padding: 6px 14px;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+.col-tabs button:hover:not(:disabled) {
+  border-color: transparent;
+  box-shadow: none;
+  color: var(--text);
+}
+.col-tabs button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.col-name-cell {
+  font-size: 0.88rem;
+}
 .role-config {
   margin-bottom: 14px;
   padding: 10px 12px;
