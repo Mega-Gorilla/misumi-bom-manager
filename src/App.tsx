@@ -80,8 +80,16 @@ export default function App() {
       return;
     }
     // Duplicate values but assign fresh ids and sequential No. (No. must not duplicate).
+    // Deep-copy nested data so the clone does not share `custom` (and later `supplier`)
+    // objects with the source row — the custom valueSetter mutates row.custom in place.
     let n = nextNo(doc.rows);
-    const clones = sel.map((r) => ({ ...r, id: crypto.randomUUID(), no: n++ }));
+    const clones = sel.map((r) => ({
+      ...r,
+      id: crypto.randomUUID(),
+      no: n++,
+      custom: { ...r.custom },
+      supplier: r.supplier ? structuredClone(r.supplier) : undefined,
+    }));
     setDoc({ ...doc, rows: [...doc.rows, ...clones] });
   };
 
