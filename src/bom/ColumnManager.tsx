@@ -56,36 +56,56 @@ export function ColumnManager(p: Props) {
           </button>
         </div>
 
-        <ul className="col-list">
-          {p.columns.map((c, i) => (
-            <li key={c.key}>
-              <input
-                className="col-label"
-                value={c.label}
-                onChange={(e) => p.onRename(c.key, e.currentTarget.value)}
-              />
-              <span className={`kind kind-${c.kind}`} title={KIND_TITLE[c.kind] ?? c.kind}>
-                {KIND_LABEL[c.kind] ?? c.kind}
-              </span>
-              {canLink(c) && (
-                <span className="col-link">
-                  <span className="link-arrow" title="この列を埋める取得項目">
-                    ←
+        <table className="col-table">
+          <thead>
+            <tr>
+              <th>列名</th>
+              <th>種別</th>
+              <th>EC連携</th>
+              <th>書込</th>
+              <th className="col-th-actions">並べ替え / 削除</th>
+            </tr>
+          </thead>
+          <tbody>
+            {p.columns.map((c, i) => (
+              <tr key={c.key}>
+                <td>
+                  <input
+                    className="col-label"
+                    value={c.label}
+                    onChange={(e) => p.onRename(c.key, e.currentTarget.value)}
+                  />
+                </td>
+                <td>
+                  <span className={`kind kind-${c.kind}`} title={KIND_TITLE[c.kind] ?? c.kind}>
+                    {KIND_LABEL[c.kind] ?? c.kind}
                   </span>
-                  <select
-                    value={c.link?.field ?? ""}
-                    onChange={(e) =>
-                      p.onSetLink(c.key, e.currentTarget.value || null, c.link?.write ?? "fillEmpty")
-                    }
-                  >
-                    <option value="">連携なし</option>
-                    {LINKABLE.map((f) => (
-                      <option key={f.field} value={f.field}>
-                        {f.label}
-                      </option>
-                    ))}
-                  </select>
-                  {c.link && (
+                </td>
+                <td>
+                  {canLink(c) ? (
+                    <select
+                      value={c.link?.field ?? ""}
+                      onChange={(e) =>
+                        p.onSetLink(
+                          c.key,
+                          e.currentTarget.value || null,
+                          c.link?.write ?? "fillEmpty",
+                        )
+                      }
+                    >
+                      <option value="">連携なし</option>
+                      {LINKABLE.map((f) => (
+                        <option key={f.field} value={f.field}>
+                          {f.label}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <span className="dash">—</span>
+                  )}
+                </td>
+                <td>
+                  {canLink(c) && c.link ? (
                     <select
                       value={c.link.write}
                       onChange={(e) =>
@@ -99,38 +119,42 @@ export function ColumnManager(p: Props) {
                         </option>
                       ))}
                     </select>
+                  ) : (
+                    <span className="dash">—</span>
                   )}
-                </span>
-              )}
-              <span className="col-actions">
-                <button
-                  className="icon-btn"
-                  disabled={i === 0}
-                  onClick={() => p.onMove(c.key, -1)}
-                  title="上へ"
-                >
-                  <ChevronUp size={15} />
-                </button>
-                <button
-                  className="icon-btn"
-                  disabled={i === p.columns.length - 1}
-                  onClick={() => p.onMove(c.key, 1)}
-                  title="下へ"
-                >
-                  <ChevronDown size={15} />
-                </button>
-                <button
-                  className="icon-btn danger"
-                  disabled={c.kind === "core"}
-                  title={c.kind === "core" ? "core 列は削除不可" : "削除"}
-                  onClick={() => p.onDelete(c.key)}
-                >
-                  <Trash2 size={15} />
-                </button>
-              </span>
-            </li>
-          ))}
-        </ul>
+                </td>
+                <td>
+                  <div className="col-actions">
+                    <button
+                      className="icon-btn"
+                      disabled={i === 0}
+                      onClick={() => p.onMove(c.key, -1)}
+                      title="上へ"
+                    >
+                      <ChevronUp size={15} />
+                    </button>
+                    <button
+                      className="icon-btn"
+                      disabled={i === p.columns.length - 1}
+                      onClick={() => p.onMove(c.key, 1)}
+                      title="下へ"
+                    >
+                      <ChevronDown size={15} />
+                    </button>
+                    <button
+                      className="icon-btn danger"
+                      disabled={c.kind === "core"}
+                      title={c.kind === "core" ? "core 列は削除不可" : "削除"}
+                      onClick={() => p.onDelete(c.key)}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
 
         <div className="col-add">
           <input

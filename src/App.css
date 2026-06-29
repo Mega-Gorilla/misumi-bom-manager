@@ -266,58 +266,61 @@ body.fill-dragging {
   align-items: center;
   margin-bottom: 12px;
 }
-.col-list {
-  list-style: none;
-  margin: 0 0 14px;
-  padding: 0;
+.col-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 14px;
 }
-.col-list li {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--border);
-}
-.col-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-}
-.link-arrow {
+.col-table th {
+  text-align: left;
+  font-size: 0.72rem;
   color: var(--muted);
-  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 4px 8px 6px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
 }
-.col-actions {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.col-table th.col-th-actions {
+  text-align: right;
 }
-.col-link select {
-  font-size: 0.78rem;
-  padding: 3px 6px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--card);
-  color: var(--text);
+.col-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
 }
-.col-list .col-label {
-  flex: 0 0 150px;
+.col-table .col-label {
+  width: 100%;
+  box-sizing: border-box;
   padding: 5px 8px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--card);
   color: var(--text);
 }
-.col-list .kind {
+.col-table select {
+  max-width: 150px;
+  font-size: 0.8rem;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}
+.col-table .kind {
   font-size: 0.7rem;
   color: var(--muted);
-  width: 72px;
-  text-align: center;
-  flex: none;
+  white-space: nowrap;
 }
-.col-list .kind-custom {
+.col-table .kind-custom {
   color: var(--accent);
+}
+.col-table .dash {
+  color: var(--muted);
+}
+.col-actions {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
 }
 .col-add {
   display: flex;
