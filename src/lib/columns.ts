@@ -16,6 +16,72 @@ export function buildColumnDefs(doc: BomDoc): ColDef<BomRow>[] {
   return doc.columns.map(toColDef);
 }
 
+/** Apply linked-column write policies to all rows using the current supplier results.
+ *  Called after a bulk fetch and when a link is configured. Only editable columns with
+ *  a link (excluding partsNo/order) on ORDER-matching rows are affected:
+ *    overwrite -> always write the fetched value; fillEmpty -> only blank cells;
+ *    suggest   -> no write (shown via diff highlight / tooltip). */
+export function applyLinkedColumns(doc: BomDoc): BomDoc {
+  const links = doc.columns.filter(
+    (c) =>
+      c.kind !== "supplier" &&
+      c.editable &&
+      c.link &&
+      c.key !== "partsNo" &&
+      c.key !== "order",
+  );
+  if (links.length === 0) return doc;
+  const rows = doc.rows.map((r) => {
+    if (!supplierActive(r)) return r;
+    let nr = r;
+    for (const c of links) {
+      const fetched = getSupplierFieldValue(nr, c.link!.field);
+      if (fetched == null || fetched === "") continue;
+      if (c.link!.write === "overwrite") {
+        nr = setCellValue(nr, c, fetched);
+      } else if (c.link!.write === "fillEmpty") {
+        const cur = getCellValue(nr, c);
+        if (cur == null || String(cur).trim() === "") nr = setCellValue(nr, c, fetched);
+      }
+      // suggest: no write (display only)
+    }
+    return nr;
+  });
+  return { ...doc, rows };
+}
+
+/** ColDef extras for an editable column linked to a supplier field: live diff highlight
+ *  (cell value vs fetched) + a "MISUMI: <value>" tooltip. Stateless. */
+function linkExtras(c: ColumnDef): Partial<ColDef<BomRow>> {
+  if (!c.link || c.kind === "supplier") return {};
+  const field = c.link.field;
+  const policy = c.link.write;
+  const extras: Partial<ColDef<BomRow>> = {
+    cellClassRules: {
+      "cell-link-diff": (p) => {
+        if (!p.data) return false;
+        const fetched = getSupplierFieldValue(p.data, field);
+        if (fetched == null || fetched === "") return false;
+        const cur = getCellValue(p.data, c);
+        if (cur == null || String(cur).trim() === "") return false;
+        return String(cur).trim() !== String(fetched).trim();
+      },
+      "cell-link-suggest": (p) => {
+        if (policy !== "suggest" || !p.data) return false;
+        const fetched = getSupplierFieldValue(p.data, field);
+        if (fetched == null || fetched === "") return false;
+        const cur = getCellValue(p.data, c);
+        return cur == null || String(cur).trim() === "";
+      },
+    },
+    tooltipValueGetter: (p) => {
+      const fetched = p.data ? getSupplierFieldValue(p.data, field) : "";
+      return fetched != null && fetched !== "" ? `MISUMI: ${fetched}` : "";
+    },
+  };
+  return extras;
+}
+
 /** Read a cell's value for a column (used by the fill handle). Supplier columns are
  *  read-only and return undefined. */
 export function getCellValue(row: BomRow, col: ColumnDef): unknown {
@@ -57,6 +123,7 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
         p.data.custom[c.key] = p.newValue == null ? "" : String(p.newValue);
         return true;
       },
+      ...linkExtras(c),
     };
   }
 
@@ -91,16 +158,23 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
     core.cellEditor = "agSelectCellEditor";
     core.cellEditorParams = { values: ORDER_OPTIONS };
   }
-  return core;
+  return { ...core, ...linkExtras(c) };
 }
 
 /** The row's supplier result applies only while its ORDER still matches the supplier
  *  it was fetched from. Changing ORDER away from MISUMI (or to blank) hides the data
  *  immediately, without needing a re-fetch; switching back re-shows the cached result. */
-function supplierActive(row: BomRow | undefined): boolean {
+export function supplierActive(row: BomRow | undefined): boolean {
   const s = row?.supplier;
   if (!s) return false;
   return (row?.order ?? "").trim().toUpperCase() === (s.supplierCode ?? "").toUpperCase();
+}
+
+/** Raw fetched value for a supplier data field (dotted path on the quote), gated by
+ *  ORDER. Used to drive/compare linked editable columns (write policy + diff highlight). */
+export function getSupplierFieldValue(row: BomRow | undefined, field: string): unknown {
+  if (!supplierActive(row)) return "";
+  return resolvePath(row!.supplier, field);
 }
 
 /** Resolve a supplier column value: computed keys (status/messages/fetchedAt/subtotal)

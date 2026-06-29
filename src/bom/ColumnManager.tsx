@@ -1,16 +1,25 @@
 import { useState } from "react";
 import { X, ChevronUp, ChevronDown, Trash2, Plus } from "lucide-react";
-import type { ColumnDef } from "../types/bom";
-import { SUPPLIER_FIELDS } from "../types/bom";
+import type { ColumnDef, WritePolicy } from "../types/bom";
+import { SUPPLIER_FIELDS, WRITE_POLICIES } from "../types/bom";
 
 interface Props {
   columns: ColumnDef[];
   onAdd: (label: string) => void;
   onAddSupplier: (field: string, label: string) => void;
+  onSetLink: (key: string, field: string | null, write: WritePolicy) => void;
   onRename: (key: string, label: string) => void;
   onDelete: (key: string) => void;
   onMove: (key: string, dir: -1 | 1) => void;
   onClose: () => void;
+}
+
+// Supplier data fields that can drive an existing editable column (write policy).
+const LINKABLE = SUPPLIER_FIELDS.filter((f) => f.linkable);
+
+// Editable, non-key columns that may be linked to a MISUMI field.
+function canLink(c: ColumnDef): boolean {
+  return c.kind !== "supplier" && c.editable && c.key !== "partsNo" && c.key !== "order";
 }
 
 export function ColumnManager(p: Props) {
@@ -36,36 +45,72 @@ export function ColumnManager(p: Props) {
         <ul className="col-list">
           {p.columns.map((c, i) => (
             <li key={c.key}>
-              <input
-                className="col-label"
-                value={c.label}
-                onChange={(e) => p.onRename(c.key, e.currentTarget.value)}
-              />
-              <span className={`kind kind-${c.kind}`}>{c.kind}</span>
-              <button
-                className="icon-btn"
-                disabled={i === 0}
-                onClick={() => p.onMove(c.key, -1)}
-                title="上へ"
-              >
-                <ChevronUp size={15} />
-              </button>
-              <button
-                className="icon-btn"
-                disabled={i === p.columns.length - 1}
-                onClick={() => p.onMove(c.key, 1)}
-                title="下へ"
-              >
-                <ChevronDown size={15} />
-              </button>
-              <button
-                className="icon-btn danger"
-                disabled={c.kind === "core"}
-                title={c.kind === "core" ? "core 列は削除不可" : "削除"}
-                onClick={() => p.onDelete(c.key)}
-              >
-                <Trash2 size={15} />
-              </button>
+              <div className="col-row">
+                <input
+                  className="col-label"
+                  value={c.label}
+                  onChange={(e) => p.onRename(c.key, e.currentTarget.value)}
+                />
+                <span className={`kind kind-${c.kind}`}>{c.kind}</span>
+                <button
+                  className="icon-btn"
+                  disabled={i === 0}
+                  onClick={() => p.onMove(c.key, -1)}
+                  title="上へ"
+                >
+                  <ChevronUp size={15} />
+                </button>
+                <button
+                  className="icon-btn"
+                  disabled={i === p.columns.length - 1}
+                  onClick={() => p.onMove(c.key, 1)}
+                  title="下へ"
+                >
+                  <ChevronDown size={15} />
+                </button>
+                <button
+                  className="icon-btn danger"
+                  disabled={c.kind === "core"}
+                  title={c.kind === "core" ? "core 列は削除不可" : "削除"}
+                  onClick={() => p.onDelete(c.key)}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
+
+              {canLink(c) && (
+                <div className="col-link">
+                  <span className="col-link-label">MISUMI 連携</span>
+                  <select
+                    value={c.link?.field ?? ""}
+                    onChange={(e) =>
+                      p.onSetLink(c.key, e.currentTarget.value || null, c.link?.write ?? "fillEmpty")
+                    }
+                  >
+                    <option value="">連携なし</option>
+                    {LINKABLE.map((f) => (
+                      <option key={f.field} value={f.field}>
+                        {f.label}
+                      </option>
+                    ))}
+                  </select>
+                  {c.link && (
+                    <select
+                      value={c.link.write}
+                      onChange={(e) =>
+                        p.onSetLink(c.key, c.link!.field, e.currentTarget.value as WritePolicy)
+                      }
+                      title="書込ポリシー"
+                    >
+                      {WRITE_POLICIES.map((w) => (
+                        <option key={w.value} value={w.value}>
+                          {w.label}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              )}
             </li>
           ))}
         </ul>
@@ -88,7 +133,9 @@ export function ColumnManager(p: Props) {
           <div className="supplier-fields-head">MISUMI 項目を列に追加</div>
           <div className="supplier-fields-list">
             {SUPPLIER_FIELDS.map((f) => {
-              const added = p.columns.some((c) => c.kind === "supplier" && c.link?.field === f.field);
+              const added = p.columns.some(
+                (c) => c.kind === "supplier" && c.link?.field === f.field,
+              );
               return (
                 <button
                   key={f.field}
