@@ -123,12 +123,13 @@ export const SUPPLIER_FIELDS: SupplierFieldDef[] = [
   { field: "fetchedAt", label: "EC 取得日時", width: 160 },
 ];
 
-/** Fields seeded as supplier columns on a new BOM. */
+/** Fields seeded as supplier columns on a new BOM. `status` is intentionally NOT
+ *  seeded (redundant with the message column + red error highlight); it stays in
+ *  SUPPLIER_FIELDS so it can still be added via the column manager on demand. */
 const DEFAULT_SUPPLIER_FIELDS = [
   "quote.unitPrice",
   "quote.shipDate",
   "quote.stock",
-  "status",
   "messages",
 ];
 
