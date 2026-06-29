@@ -170,6 +170,37 @@ fn bom_delete(db: State<DbState>, id: String) -> Result<(), String> {
     db::delete_bom(&conn, &id).map_err(|e| e.to_string())
 }
 
+/// Import a BOM from a JSON file path (picked via the dialog plugin on the frontend).
+/// Backend file IO avoids plugin-fs scope limits and keeps BomDoc<->JSON authority in Rust.
+#[tauri::command]
+fn bom_import(db: State<DbState>, path: String) -> Result<String, String> {
+    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut doc: model::BomDoc = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    // Import always creates a NEW BOM (list "JSON取込" = 新規作成). Drop any embedded
+    // id so save_bom assigns a fresh one — re-importing an export yields a new copy,
+    // never an overwrite of an existing BOM.
+    doc.id = None;
+    // BomRow.id is `#[serde(default)]`, so rows lacking an id parse to ""; assign here.
+    for row in &mut doc.rows {
+        if row.id.trim().is_empty() {
+            row.id = db::new_id();
+        }
+    }
+    if doc.meta.qty_multiplier == 0.0 {
+        doc.meta.qty_multiplier = 1.0;
+    }
+    doc.meta.imported_from = Some(path);
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::save_bom(&mut conn, &doc).map_err(|e| e.to_string())
+}
+
+/// Export a BOM document to a JSON file path (picked via the dialog plugin).
+#[tauri::command]
+fn bom_export(path: String, doc: model::BomDoc) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -232,7 +263,9 @@ pub fn run() {
             bom_list,
             bom_load,
             bom_save,
-            bom_delete
+            bom_delete,
+            bom_import,
+            bom_export
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

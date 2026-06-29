@@ -104,7 +104,7 @@ CREATE TABLE mapping_template (
 );
 "#;
 
-fn new_id() -> String {
+pub fn new_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -342,5 +342,17 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM bom_row", [], |r| r.get(0))
             .unwrap();
         assert_eq!(row_count, 0); // cascade
+    }
+
+    #[test]
+    fn bomrow_id_defaults_when_missing() {
+        // JSON import: rows without an "id" field must still parse (id => ""),
+        // so bom_import can assign a fresh id. Regression for PR #6 review.
+        let json = r#"{"version":1,"meta":{"name":"x","qtyMultiplier":1},
+            "columns":[],"rows":[{"partsNo":"CBT3-8","custom":{}}]}"#;
+        let doc: BomDoc = serde_json::from_str(json).unwrap();
+        assert_eq!(doc.rows.len(), 1);
+        assert_eq!(doc.rows[0].id, "");
+        assert_eq!(doc.rows[0].parts_no.as_deref(), Some("CBT3-8"));
     }
 }

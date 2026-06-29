@@ -98,6 +98,9 @@ pub struct SupplierQuote {
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct BomRow {
+    /// `#[serde(default)]` so JSON import of rows lacking `id` parses (→ ""), then
+    /// `bom_import` assigns a fresh id. UI-created rows always set a UUID.
+    #[serde(default)]
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no: Option<i64>,
