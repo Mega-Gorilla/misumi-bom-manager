@@ -30,7 +30,10 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
     (e: CellValueChangedEvent<BomRow>) => {
       // AG Grid has already mutated e.data via field / valueSetter; reflect it
       // back into the doc immutably so state stays the source of truth.
-      const rows = doc.rows.map((r) => (r.id === e.data.id ? { ...e.data } : r));
+      // Changing the part number invalidates the fetched EC result for that row.
+      const updated =
+        e.column.getColId() === "partsNo" ? { ...e.data, supplier: undefined } : { ...e.data };
+      const rows = doc.rows.map((r) => (r.id === e.data.id ? updated : r));
       onChange({ ...doc, rows });
     },
     [doc, onChange],
@@ -56,6 +59,7 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
         rowData={doc.rows}
         columnDefs={columnDefs}
         getRowId={(p) => p.data.id}
+        context={{ qtyMultiplier: doc.meta.qtyMultiplier ?? 1 }}
         rowSelection={{ mode: "multiRow" }}
         onGridReady={(e: GridReadyEvent<BomRow>) => setApi(e.api)}
         onCellValueChanged={onCellValueChanged}

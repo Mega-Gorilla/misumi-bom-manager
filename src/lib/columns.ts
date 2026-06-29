@@ -31,11 +31,13 @@ export function setCellValue(row: BomRow, col: ColumnDef, value: unknown): BomRo
   if (col.kind === "custom") {
     return { ...row, custom: { ...row.custom, [col.key]: value == null ? "" : String(value) } };
   }
+  // Changing the part number invalidates any fetched EC result for this row.
+  const r = col.key === "partsNo" && row.supplier ? { ...row, supplier: undefined } : row;
   if (NUMERIC_CORE_KEYS.has(col.key)) {
     const n = Number(value);
-    return { ...row, [col.key]: Number.isFinite(n) ? n : undefined };
+    return { ...r, [col.key]: Number.isFinite(n) ? n : undefined };
   }
-  return { ...row, [col.key]: value == null ? "" : String(value) };
+  return { ...r, [col.key]: value == null ? "" : String(value) };
 }
 
 function toColDef(c: ColumnDef): ColDef<BomRow> {
@@ -62,7 +64,8 @@ function toColDef(c: ColumnDef): ColDef<BomRow> {
     return {
       ...base,
       editable: false,
-      valueGetter: (p: ValueGetterParams<BomRow>) => supplierValue(p.data, c.link?.field),
+      valueGetter: (p: ValueGetterParams<BomRow>) =>
+        supplierValue(p.data, c.link?.field, p.context?.qtyMultiplier ?? 1),
       cellClassRules: {
         "cell-error": (p) => supplierActive(p.data) && p.data?.supplier?.status === "error",
       },
@@ -100,14 +103,26 @@ function supplierActive(row: BomRow | undefined): boolean {
   return (row?.order ?? "").trim().toUpperCase() === (s.supplierCode ?? "").toUpperCase();
 }
 
-/** Resolve a supplier column value: computed keys (status/messages/fetchedAt) or a
- *  dotted path on the row's SupplierQuote (e.g. "quote.unitPrice"). Gated by ORDER. */
-function supplierValue(row: BomRow | undefined, field?: string): unknown {
+/** Resolve a supplier column value: computed keys (status/messages/fetchedAt/subtotal)
+ *  or a dotted path on the row's SupplierQuote. Gated by ORDER. Qty-derived values
+ *  (subtotal, MOQ note) are computed LIVE from the row's current Qty/multiplier so they
+ *  never go stale after the user edits Qty. */
+function supplierValue(row: BomRow | undefined, field?: string, qtyMultiplier = 1): unknown {
   if (!field || !supplierActive(row)) return "";
   const s = row!.supplier!;
+  const qty = row!.qty ?? 1;
   if (field === "status") return s.status ?? "";
-  if (field === "messages") return [...(s.errors ?? []), ...(s.warnings ?? [])].join(" / ");
   if (field === "fetchedAt") return (s.fetchedAt ?? "").slice(0, 16); // "YYYY-MM-DD HH:MM" (秒を除去)
+  if (field === "messages") {
+    const msgs = [...(s.errors ?? []), ...(s.warnings ?? [])];
+    const moq = s.quote?.moq;
+    if (moq != null && qty < moq) msgs.push(`最小発注数 ${moq}（現在 ${qty}）`);
+    return msgs.join(" / ");
+  }
+  if (field === "quote.subtotal") {
+    const unit = Number(s.quote?.unitPrice);
+    return Number.isFinite(unit) ? unit * qty * (qtyMultiplier || 1) : "";
+  }
   return resolvePath(s, field);
 }
 

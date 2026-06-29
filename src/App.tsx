@@ -164,23 +164,13 @@ export default function App() {
       );
       const items = targets.map((r) => ({ partNo: r.partsNo!.trim() }));
       const quotes = await api.quote("MISUMI", items, force);
-      const mult = doc.meta.qtyMultiplier || 1;
       const byId = new Map<string, SupplierQuote>();
+      // Store the raw quote only. Subtotal and the MOQ note are derived LIVE in the
+      // supplier column getters from the row's current Qty/multiplier, so they stay
+      // correct after the user edits Qty (no stale stamped values).
       targets.forEach((r, idx) => {
         const q = quotes[idx];
-        if (!q) return;
-        const qty = r.qty ?? 1;
-        const unit = Number(q.quote?.unitPrice);
-        if (q.quote && Number.isFinite(unit)) {
-          q.quote.subtotal = unit * qty * mult;
-        }
-        // MOQ is qty-independent (product minSoQty); judge it against THIS row's Qty
-        // rather than the representative qty=1 fetch, so the per-row signal is accurate.
-        const moq = q.quote?.moq;
-        if (moq != null && qty < moq) {
-          q.warnings = [...(q.warnings ?? []), `最小発注数 ${moq}（現在 ${qty}）`];
-        }
-        byId.set(r.id, q);
+        if (q) byId.set(r.id, q);
       });
       // Apply fresh quotes to targets; clear stale supplier data from rows that are no
       // longer MISUMI targets (ORDER changed away / Parts No removed) so re-fetch resets them.
