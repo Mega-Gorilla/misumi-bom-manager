@@ -100,23 +100,33 @@ export const CORE_COLUMNS: ColumnDef[] = [
 ];
 
 /** MISUMI/supplier fields that can be added as read-only linked columns.
- *  `field` is a dotted path on SupplierQuote, or a computed key (status/messages). */
+ *  `field` is a dotted path on SupplierQuote, or a computed key (status/messages).
+ *  `linkable` = concrete data field that may also drive an existing editable column
+ *  (write policy / PR-D). Computed/meta fields (status/messages/fetchedAt/subtotal) are not. */
 export interface SupplierFieldDef {
   field: string;
   label: string;
   width?: number;
+  linkable?: boolean;
 }
+
+/** Write-policy choices for a linked editable column (ColumnLink.write). */
+export const WRITE_POLICIES: { value: WritePolicy; label: string }[] = [
+  { value: "fillEmpty", label: "空欄補完" },
+  { value: "overwrite", label: "上書き" },
+  { value: "suggest", label: "提案" },
+];
 
 // "EC " prefix distinguishes fetched supplier columns from the user's own BOM columns
 // (品名/出荷日 等と紛らわしいため)。"在庫" は即時出荷可能数(immediateShippableQty)
 // なので意味を明確化して "即納在庫数"。
 export const SUPPLIER_FIELDS: SupplierFieldDef[] = [
-  { field: "product.name", label: "EC 品名", width: 200 },
-  { field: "quote.unitPrice", label: "EC 単価(税別)", width: 120 },
-  { field: "quote.unitPriceTax", label: "EC 単価(税込)", width: 120 },
-  { field: "quote.shipDate", label: "EC 出荷日", width: 120 },
-  { field: "quote.stock", label: "EC 即納在庫数", width: 120 },
-  { field: "quote.moq", label: "EC 最小数量", width: 110 },
+  { field: "product.name", label: "EC 品名", width: 200, linkable: true },
+  { field: "quote.unitPrice", label: "EC 単価(税別)", width: 120, linkable: true },
+  { field: "quote.unitPriceTax", label: "EC 単価(税込)", width: 120, linkable: true },
+  { field: "quote.shipDate", label: "EC 出荷日", width: 120, linkable: true },
+  { field: "quote.stock", label: "EC 即納在庫数", width: 120, linkable: true },
+  { field: "quote.moq", label: "EC 最小数量", width: 110, linkable: true },
   { field: "quote.subtotal", label: "EC 小計", width: 110 },
   { field: "status", label: "EC 状態", width: 90 },
   { field: "messages", label: "EC メッセージ", width: 240 },

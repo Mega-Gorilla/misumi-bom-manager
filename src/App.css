@@ -250,7 +250,8 @@ body.fill-dragging {
   z-index: 50;
 }
 .col-mgr {
-  width: 460px;
+  width: 640px;
+  max-width: 92vw;
   max-height: 80vh;
   overflow: auto;
   background: var(--card);
@@ -265,34 +266,61 @@ body.fill-dragging {
   align-items: center;
   margin-bottom: 12px;
 }
-.col-list {
-  list-style: none;
-  margin: 0 0 14px;
-  padding: 0;
+.col-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 14px;
 }
-.col-list li {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 0;
+.col-table th {
+  text-align: left;
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-weight: 600;
+  padding: 4px 8px 6px;
   border-bottom: 1px solid var(--border);
+  white-space: nowrap;
 }
-.col-list .col-label {
-  flex: 1;
+.col-table th.col-th-actions {
+  text-align: right;
+}
+.col-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.col-table .col-label {
+  width: 100%;
+  box-sizing: border-box;
   padding: 5px 8px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--card);
   color: var(--text);
 }
-.col-list .kind {
+.col-table select {
+  max-width: 150px;
+  font-size: 0.8rem;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}
+.col-table .kind {
   font-size: 0.7rem;
   color: var(--muted);
-  width: 64px;
-  text-align: center;
+  white-space: nowrap;
 }
-.col-list .kind-custom {
+.col-table .kind-custom {
   color: var(--accent);
+}
+.col-table .dash {
+  color: var(--muted);
+}
+.col-actions {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
 }
 .col-add {
   display: flex;
@@ -315,6 +343,16 @@ button:disabled {
 .cell-error {
   color: var(--error);
   background: #fdecea;
+}
+
+/* linked editable column: cell value differs from the fetched MISUMI value */
+.cell-link-diff {
+  background: #fff4e5;
+  box-shadow: inset 2px 0 0 #f59e0b;
+}
+/* linked editable column (suggest policy): an unfilled suggestion is available */
+.cell-link-suggest {
+  background: #f3f7ff;
 }
 
 /* ColumnManager: add MISUMI fields as columns */

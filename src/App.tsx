@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgGridReact } from "ag-grid-react";
 import "./App.css";
-import type { BomDoc, BomRow, BomSummary, SupplierQuote } from "./types/bom";
+import type { BomDoc, BomRow, BomSummary, SupplierQuote, WritePolicy } from "./types/bom";
 import { newBom, newRow, nextNo, newSupplierColumn, SUPPLIER_FIELDS } from "./types/bom";
+import { applyLinkedColumns } from "./lib/columns";
 import * as api from "./api/bom";
 import { BomEditor } from "./bom/BomEditor";
 import { Toolbar } from "./bom/Toolbar";
@@ -133,6 +134,16 @@ export default function App() {
     setDoc({ ...doc, columns: doc.columns.filter((c) => c.key !== key) });
   };
 
+  // Link (or unlink) an existing editable column to a MISUMI field with a write policy,
+  // then apply it immediately to the current supplier results.
+  const setColumnLink = (key: string, field: string | null, write: WritePolicy) => {
+    if (!doc) return;
+    const columns = doc.columns.map((c) =>
+      c.key === key ? (field ? { ...c, link: { field, write } } : { ...c, link: undefined }) : c,
+    );
+    setDoc(applyLinkedColumns({ ...doc, columns }));
+  };
+
   const addSupplierColumn = (field: string, label: string) => {
     if (!doc) return;
     if (doc.columns.some((c) => c.kind === "supplier" && c.link?.field === field)) return;
@@ -174,20 +185,18 @@ export default function App() {
       });
       // Apply fresh quotes to targets; clear stale supplier data from rows that are no
       // longer MISUMI targets (ORDER changed away / Parts No removed) so re-fetch resets them.
-      setDoc((d) =>
-        d
-          ? {
-              ...d,
-              rows: d.rows.map((r) =>
-                byId.has(r.id)
-                  ? { ...r, supplier: byId.get(r.id) }
-                  : r.supplier
-                    ? { ...r, supplier: undefined }
-                    : r,
-              ),
-            }
-          : d,
-      );
+      setDoc((d) => {
+        if (!d) return d;
+        const rows = d.rows.map((r) =>
+          byId.has(r.id)
+            ? { ...r, supplier: byId.get(r.id) }
+            : r.supplier
+              ? { ...r, supplier: undefined }
+              : r,
+        );
+        // Apply linked-column write policies (fillEmpty/overwrite) with the fresh results.
+        return applyLinkedColumns({ ...d, rows });
+      });
       const errs = quotes.filter((q) => q?.status === "error").length;
       setStatus(`取得完了（${quotes.length} 件${errs ? ` / エラー ${errs}` : ""}）`);
     } catch (e) {
@@ -300,6 +309,7 @@ export default function App() {
               columns={doc.columns}
               onAdd={addColumn}
               onAddSupplier={addSupplierColumn}
+              onSetLink={setColumnLink}
               onRename={renameColumn}
               onDelete={deleteColumn}
               onMove={moveColumn}
