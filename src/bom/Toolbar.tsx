@@ -111,8 +111,8 @@ export function Toolbar(p: Props) {
       <button className="primary" onClick={p.onSave}>
         <Save size={ICON} /> 保存
       </button>
-      <button onClick={p.onExport} title="JSON で書き出し">
-        <Download size={ICON} /> JSON
+      <button onClick={p.onExport} title="Excel (.xlsx) / CSV で書き出し">
+        <Download size={ICON} /> 書き出し
       </button>
 
       {p.status && <span className="status-msg">{p.status}</span>}

@@ -58,6 +58,18 @@ export function applyLinkedColumns(doc: BomDoc): BomDoc {
   return { ...doc, rows };
 }
 
+/** Reserved row.custom key marking that a linked column's difference vs the fetched EC
+ *  value has been reconciled ("現在の値を採用"). It stores the fetched value it was resolved
+ *  against, so a later fetch that changes that value re-flags the cell. Hidden (no column
+ *  uses this key, so it never displays or exports) and persisted for free via row.custom. */
+export const ackKey = (colKey: string): string => `__mbmAck:${colKey}`;
+
+/** True if the cell was reconciled against the current fetched value (highlight suppressed). */
+function isResolved(row: BomRow, colKey: string, fetched: unknown): boolean {
+  const ack = row.custom?.[ackKey(colKey)];
+  return ack != null && ack === String(fetched ?? "").trim();
+}
+
 /** ColDef extras for an editable column linked to a supplier field: live diff highlight
  *  (cell value vs fetched) + a "MISUMI: <value>" tooltip. Stateless. */
 function linkExtras(c: ColumnDef, sourceCol?: ColumnDef): Partial<ColDef<BomRow>> {
@@ -74,12 +86,14 @@ function linkExtras(c: ColumnDef, sourceCol?: ColumnDef): Partial<ColDef<BomRow>
         if (fetched == null || fetched === "") return false;
         const cur = getCellValue(p.data, c);
         if (cur == null || String(cur).trim() === "") return false;
+        if (isResolved(p.data, c.key, fetched)) return false; // reconciled
         return String(cur).trim() !== String(fetched).trim();
       },
       "cell-link-suggest": (p) => {
         if (policy !== "suggest" || !p.data) return false;
         const fetched = getSupplierFieldValue(p.data, field, sourceCol);
         if (fetched == null || fetched === "") return false;
+        if (isResolved(p.data, c.key, fetched)) return false; // reconciled
         const cur = getCellValue(p.data, c);
         return cur == null || String(cur).trim() === "";
       },
@@ -114,6 +128,49 @@ export function setCellValue(row: BomRow, col: ColumnDef, value: unknown): BomRo
     return { ...row, [col.key]: Number.isFinite(n) ? n : undefined };
   }
   return { ...row, [col.key]: value == null ? "" : String(value) };
+}
+
+/** Display string for a cell, matching what the grid shows — used for export.
+ *  Editable columns render their own value; supplier columns render the (ORDER-gated,
+ *  qty-live) fetched value exactly as the grid does. */
+export function cellDisplayValue(doc: BomDoc, row: BomRow, col: ColumnDef, sourceCol?: ColumnDef): string {
+  if (col.kind === "supplier") {
+    const v = supplierValue(row, col.link?.field, doc.meta.qtyMultiplier ?? 1, sourceCol ?? sourceColumn(doc));
+    return v == null ? "" : String(v);
+  }
+  const v = getCellValue(row, col);
+  return v == null ? "" : String(v);
+}
+
+/** Build a flat export grid: header labels + one display string per column per row.
+ *  Columns are emitted in their current order, including fetched EC (supplier) values. */
+export function buildExportGrid(doc: BomDoc): { headers: string[]; rows: string[][] } {
+  const sourceCol = sourceColumn(doc);
+  const headers = doc.columns.map((c) => c.label);
+  const rows = doc.rows.map((r) => doc.columns.map((c) => cellDisplayValue(doc, r, c, sourceCol)));
+  return { headers, rows };
+}
+
+/** If a linked editable column has a fetched EC value that differs from the cell's current
+ *  value (an empty cell counts as differing), return both so the UI can offer to adopt it.
+ *  Returns null when there is nothing to reconcile: no link, a role/fetch-key column, no
+ *  fetched value (or ORDER not matching), or the cell already equals the fetched value. */
+export function pendingSuggestion(
+  doc: BomDoc,
+  row: BomRow,
+  col: ColumnDef,
+): { current: string; fetched: string } | null {
+  if (!col.link || col.kind === "supplier" || col.role || !col.editable) return null;
+  const sourceCol = sourceColumn(doc);
+  if (col.key === partNoColumn(doc)?.key || col.key === sourceCol?.key) return null;
+  const fetchedRaw = getSupplierFieldValue(row, col.link.field, sourceCol);
+  const fetched = fetchedRaw == null ? "" : String(fetchedRaw);
+  if (fetched.trim() === "") return null;
+  if (isResolved(row, col.key, fetchedRaw)) return null; // already reconciled
+  const curRaw = getCellValue(row, col);
+  const current = curRaw == null ? "" : String(curRaw);
+  if (current.trim() === fetched.trim()) return null;
+  return { current, fetched };
 }
 
 function toColDef(c: ColumnDef, sourceCol?: ColumnDef): ColDef<BomRow> {
@@ -197,7 +254,7 @@ export function getSupplierFieldValue(
  *  or a dotted path on the row's SupplierQuote. Gated by ORDER. Qty-derived values
  *  (subtotal, MOQ note) are computed LIVE from the row's current Qty/multiplier so they
  *  never go stale after the user edits Qty. */
-function supplierValue(
+export function supplierValue(
   row: BomRow | undefined,
   field?: string,
   qtyMultiplier = 1,

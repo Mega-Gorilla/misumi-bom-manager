@@ -26,6 +26,7 @@ use tokio::sync::oneshot;
 
 mod db;
 mod model;
+mod spreadsheet;
 mod supplier;
 
 use supplier::{provider_for, QuoteItem};
@@ -152,7 +153,7 @@ async fn lookup_part(app: AppHandle, part_number: String) -> Result<Value, Strin
     }
 }
 
-// ---- BOM CRUD (SQLite system-of-record). JSON import/export is frontend-driven. ----
+// ---- BOM CRUD (SQLite system-of-record). Excel/CSV import/export is frontend-driven. ----
 
 #[tauri::command]
 fn bom_list(db: State<DbState>) -> Result<Vec<model::BomSummary>, String> {
@@ -178,35 +179,23 @@ fn bom_delete(db: State<DbState>, id: String) -> Result<(), String> {
     db::delete_bom(&conn, &id).map_err(|e| e.to_string())
 }
 
-/// Import a BOM from a JSON file path (picked via the dialog plugin on the frontend).
-/// Backend file IO avoids plugin-fs scope limits and keeps BomDoc<->JSON authority in Rust.
+/// Parse an Excel (.xlsx/.xls/.ods) or CSV file (path picked via the dialog plugin) into
+/// a flat string grid. The frontend import wizard maps rows/columns onto a BomDoc and
+/// persists via `bom_save` — backend stays a thin file<->grid converter.
 #[tauri::command]
-fn bom_import(db: State<DbState>, path: String) -> Result<String, String> {
-    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let mut doc: model::BomDoc = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    // Import always creates a NEW BOM (list "JSON取込" = 新規作成). Drop any embedded
-    // id so save_bom assigns a fresh one — re-importing an export yields a new copy,
-    // never an overwrite of an existing BOM.
-    doc.id = None;
-    // BomRow.id is `#[serde(default)]`, so rows lacking an id parse to ""; assign here.
-    for row in &mut doc.rows {
-        if row.id.trim().is_empty() {
-            row.id = db::new_id();
-        }
-    }
-    if doc.meta.qty_multiplier == 0.0 {
-        doc.meta.qty_multiplier = 1.0;
-    }
-    doc.meta.imported_from = Some(path);
-    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
-    db::save_bom(&mut conn, &doc).map_err(|e| e.to_string())
+fn spreadsheet_read(path: String) -> Result<spreadsheet::Workbook, String> {
+    spreadsheet::read_workbook(&path)
 }
 
-/// Export a BOM document to a JSON file path (picked via the dialog plugin).
+/// Write a flat grid (header row + data rows) to xlsx or CSV (by extension). The frontend
+/// builds the grid from the current BomDoc (columns as-displayed, incl. fetched EC values).
 #[tauri::command]
-fn bom_export(path: String, doc: model::BomDoc) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
+fn spreadsheet_write(
+    path: String,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> Result<(), String> {
+    spreadsheet::write_grid(&path, &headers, &rows)
 }
 
 // ---- Supplier quote (cache-first batch fetch via the bridge) ----
@@ -427,8 +416,8 @@ pub fn run() {
             bom_load,
             bom_save,
             bom_delete,
-            bom_import,
-            bom_export,
+            spreadsheet_read,
+            spreadsheet_write,
             quote
         ])
         .run(tauri::generate_context!())

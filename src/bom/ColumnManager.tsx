@@ -5,6 +5,8 @@ import { SUPPLIER_FIELDS, WRITE_POLICIES } from "../types/bom";
 
 interface Props {
   columns: ColumnDef[];
+  /** Which tab to open on (default "columns"). Import flow opens on "ec". */
+  initialTab?: "columns" | "ec";
   onAdd: (label: string) => void;
   onAddSupplier: (field: string, label: string) => void;
   onSetFieldLink: (field: string, columnKey: string | null, write: WritePolicy) => void;
@@ -36,7 +38,7 @@ function roleKey(columns: ColumnDef[], role: ColumnRole, fallbackKey: string): s
 }
 
 export function ColumnManager(p: Props) {
-  const [tab, setTab] = useState<"columns" | "ec">("columns");
+  const [tab, setTab] = useState<"columns" | "ec">(p.initialTab ?? "columns");
   const [newLabel, setNewLabel] = useState("");
 
   const add = () => {
@@ -275,6 +277,10 @@ export function ColumnManager(p: Props) {
                 })}
               </tbody>
             </table>
+            <p className="col-note">
+              ※ 反映先の列がない場合は、「列の構成」タブの「EC連携項目を列に追加」から
+              EC取得列を追加してください。
+            </p>
           </>
         )}
       </div>

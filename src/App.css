@@ -179,10 +179,12 @@ body.fill-dragging {
   cursor: crosshair;
   user-select: none;
 }
-/* Only the AG Grid root should fill the wrapper — NOT the fill-handle / preview
-   overlays (which are also direct children). Otherwise this rule's higher
-   specificity overrides .fill-handle's height:8px and stretches it into a tall bar. */
-.grid-wrap > div:not(.fill-handle):not(.fill-preview) {
+/* Only the AG Grid root should fill the wrapper — NOT the overlays that are also direct
+   children (fill handle / preview / suggestion chooser + its backdrop). Otherwise this
+   rule's higher specificity forces height:100% and stretches them (a tall fill-handle bar,
+   or an over-tall chooser popover with empty space below its content). */
+.grid-wrap
+  > div:not(.fill-handle):not(.fill-preview):not(.sugg-chooser):not(.sugg-backdrop) {
   height: 100%;
 }
 
@@ -379,6 +381,12 @@ body.fill-dragging {
   gap: 4px;
   justify-content: flex-end;
 }
+.col-note {
+  margin: 10px 2px 0;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--muted);
+}
 .col-add {
   display: flex;
   gap: 8px;
@@ -400,6 +408,92 @@ button:disabled {
 .cell-error {
   color: var(--error);
   background: #fdecea;
+}
+
+/* suggestion chooser: opened by double-clicking a linked cell with a pending EC value */
+.sugg-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 6;
+}
+.sugg-chooser {
+  position: absolute;
+  z-index: 7;
+  width: 420px;
+  max-width: 60vw;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(16, 24, 40, 0.18);
+  padding: 12px 14px;
+  font-size: 0.84rem;
+}
+.sugg-title {
+  font-weight: 600;
+}
+.sugg-sub {
+  font-size: 0.76rem;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.sugg-values {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  background: var(--bg);
+}
+.sugg-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 3px 0;
+}
+.sugg-row span {
+  color: var(--muted);
+  flex: 0 0 72px;
+}
+.sugg-row b {
+  font-weight: 600;
+  white-space: normal;
+  word-break: break-word;
+}
+.sugg-options {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 10px;
+}
+.sugg-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+}
+.sugg-kbd {
+  margin-left: auto;
+  font-size: 0.72rem;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 5px;
+  background: var(--bg);
+  font-family: inherit;
+}
+.sugg-hint {
+  margin-top: 8px;
+  font-size: 0.72rem;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.sugg-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+.sugg-actions button {
+  font-size: 0.82rem;
+  padding: 5px 14px;
 }
 
 /* linked editable column: cell value differs from the fetched MISUMI value */
@@ -431,4 +525,138 @@ button:disabled {
 .supplier-fields-list button {
   font-size: 0.8rem;
   padding: 4px 8px;
+}
+
+/* ---- import wizard (Excel/CSV preview + mapping) ---- */
+.import-wizard {
+  width: 960px;
+  max-width: 96vw;
+  display: flex;
+  flex-direction: column;
+}
+.iw-name-row {
+  display: flex;
+  padding: 2px 2px 10px;
+}
+.iw-name-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--muted);
+  width: 100%;
+}
+.iw-name {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--text);
+  font-size: 0.95rem;
+}
+.iw-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  padding: 4px 2px 12px;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+.iw-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+.iw-controls select,
+.iw-controls input[type="number"] {
+  padding: 4px 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}
+.iw-controls input[type="number"] {
+  width: 72px;
+}
+.iw-check {
+  cursor: pointer;
+}
+.iw-summary {
+  margin-left: auto;
+  color: var(--accent);
+  font-weight: 600;
+}
+.iw-preview {
+  overflow: auto;
+  max-height: 52vh;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.iw-table {
+  margin-bottom: 0;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+.iw-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  vertical-align: top;
+  padding: 6px 8px;
+  z-index: 1;
+}
+.iw-table thead select {
+  max-width: 160px;
+}
+.iw-header-label {
+  margin-top: 4px;
+  font-weight: 400;
+  color: var(--text);
+  text-transform: none;
+  font-size: 0.8rem;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.iw-table td {
+  padding: 4px 8px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.iw-rownum {
+  color: var(--muted);
+  text-align: right;
+  width: 40px;
+  position: sticky;
+  left: 0;
+  background: var(--card);
+}
+.iw-hdr td {
+  background: #eef4ff;
+  font-weight: 600;
+}
+.iw-skip td {
+  color: var(--muted);
+  background: #fafafa;
+}
+.iw-more {
+  padding: 8px;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.iw-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+.iw-setup-ec {
+  margin-right: auto;
+  color: var(--muted);
+  cursor: pointer;
 }

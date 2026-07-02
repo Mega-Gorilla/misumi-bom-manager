@@ -1,35 +1,56 @@
-// Thin invoke wrappers for the BOM backend commands + JSON import/export.
-// File IO goes through backend commands (bom_import/bom_export); the dialog
-// plugin only picks the path. See plan PR-B notes.
+// Thin invoke wrappers for the BOM backend commands + Excel/CSV import/export.
+// File IO goes through backend commands (spreadsheet_read/spreadsheet_write); the
+// dialog plugin only picks the path. BomDoc construction / column mapping is done on
+// the frontend (import wizard) so the backend stays a thin file<->grid converter.
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import type { BomDoc, BomSummary, SupplierQuote } from "../types/bom";
+import type { BomDoc, BomSummary, SupplierQuote, Workbook } from "../types/bom";
 
 export const bomList = (): Promise<BomSummary[]> => invoke("bom_list");
 export const bomLoad = (id: string): Promise<BomDoc | null> => invoke("bom_load", { id });
 export const bomSave = (doc: BomDoc): Promise<string> => invoke("bom_save", { doc });
 export const bomDelete = (id: string): Promise<void> => invoke("bom_delete", { id });
 
-/** Pick a JSON file and import it (backend assigns missing row IDs). Returns the new BOM id, or null if cancelled. */
-export async function importJson(): Promise<string | null> {
-  const path = await open({
-    multiple: false,
-    filters: [{ name: "BOM JSON", extensions: ["json"] }],
-  });
-  if (typeof path !== "string") return null;
-  return invoke<string>("bom_import", { path });
+/** A picked spreadsheet file: its absolute path + base name (for the new BOM title). */
+export interface PickedFile {
+  path: string;
+  name: string;
 }
 
-/** Pick a destination and export the BOM as JSON. Returns false if cancelled. */
-export async function exportJson(doc: BomDoc): Promise<boolean> {
+/** Pick an Excel/CSV file to import. Returns path + base name, or null if cancelled. */
+export async function pickSpreadsheetToOpen(): Promise<PickedFile | null> {
+  const path = await open({
+    multiple: false,
+    filters: [{ name: "Excel / CSV", extensions: ["xlsx", "xls", "csv"] }],
+  });
+  if (typeof path !== "string") return null;
+  const base = path.split(/[\\/]/).pop() ?? path;
+  const name = base.replace(/\.[^.]+$/, "");
+  return { path, name };
+}
+
+/** Parse the picked file into a flat string grid (one entry per sheet). */
+export const readSpreadsheet = (path: string): Promise<Workbook> =>
+  invoke("spreadsheet_read", { path });
+
+/** Pick a destination and export the grid as .xlsx or .csv (by chosen extension).
+ *  Returns false if cancelled. */
+export async function exportSpreadsheet(
+  doc: BomDoc,
+  headers: string[],
+  rows: string[][],
+): Promise<boolean> {
   const path = await save({
-    defaultPath: `${doc.meta.name ?? "bom"}.json`,
-    filters: [{ name: "BOM JSON", extensions: ["json"] }],
+    defaultPath: `${doc.meta.name ?? "bom"}.xlsx`,
+    filters: [
+      { name: "Excel", extensions: ["xlsx"] },
+      { name: "CSV", extensions: ["csv"] },
+    ],
   });
   if (!path) return false;
-  await invoke("bom_export", { path, doc });
+  await invoke("spreadsheet_write", { path, headers, rows });
   return true;
 }
 

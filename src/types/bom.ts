@@ -87,6 +87,17 @@ export interface BomSummary {
   updatedAt?: string | null;
 }
 
+/** One sheet parsed by the backend `spreadsheet_read` command: a flat string grid.
+ *  `truncated` is true if the sheet was capped at the backend row limit. */
+export interface SheetGrid {
+  name: string;
+  rows: string[][];
+  truncated: boolean;
+}
+export interface Workbook {
+  sheets: SheetGrid[];
+}
+
 /** Field keys that live on the BomRow top level (vs. row.custom[...]). */
 export const CORE_KEYS = ["no", "partsName", "partsNo", "order", "qty", "material"] as const;
 export const NUMERIC_CORE_KEYS = new Set<string>(["no", "qty"]);

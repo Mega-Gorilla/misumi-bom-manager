@@ -19,8 +19,8 @@ export function BomList(p: Props) {
           <button className="primary" onClick={p.onNew}>
             <FilePlus2 size={16} /> 新規 BOM
           </button>
-          <button onClick={p.onImport}>
-            <Upload size={16} /> JSON 取込
+          <button onClick={p.onImport} title="Excel / CSV から取込">
+            <Upload size={16} /> 取込 (Excel/CSV)
           </button>
         </div>
       </header>

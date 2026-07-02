@@ -26,5 +26,9 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tokio = { version = "1", features = ["sync", "time"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+calamine = "0.26"          # read .xlsx/.xls/.ods
+rust_xlsxwriter = "0.79"   # write .xlsx
+csv = "1"                  # read/write CSV
+encoding_rs = "0.8"        # CSV decode (Shift-JIS fallback) / BOM handling
 
 
