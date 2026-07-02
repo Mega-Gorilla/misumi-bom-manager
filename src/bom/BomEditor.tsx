@@ -180,6 +180,9 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
       }
       if (!api || !ev.altKey || ev.ctrlKey || ev.metaKey) return;
       if (ev.key !== "1" && ev.key !== "2" && ev.key !== "3") return;
+      // This listener is on window; only act when the grid actually holds focus, so a stale
+      // getFocusedCell() isn't reconciled while a modal (列管理) or toolbar input is focused.
+      if (!wrapRef.current?.contains(document.activeElement)) return;
       if (api.getEditingCells().length > 0) return;
       const fc = api.getFocusedCell();
       if (!fc || fc.rowPinned) return;
