@@ -379,6 +379,12 @@ body.fill-dragging {
   gap: 4px;
   justify-content: flex-end;
 }
+.col-note {
+  margin: 10px 2px 0;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--muted);
+}
 .col-add {
   display: flex;
   gap: 8px;

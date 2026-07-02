@@ -277,6 +277,10 @@ export function ColumnManager(p: Props) {
                 })}
               </tbody>
             </table>
+            <p className="col-note">
+              ※ 反映先の列がない場合は、「列の構成」タブの「EC連携項目を列に追加」から
+              EC取得列を追加してください。
+            </p>
           </>
         )}
       </div>
