@@ -192,8 +192,11 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
         api.startEditingCell({ rowIndex: fc.rowIndex, colKey: colId });
         return;
       }
-      const sel = api.getSelectedRows();
-      const rowIds = sel.length ? sel.map((r) => r.id) : [node.data.id];
+      // Bulk over the selection only when the focused row is part of a multi-row selection;
+      // otherwise act on just the focused row (so arrow-moving off the selection is intuitive).
+      const selIds = api.getSelectedRows().map((r) => r.id);
+      const rowIds =
+        selIds.length > 1 && selIds.includes(node.data.id) ? selIds : [node.data.id];
       reconcileRows(rowIds, colId, ev.key === "1" ? "adopt" : "keep");
     };
     window.addEventListener("keydown", onKey);
@@ -222,7 +225,7 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
         columnDefs={columnDefs}
         getRowId={(p) => p.data.id}
         context={{ qtyMultiplier: doc.meta.qtyMultiplier ?? 1 }}
-        rowSelection={{ mode: "multiRow" }}
+        rowSelection={{ mode: "multiRow", enableClickSelection: true }}
         onGridReady={(e: GridReadyEvent<BomRow>) => setApi(e.api)}
         onCellValueChanged={onCellValueChanged}
         onCellDoubleClicked={onCellDoubleClicked}
