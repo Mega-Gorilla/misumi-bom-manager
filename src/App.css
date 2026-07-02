@@ -432,3 +432,110 @@ button:disabled {
   font-size: 0.8rem;
   padding: 4px 8px;
 }
+
+/* ---- import wizard (Excel/CSV preview + mapping) ---- */
+.import-wizard {
+  width: 960px;
+  max-width: 96vw;
+  display: flex;
+  flex-direction: column;
+}
+.iw-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  padding: 4px 2px 12px;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+.iw-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+.iw-controls select,
+.iw-controls input[type="number"] {
+  padding: 4px 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}
+.iw-controls input[type="number"] {
+  width: 72px;
+}
+.iw-check {
+  cursor: pointer;
+}
+.iw-summary {
+  margin-left: auto;
+  color: var(--accent);
+  font-weight: 600;
+}
+.iw-preview {
+  overflow: auto;
+  max-height: 52vh;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.iw-table {
+  margin-bottom: 0;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+.iw-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  vertical-align: top;
+  padding: 6px 8px;
+  z-index: 1;
+}
+.iw-table thead select {
+  max-width: 160px;
+}
+.iw-header-label {
+  margin-top: 4px;
+  font-weight: 400;
+  color: var(--text);
+  text-transform: none;
+  font-size: 0.8rem;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.iw-table td {
+  padding: 4px 8px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.iw-rownum {
+  color: var(--muted);
+  text-align: right;
+  width: 40px;
+  position: sticky;
+  left: 0;
+  background: var(--card);
+}
+.iw-hdr td {
+  background: #eef4ff;
+  font-weight: 600;
+}
+.iw-skip td {
+  color: var(--muted);
+  background: #fafafa;
+}
+.iw-more {
+  padding: 8px;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.iw-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}

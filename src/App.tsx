@@ -18,12 +18,14 @@ import {
   partNoColumn,
   sourceColumn,
 } from "./types/bom";
-import { applyLinkedColumns, getCellValue } from "./lib/columns";
+import type { Workbook } from "./types/bom";
+import { applyLinkedColumns, getCellValue, buildExportGrid } from "./lib/columns";
 import * as api from "./api/bom";
 import { BomEditor } from "./bom/BomEditor";
 import { Toolbar } from "./bom/Toolbar";
 import { BomList } from "./bom/BomList";
 import { ColumnManager } from "./bom/ColumnManager";
+import { ImportWizard } from "./bom/ImportWizard";
 
 function slug(s: string): string {
   return (
@@ -49,6 +51,7 @@ export default function App() {
   const [list, setList] = useState<BomSummary[]>([]);
   const [status, setStatus] = useState("");
   const [showColumns, setShowColumns] = useState(false);
+  const [importSrc, setImportSrc] = useState<{ workbook: Workbook; fileName: string; path: string } | null>(null);
   const [quickFilter, setQuickFilter] = useState("");
   const [quoting, setQuoting] = useState(false);
   const gridRef = useRef<AgGridReact<BomRow>>(null);
@@ -298,14 +301,28 @@ export default function App() {
     await reloadList();
   };
 
+  // Import: pick an Excel/CSV file, parse it to a grid, and open the mapping wizard.
   const doImport = async () => {
     try {
-      const id = await api.importJson();
-      if (id) {
-        await reloadList();
-        await openBom(id);
-        setStatus("インポートしました");
-      }
+      const picked = await api.pickSpreadsheetToOpen();
+      if (!picked) return;
+      setStatus("ファイルを読み込み中…");
+      const workbook = await api.readSpreadsheet(picked.path);
+      setImportSrc({ workbook, fileName: picked.name, path: picked.path });
+      setStatus("");
+    } catch (e) {
+      setStatus(String(e));
+    }
+  };
+
+  // Wizard confirmed: persist the built BomDoc as a new BOM and open it.
+  const confirmImport = async (built: BomDoc) => {
+    setImportSrc(null);
+    try {
+      const id = await api.bomSave(built);
+      await reloadList();
+      await openBom(id);
+      setStatus(`取込しました（${built.rows.length} 行）`);
     } catch (e) {
       setStatus(String(e));
     }
@@ -314,7 +331,8 @@ export default function App() {
   const doExport = async () => {
     if (!doc) return;
     try {
-      if (await api.exportJson(doc)) setStatus("エクスポートしました");
+      const { headers, rows } = buildExportGrid(doc);
+      if (await api.exportSpreadsheet(doc, headers, rows)) setStatus("書き出しました");
     } catch (e) {
       setStatus(String(e));
     }
@@ -377,6 +395,15 @@ export default function App() {
             />
           )}
         </>
+      )}
+      {importSrc && (
+        <ImportWizard
+          workbook={importSrc.workbook}
+          fileName={importSrc.fileName}
+          path={importSrc.path}
+          onCancel={() => setImportSrc(null)}
+          onConfirm={confirmImport}
+        />
       )}
     </div>
   );

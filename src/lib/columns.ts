@@ -116,6 +116,27 @@ export function setCellValue(row: BomRow, col: ColumnDef, value: unknown): BomRo
   return { ...row, [col.key]: value == null ? "" : String(value) };
 }
 
+/** Display string for a cell, matching what the grid shows — used for export.
+ *  Editable columns render their own value; supplier columns render the (ORDER-gated,
+ *  qty-live) fetched value exactly as the grid does. */
+export function cellDisplayValue(doc: BomDoc, row: BomRow, col: ColumnDef, sourceCol?: ColumnDef): string {
+  if (col.kind === "supplier") {
+    const v = supplierValue(row, col.link?.field, doc.meta.qtyMultiplier ?? 1, sourceCol ?? sourceColumn(doc));
+    return v == null ? "" : String(v);
+  }
+  const v = getCellValue(row, col);
+  return v == null ? "" : String(v);
+}
+
+/** Build a flat export grid: header labels + one display string per column per row.
+ *  Columns are emitted in their current order, including fetched EC (supplier) values. */
+export function buildExportGrid(doc: BomDoc): { headers: string[]; rows: string[][] } {
+  const sourceCol = sourceColumn(doc);
+  const headers = doc.columns.map((c) => c.label);
+  const rows = doc.rows.map((r) => doc.columns.map((c) => cellDisplayValue(doc, r, c, sourceCol)));
+  return { headers, rows };
+}
+
 function toColDef(c: ColumnDef, sourceCol?: ColumnDef): ColDef<BomRow> {
   const base: ColDef<BomRow> = {
     colId: c.key,
@@ -197,7 +218,7 @@ export function getSupplierFieldValue(
  *  or a dotted path on the row's SupplierQuote. Gated by ORDER. Qty-derived values
  *  (subtotal, MOQ note) are computed LIVE from the row's current Qty/multiplier so they
  *  never go stale after the user edits Qty. */
-function supplierValue(
+export function supplierValue(
   row: BomRow | undefined,
   field?: string,
   qtyMultiplier = 1,
