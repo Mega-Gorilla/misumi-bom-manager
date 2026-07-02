@@ -146,7 +146,17 @@ export default function App() {
     if (!doc) return;
     const col = doc.columns.find((c) => c.key === key);
     if (!col || col.kind === "core") return; // only core columns are protected
-    setDoc({ ...doc, columns: doc.columns.filter((c) => c.key !== key) });
+    // Deleting the current 型番列 changes the fetch identity — partNoColumn() falls back to
+    // the default partsNo column, so previously fetched EC results no longer correspond to
+    // the (now different) part number. Clear supplier from all rows (mirrors setColumnRole).
+    // Deleting the 発注先列 only shifts the ORDER gate to the fallback column, which
+    // supplierActive re-evaluates live, so supplier need not be cleared there.
+    const removingPartNo = partNoColumn(doc)?.key === key;
+    const columns = doc.columns.filter((c) => c.key !== key);
+    const rows = removingPartNo
+      ? doc.rows.map((r) => (r.supplier ? { ...r, supplier: undefined } : r))
+      : doc.rows;
+    setDoc({ ...doc, columns, rows });
   };
 
   // Designate which column plays a fetch role (型番列 / EC発注先列). Each role has at most
