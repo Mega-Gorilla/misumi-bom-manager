@@ -21,7 +21,7 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
 
 // Append-only list of migrations. Index i => schema version i+1.
 // NEVER edit a shipped migration string — only append a new one.
-const MIGRATIONS: &[&str] = &[V1];
+const MIGRATIONS: &[&str] = &[V1, V2];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     let mut v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -104,6 +104,14 @@ CREATE TABLE mapping_template (
 );
 "#;
 
+// V2: column roles for the fetch pipeline (型番列 / EC発注先列). Backfill existing BOMs
+// so the core partsNo/order columns keep playing those roles.
+const V2: &str = r#"
+ALTER TABLE bom_column ADD COLUMN role TEXT;
+UPDATE bom_column SET role = 'partNo' WHERE key = 'partsNo';
+UPDATE bom_column SET role = 'source' WHERE key = 'order';
+"#;
+
 pub fn new_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -153,7 +161,7 @@ pub fn load_bom(conn: &Connection, id: &str) -> rusqlite::Result<Option<BomDoc>>
     };
 
     let mut cstmt = conn.prepare(
-        "SELECT key, label, kind, editable, width, link_field, link_write \
+        "SELECT key, label, kind, editable, width, link_field, link_write, role \
          FROM bom_column WHERE bom_id = ?1 ORDER BY sort_order",
     )?;
     let columns = cstmt
@@ -171,6 +179,7 @@ pub fn load_bom(conn: &Connection, id: &str) -> rusqlite::Result<Option<BomDoc>>
                 editable: r.get::<_, i64>(3)? != 0,
                 width: r.get(4)?,
                 link,
+                role: r.get(7)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -238,9 +247,9 @@ pub fn save_bom(conn: &mut Connection, doc: &BomDoc) -> rusqlite::Result<String>
             None => (None, None),
         };
         tx.execute(
-            "INSERT INTO bom_column(bom_id, key, label, kind, editable, sort_order, link_field, link_write, width) \
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![id, c.key, c.label, c.kind, c.editable as i64, i as i64, lf, lw, c.width],
+            "INSERT INTO bom_column(bom_id, key, label, kind, editable, sort_order, link_field, link_write, width, role) \
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![id, c.key, c.label, c.kind, c.editable as i64, i as i64, lf, lw, c.width, c.role],
         )?;
     }
 
@@ -356,6 +365,7 @@ mod tests {
                 editable: true,
                 width: None,
                 link: None,
+                role: Some("partNo".into()),
             }],
             rows: vec![BomRow {
                 id: "r1".into(),
@@ -376,6 +386,7 @@ mod tests {
         let loaded = load_bom(&conn, "b1").unwrap().unwrap();
         assert_eq!(loaded.meta.qty_multiplier, 3.0);
         assert_eq!(loaded.columns.len(), 1);
+        assert_eq!(loaded.columns[0].role.as_deref(), Some("partNo"));
         assert_eq!(loaded.rows.len(), 1);
         assert_eq!(loaded.rows[0].parts_no.as_deref(), Some("CBT3-8"));
         assert_eq!(

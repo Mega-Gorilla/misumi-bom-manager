@@ -1,9 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgGridReact } from "ag-grid-react";
 import "./App.css";
-import type { BomDoc, BomRow, BomSummary, SupplierQuote, WritePolicy } from "./types/bom";
-import { newBom, newRow, nextNo, newSupplierColumn, SUPPLIER_FIELDS } from "./types/bom";
-import { applyLinkedColumns } from "./lib/columns";
+import type {
+  BomDoc,
+  BomRow,
+  BomSummary,
+  ColumnRole,
+  SupplierQuote,
+  WritePolicy,
+} from "./types/bom";
+import {
+  newBom,
+  newRow,
+  nextNo,
+  newSupplierColumn,
+  SUPPLIER_FIELDS,
+  partNoColumn,
+  sourceColumn,
+} from "./types/bom";
+import { applyLinkedColumns, getCellValue } from "./lib/columns";
 import * as api from "./api/bom";
 import { BomEditor } from "./bom/BomEditor";
 import { Toolbar } from "./bom/Toolbar";
@@ -131,16 +146,51 @@ export default function App() {
     if (!doc) return;
     const col = doc.columns.find((c) => c.key === key);
     if (!col || col.kind === "core") return; // only core columns are protected
-    setDoc({ ...doc, columns: doc.columns.filter((c) => c.key !== key) });
+    // Deleting the current 型番列 changes the fetch identity — partNoColumn() falls back to
+    // the default partsNo column, so previously fetched EC results no longer correspond to
+    // the (now different) part number. Clear supplier from all rows (mirrors setColumnRole).
+    // Deleting the 発注先列 only shifts the ORDER gate to the fallback column, which
+    // supplierActive re-evaluates live, so supplier need not be cleared there.
+    const removingPartNo = partNoColumn(doc)?.key === key;
+    const columns = doc.columns.filter((c) => c.key !== key);
+    const rows = removingPartNo
+      ? doc.rows.map((r) => (r.supplier ? { ...r, supplier: undefined } : r))
+      : doc.rows;
+    setDoc({ ...doc, columns, rows });
   };
 
-  // Link (or unlink) an existing editable column to a MISUMI field with a write policy,
-  // then apply it immediately to the current supplier results.
-  const setColumnLink = (key: string, field: string | null, write: WritePolicy) => {
+  // Designate which column plays a fetch role (型番列 / EC発注先列). Each role has at most
+  // one column, so assigning it clears any previous holder. A role column is a fetch key,
+  // never an EC fill target, so we also drop any EC link it may have carried.
+  const setColumnRole = (role: ColumnRole, key: string) => {
     if (!doc) return;
-    const columns = doc.columns.map((c) =>
-      c.key === key ? (field ? { ...c, link: { field, write } } : { ...c, link: undefined }) : c,
-    );
+    const prevPartKey = partNoColumn(doc)?.key;
+    const columns = doc.columns.map((c) => {
+      if (c.key === key) return { ...c, role, link: undefined };
+      if (c.role === role) return { ...c, role: undefined };
+      return c;
+    });
+    // Reassigning the 型番列 changes the fetch identity — previously fetched EC results no
+    // longer correspond to the new part number, so clear supplier from all rows (re-fetch
+    // resets them). Reassigning the 発注先列 doesn't change identity (supplierActive gates
+    // it live), so leave supplier intact there.
+    const rows =
+      role === "partNo" && prevPartKey !== key
+        ? doc.rows.map((r) => (r.supplier ? { ...r, supplier: undefined } : r))
+        : doc.rows;
+    setDoc({ ...doc, columns, rows });
+  };
+
+  // Map an EC field to a target column (field-anchored, per plan §7.3「フィールドを列に結ぶ」).
+  // Each field binds at most one column; binding clears the field from any previous holder.
+  // columnKey === null unbinds the field. Applied immediately to current supplier results.
+  const setFieldLink = (field: string, columnKey: string | null, write: WritePolicy) => {
+    if (!doc) return;
+    const columns = doc.columns.map((c) => {
+      if (c.link?.field === field && c.key !== columnKey) return { ...c, link: undefined };
+      if (columnKey && c.key === columnKey) return { ...c, link: { field, write } };
+      return c;
+    });
     setDoc(applyLinkedColumns({ ...doc, columns }));
   };
 
@@ -159,11 +209,20 @@ export default function App() {
   // Fetch quotes for ORDER=MISUMI rows and apply them (cache-first; force re-fetch).
   const runQuote = async (force: boolean) => {
     if (!doc || quoting) return;
-    const targets = doc.rows.filter(
-      (r) => (r.order ?? "").toUpperCase() === "MISUMI" && (r.partsNo ?? "").trim() !== "",
-    );
+    const partCol = partNoColumn(doc);
+    const srcCol = sourceColumn(doc);
+    if (!partCol || !srcCol) {
+      setStatus("型番列 / EC発注先列 が未設定です（列の管理で設定）");
+      return;
+    }
+    const partOf = (r: BomRow) => String(getCellValue(r, partCol) ?? "").trim();
+    const isMisumi = (r: BomRow) =>
+      String(getCellValue(r, srcCol) ?? "")
+        .trim()
+        .toUpperCase() === "MISUMI";
+    const targets = doc.rows.filter((r) => isMisumi(r) && partOf(r) !== "");
     if (targets.length === 0) {
-      setStatus("ORDER=MISUMI かつ Parts No のある行がありません");
+      setStatus("EC発注先=MISUMI かつ 型番のある行がありません");
       return;
     }
     setQuoting(true);
@@ -173,7 +232,7 @@ export default function App() {
       unlisten = await api.onQuoteProgress((p) =>
         setStatus(p.total > 0 ? `取得中 ${p.done}/${p.total}…` : "キャッシュから取得中…"),
       );
-      const items = targets.map((r) => ({ partNo: r.partsNo!.trim() }));
+      const items = targets.map((r) => ({ partNo: partOf(r) }));
       const quotes = await api.quote("MISUMI", items, force);
       const byId = new Map<string, SupplierQuote>();
       // Store the raw quote only. Subtotal and the MOQ note are derived LIVE in the
@@ -309,7 +368,8 @@ export default function App() {
               columns={doc.columns}
               onAdd={addColumn}
               onAddSupplier={addSupplierColumn}
-              onSetLink={setColumnLink}
+              onSetFieldLink={setFieldLink}
+              onSetRole={setColumnRole}
               onRename={renameColumn}
               onDelete={deleteColumn}
               onMove={moveColumn}

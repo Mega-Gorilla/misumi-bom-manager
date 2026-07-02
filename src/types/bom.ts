@@ -2,6 +2,8 @@
 
 export type ColumnKind = "core" | "custom" | "supplier";
 export type WritePolicy = "overwrite" | "fillEmpty" | "suggest";
+/** Fetch-pipeline role: which column is the part number / which selects the EC source. */
+export type ColumnRole = "partNo" | "source";
 
 export interface ColumnLink {
   /** Dotted path on SupplierQuote, e.g. "quote.unitPrice" / "product.name". */
@@ -16,6 +18,8 @@ export interface ColumnDef {
   editable: boolean;
   width?: number;
   link?: ColumnLink;
+  /** Fetch-pipeline role (型番列 / EC発注先列). At most one column per role. */
+  role?: ColumnRole;
 }
 
 export interface SupplierProduct {
@@ -92,12 +96,24 @@ export const ORDER_OPTIONS = ["", "MISUMI", "3D-PRINTED", "OTHER"];
 
 export const CORE_COLUMNS: ColumnDef[] = [
   { key: "no", label: "No.", kind: "core", editable: true, width: 72 },
-  { key: "partsNo", label: "Parts No", kind: "core", editable: true, width: 180 },
+  { key: "partsNo", label: "Parts No", kind: "core", editable: true, width: 180, role: "partNo" },
   { key: "partsName", label: "Parts Name", kind: "core", editable: true, width: 200 },
-  { key: "order", label: "ORDER", kind: "core", editable: true, width: 120 },
+  { key: "order", label: "ORDER", kind: "core", editable: true, width: 120, role: "source" },
   { key: "qty", label: "Qty", kind: "core", editable: true, width: 90 },
   { key: "material", label: "MATERIAL", kind: "core", editable: true, width: 160 },
 ];
+
+/** The column designated for a fetch role, falling back to the default core key
+ *  (handles BOMs created before roles existed). */
+export function roleColumn(doc: BomDoc, role: ColumnRole, fallbackKey: string): ColumnDef | undefined {
+  return doc.columns.find((c) => c.role === role) ?? doc.columns.find((c) => c.key === fallbackKey);
+}
+/** Column whose value is the part number sent to the EC fetch. */
+export const partNoColumn = (doc: BomDoc): ColumnDef | undefined =>
+  roleColumn(doc, "partNo", "partsNo");
+/** Column whose value selects the EC source (matched against the supplier code). */
+export const sourceColumn = (doc: BomDoc): ColumnDef | undefined =>
+  roleColumn(doc, "source", "order");
 
 /** MISUMI/supplier fields that can be added as read-only linked columns.
  *  `field` is a dotted path on SupplierQuote, or a computed key (status/messages).

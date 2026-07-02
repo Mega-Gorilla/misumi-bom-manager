@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import type { GridApi } from "ag-grid-community";
 import type { BomDoc, BomRow, ColumnDef } from "../types/bom";
+import { partNoColumn } from "../types/bom";
 import { getCellValue, setCellValue } from "../lib/columns";
 
 interface Props {
@@ -146,7 +147,14 @@ export function FillHandle({ api, container, doc, onChange }: Props) {
     if (!ids.size) return;
     const cur = docRef.current;
     const col = cur.columns.find((c) => c.key === d.colId) ?? d.col;
-    const rows = cur.rows.map((r) => (ids.has(r.id) ? setCellValue(r, col, d.value) : r));
+    // Filling into the designated 型番列 changes each row's fetch identity → drop its stale
+    // EC result (mirrors the single-cell edit path in BomEditor.onCellValueChanged).
+    const clearsSupplier = col.key === partNoColumn(cur)?.key;
+    const rows = cur.rows.map((r) => {
+      if (!ids.has(r.id)) return r;
+      const nr = setCellValue(r, col, d.value);
+      return clearsSupplier && nr.supplier ? { ...nr, supplier: undefined } : nr;
+    });
     onChange({ ...cur, rows });
   }
 

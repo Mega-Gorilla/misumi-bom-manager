@@ -34,6 +34,9 @@ pub struct ColumnDef {
     pub width: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<ColumnLink>,
+    /// Designated role for the fetch pipeline: "partNo" (型番列) | "source" (EC発注先列).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
