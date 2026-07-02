@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Ref } from "react";
 import { AgGridReact } from "ag-grid-react";
 import type {
@@ -10,7 +10,7 @@ import type {
 } from "ag-grid-community";
 import type { BomDoc, BomRow } from "../types/bom";
 import { partNoColumn } from "../types/bom";
-import { ackKey, buildColumnDefs, pendingSuggestion } from "../lib/columns";
+import { ackKey, buildColumnDefs, pendingSuggestion, setCellValue } from "../lib/columns";
 import { bomTheme } from "../lib/agTheme";
 import { FillHandle } from "./FillHandle";
 
@@ -112,13 +112,13 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
   //  - edit  : open the inline editor.
   //  - keep  : keep the current value but mark the difference reconciled (ack = fetched) so
   //            the highlight clears until a future fetch changes the MISUMI value.
-  const applyChoice = () => {
+  const applyChoice = (action: "adopt" | "keep" | "edit" = choice) => {
     if (!chooser || !api) return;
     const c = chooser;
     setChooser(null);
-    if (choice === "adopt") {
+    if (action === "adopt") {
       api.getRowNode(c.rowId)?.setDataValue(c.colId, c.fetched);
-    } else if (choice === "edit") {
+    } else if (action === "edit") {
       // Remember this cell so its next commit is recorded as reconciled (highlight clears).
       pendingEditAckRef.current = { rowId: c.rowId, colId: c.colId, fetched: c.fetched.trim() };
       api.startEditingCell({ rowIndex: c.rowIndex, colKey: c.colId });
@@ -132,6 +132,74 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
       requestAnimationFrame(() => api.refreshCells({ force: true }));
     }
   };
+
+  // Reconcile one column across the given rows in a single pass (used by the Alt+1/2/3
+  // shortcuts, incl. bulk over selected rows). "adopt" writes the fetched value; "keep"
+  // records the ack so the highlight clears. Rows without a pending suggestion are skipped.
+  const reconcileRows = (rowIds: string[], colId: string, action: "adopt" | "keep") => {
+    const col = doc.columns.find((c) => c.key === colId);
+    if (!col) return;
+    const ids = new Set(rowIds);
+    let changed = false;
+    const rows = doc.rows.map((r) => {
+      if (!ids.has(r.id)) return r;
+      const pend = pendingSuggestion(doc, r, col);
+      if (!pend) return r;
+      changed = true;
+      return action === "adopt"
+        ? setCellValue(r, col, pend.fetched)
+        : { ...r, custom: { ...r.custom, [ackKey(colId)]: pend.fetched.trim() } };
+    });
+    if (!changed) return;
+    onChange({ ...doc, rows });
+    requestAnimationFrame(() => api?.refreshCells({ force: true }));
+  };
+
+  // Keyboard shortcuts:
+  //  - chooser open : 1/2/3 confirm the option, Enter confirms the selection, Esc closes.
+  //  - grid focused : Alt+1/2/3 reconcile the focused cell directly (no popover). If rows are
+  //                   selected, Alt+1/2 apply to the focused column across all of them (bulk).
+  useEffect(() => {
+    const onKey = (ev: KeyboardEvent) => {
+      if (chooser) {
+        if (ev.key === "Escape") {
+          ev.preventDefault();
+          setChooser(null);
+        } else if (ev.key === "Enter") {
+          ev.preventDefault();
+          applyChoice();
+        } else if (ev.key === "1" || ev.key === "2" || ev.key === "3") {
+          ev.preventDefault();
+          applyChoice(ev.key === "1" ? "adopt" : ev.key === "2" ? "keep" : "edit");
+        }
+        return;
+      }
+      if (!api || !ev.altKey || ev.ctrlKey || ev.metaKey) return;
+      if (ev.key !== "1" && ev.key !== "2" && ev.key !== "3") return;
+      if (api.getEditingCells().length > 0) return;
+      const fc = api.getFocusedCell();
+      if (!fc || fc.rowPinned) return;
+      const node = api.getDisplayedRowAtIndex(fc.rowIndex);
+      if (!node?.data) return;
+      const colId = fc.column.getColId();
+      const col = doc.columns.find((c) => c.key === colId);
+      if (!col) return;
+      ev.preventDefault();
+      if (ev.key === "3") {
+        const pend = pendingSuggestion(doc, node.data, col);
+        if (!pend) return;
+        pendingEditAckRef.current = { rowId: node.data.id, colId, fetched: pend.fetched.trim() };
+        api.startEditingCell({ rowIndex: fc.rowIndex, colKey: colId });
+        return;
+      }
+      const sel = api.getSelectedRows();
+      const rowIds = sel.length ? sel.map((r) => r.id) : [node.data.id];
+      reconcileRows(rowIds, colId, ev.key === "1" ? "adopt" : "keep");
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, doc, chooser, choice]);
 
   // Managed row drag: read the grid's new order back into the doc.
   const onRowDragEnd = useCallback(
@@ -186,20 +254,23 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
             <div className="sugg-options">
               <label>
                 <input type="radio" checked={choice === "adopt"} onChange={() => setChoice("adopt")} />
-                MISUMI値を採用
+                MISUMI値を採用 <kbd className="sugg-kbd">Alt+1</kbd>
               </label>
               <label>
                 <input type="radio" checked={choice === "keep"} onChange={() => setChoice("keep")} />
-                現在の値を採用
+                現在の値を採用 <kbd className="sugg-kbd">Alt+2</kbd>
               </label>
               <label>
                 <input type="radio" checked={choice === "edit"} onChange={() => setChoice("edit")} />
-                自分で編集
+                自分で編集 <kbd className="sugg-kbd">Alt+3</kbd>
               </label>
+            </div>
+            <div className="sugg-hint">
+              Enter で確定 / Esc で閉じる ・ グリッド上で Alt+1/2/3 は直接反映（複数行選択で一括）
             </div>
             <div className="sugg-actions">
               <button onClick={() => setChooser(null)}>キャンセル</button>
-              <button className="primary" onClick={applyChoice}>
+              <button className="primary" onClick={() => applyChoice()}>
                 OK
               </button>
             </div>

@@ -469,11 +469,27 @@ button:disabled {
   gap: 7px;
   cursor: pointer;
 }
+.sugg-kbd {
+  margin-left: auto;
+  font-size: 0.72rem;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 5px;
+  background: var(--bg);
+  font-family: inherit;
+}
+.sugg-hint {
+  margin-top: 8px;
+  font-size: 0.72rem;
+  color: var(--muted);
+  line-height: 1.4;
+}
 .sugg-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  margin-top: 12px;
+  margin-top: 10px;
 }
 .sugg-actions button {
   font-size: 0.82rem;
