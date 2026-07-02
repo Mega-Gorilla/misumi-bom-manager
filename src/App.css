@@ -408,6 +408,55 @@ button:disabled {
   background: #fdecea;
 }
 
+/* suggestion chooser: opened by double-clicking a linked cell with a pending EC value */
+.sugg-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 6;
+}
+.sugg-chooser {
+  position: absolute;
+  z-index: 7;
+  min-width: 230px;
+  max-width: 320px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(16, 24, 40, 0.18);
+  padding: 10px 12px;
+  font-size: 0.82rem;
+}
+.sugg-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.sugg-row {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding: 2px 0;
+}
+.sugg-row span {
+  color: var(--muted);
+  flex: none;
+}
+.sugg-row b {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sugg-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.sugg-actions button {
+  font-size: 0.8rem;
+  padding: 4px 9px;
+}
+
 /* linked editable column: cell value differs from the fetched MISUMI value */
 .cell-link-diff {
   background: #fff4e5;

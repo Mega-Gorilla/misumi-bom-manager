@@ -137,6 +137,27 @@ export function buildExportGrid(doc: BomDoc): { headers: string[]; rows: string[
   return { headers, rows };
 }
 
+/** If a linked editable column has a fetched EC value that differs from the cell's current
+ *  value (an empty cell counts as differing), return both so the UI can offer to adopt it.
+ *  Returns null when there is nothing to reconcile: no link, a role/fetch-key column, no
+ *  fetched value (or ORDER not matching), or the cell already equals the fetched value. */
+export function pendingSuggestion(
+  doc: BomDoc,
+  row: BomRow,
+  col: ColumnDef,
+): { current: string; fetched: string } | null {
+  if (!col.link || col.kind === "supplier" || col.role || !col.editable) return null;
+  const sourceCol = sourceColumn(doc);
+  if (col.key === partNoColumn(doc)?.key || col.key === sourceCol?.key) return null;
+  const fetchedRaw = getSupplierFieldValue(row, col.link.field, sourceCol);
+  const fetched = fetchedRaw == null ? "" : String(fetchedRaw);
+  if (fetched.trim() === "") return null;
+  const curRaw = getCellValue(row, col);
+  const current = curRaw == null ? "" : String(curRaw);
+  if (current.trim() === fetched.trim()) return null;
+  return { current, fetched };
+}
+
 function toColDef(c: ColumnDef, sourceCol?: ColumnDef): ColDef<BomRow> {
   const base: ColDef<BomRow> = {
     colId: c.key,
