@@ -440,6 +440,27 @@ button:disabled {
   display: flex;
   flex-direction: column;
 }
+.iw-name-row {
+  display: flex;
+  padding: 2px 2px 10px;
+}
+.iw-name-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--muted);
+  width: 100%;
+}
+.iw-name {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--text);
+  font-size: 0.95rem;
+}
 .iw-controls {
   display: flex;
   flex-wrap: wrap;
@@ -536,6 +557,12 @@ button:disabled {
 .iw-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: 8px;
   margin-top: 14px;
+}
+.iw-setup-ec {
+  margin-right: auto;
+  color: var(--muted);
+  cursor: pointer;
 }

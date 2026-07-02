@@ -5,6 +5,8 @@ import { SUPPLIER_FIELDS, WRITE_POLICIES } from "../types/bom";
 
 interface Props {
   columns: ColumnDef[];
+  /** Which tab to open on (default "columns"). Import flow opens on "ec". */
+  initialTab?: "columns" | "ec";
   onAdd: (label: string) => void;
   onAddSupplier: (field: string, label: string) => void;
   onSetFieldLink: (field: string, columnKey: string | null, write: WritePolicy) => void;
@@ -36,7 +38,7 @@ function roleKey(columns: ColumnDef[], role: ColumnRole, fallbackKey: string): s
 }
 
 export function ColumnManager(p: Props) {
-  const [tab, setTab] = useState<"columns" | "ec">("columns");
+  const [tab, setTab] = useState<"columns" | "ec">(p.initialTab ?? "columns");
   const [newLabel, setNewLabel] = useState("");
 
   const add = () => {

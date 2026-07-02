@@ -8,7 +8,7 @@ interface Props {
   fileName: string;
   path: string;
   onCancel: () => void;
-  onConfirm: (doc: BomDoc) => void;
+  onConfirm: (doc: BomDoc, openEcSetup: boolean) => void;
 }
 
 const SKIP = ""; // 取込しない
@@ -57,6 +57,8 @@ function uniqueKey(used: Set<string>, base: string): string {
 
 export function ImportWizard(p: Props) {
   const sheets = p.workbook.sheets;
+  const [name, setName] = useState(p.fileName);
+  const [setupEc, setSetupEc] = useState(true);
   const [sheetIndex, setSheetIndex] = useState(0);
   const [hasHeader, setHasHeader] = useState(true);
   const [headerRow, setHeaderRow] = useState(0); // 0-based
@@ -123,7 +125,7 @@ export function ImportWizard(p: Props) {
   const coreByKey = useMemo(() => new Map(CORE_COLUMNS.map((c) => [c.key, c])), []);
 
   const buildDoc = (): BomDoc => {
-    const doc = newBom(p.fileName || "取込BOM");
+    const doc = newBom(name.trim() || p.fileName || "取込BOM");
     // Import brings in only core columns + the columns the user mapped — NOT the default
     // EC (supplier) columns that newBom() seeds. They can be added later via 列管理; MISUMI
     // fetch works off the 型番列 / 発注先列, so nothing is lost by omitting them here.
@@ -189,6 +191,18 @@ export function ImportWizard(p: Props) {
           <button className="icon-btn" onClick={p.onCancel} title="閉じる">
             <X size={16} />
           </button>
+        </div>
+
+        <div className="iw-name-row">
+          <label>
+            BOM名
+            <input
+              className="iw-name"
+              value={name}
+              placeholder="BOM 名"
+              onChange={(e) => setName(e.currentTarget.value)}
+            />
+          </label>
         </div>
 
         <div className="iw-controls">
@@ -285,12 +299,16 @@ export function ImportWizard(p: Props) {
         </div>
 
         <div className="iw-actions">
+          <label className="iw-check iw-setup-ec">
+            <input type="checkbox" checked={setupEc} onChange={(e) => setSetupEc(e.currentTarget.checked)} />
+            取込後にEC連携を設定する
+          </label>
           <button onClick={p.onCancel}>キャンセル</button>
           <button
             className="primary"
             disabled={!canConfirm}
             title={canConfirm ? "取込を実行" : "取込する列と行を指定してください"}
-            onClick={() => p.onConfirm(buildDoc())}
+            onClick={() => p.onConfirm(buildDoc(), setupEc)}
           >
             <Check size={15} /> この内容で取込
           </button>

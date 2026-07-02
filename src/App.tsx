@@ -51,6 +51,7 @@ export default function App() {
   const [list, setList] = useState<BomSummary[]>([]);
   const [status, setStatus] = useState("");
   const [showColumns, setShowColumns] = useState(false);
+  const [columnsTab, setColumnsTab] = useState<"columns" | "ec">("columns");
   const [importSrc, setImportSrc] = useState<{ workbook: Workbook; fileName: string; path: string } | null>(null);
   const [quickFilter, setQuickFilter] = useState("");
   const [quoting, setQuoting] = useState(false);
@@ -315,14 +316,20 @@ export default function App() {
     }
   };
 
-  // Wizard confirmed: persist the built BomDoc as a new BOM and open it.
-  const confirmImport = async (built: BomDoc) => {
+  // Wizard confirmed: persist the built BomDoc as a new BOM and open it. When the user
+  // opted in, jump straight into 列管理 on the 取得・連携 tab to set up EC linking/fetch
+  // (imported BOMs have no EC columns yet, so this closes the loop).
+  const confirmImport = async (built: BomDoc, openEcSetup: boolean) => {
     setImportSrc(null);
     try {
       const id = await api.bomSave(built);
       await reloadList();
       await openBom(id);
       setStatus(`取込しました（${built.rows.length} 行）`);
+      if (openEcSetup) {
+        setColumnsTab("ec");
+        setShowColumns(true);
+      }
     } catch (e) {
       setStatus(String(e));
     }
@@ -370,7 +377,10 @@ export default function App() {
             onDupRows={dupRows}
             onDelRows={delRows}
             onRenumber={renumberNo}
-            onManageColumns={() => setShowColumns(true)}
+            onManageColumns={() => {
+              setColumnsTab("columns");
+              setShowColumns(true);
+            }}
             onExport={doExport}
             onRename={(name) => setDoc({ ...doc, meta: { ...doc.meta, name } })}
             onQuickFilter={setQuickFilter}
@@ -384,6 +394,7 @@ export default function App() {
           {showColumns && (
             <ColumnManager
               columns={doc.columns}
+              initialTab={columnsTab}
               onAdd={addColumn}
               onAddSupplier={addSupplierColumn}
               onSetFieldLink={setFieldLink}
