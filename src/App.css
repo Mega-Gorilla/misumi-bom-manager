@@ -179,10 +179,12 @@ body.fill-dragging {
   cursor: crosshair;
   user-select: none;
 }
-/* Only the AG Grid root should fill the wrapper — NOT the fill-handle / preview
-   overlays (which are also direct children). Otherwise this rule's higher
-   specificity overrides .fill-handle's height:8px and stretches it into a tall bar. */
-.grid-wrap > div:not(.fill-handle):not(.fill-preview) {
+/* Only the AG Grid root should fill the wrapper — NOT the overlays that are also direct
+   children (fill handle / preview / suggestion chooser + its backdrop). Otherwise this
+   rule's higher specificity forces height:100% and stretches them (a tall fill-handle bar,
+   or an over-tall chooser popover with empty space below its content). */
+.grid-wrap
+  > div:not(.fill-handle):not(.fill-preview):not(.sugg-chooser):not(.sugg-backdrop) {
   height: 100%;
 }
 
