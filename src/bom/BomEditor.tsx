@@ -35,6 +35,7 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
     current: string;
     fetched: string;
   } | null>(null);
+  const [choice, setChoice] = useState<"adopt" | "keep" | "edit">("adopt");
 
   // Columns only need to rebuild when the column set changes.
   const columnDefs = useMemo(() => buildColumnDefs(doc), [doc.columns]);
@@ -74,11 +75,15 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
       if (!root || !cellEl) return;
       const r = cellEl.getBoundingClientRect();
       const c = root.getBoundingClientRect();
+      // Clamp so the (wide) popover stays inside the grid area.
+      const POP_W = 420;
+      const left = Math.max(0, Math.min(r.left - c.left, c.width - POP_W));
+      setChoice("adopt");
       setChooser({
         rowId: e.data.id,
         colId,
         rowIndex: e.rowIndex,
-        left: r.left - c.left,
+        left,
         top: r.bottom - c.top,
         label: col.label,
         current: pend.current,
@@ -88,18 +93,16 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
     [doc],
   );
 
-  const adoptFetched = () => {
+  // Apply the selected option on OK. Adopt writes through the grid (valueSetter →
+  // onCellValueChanged) so the doc stays authoritative and the highlight clears; edit opens
+  // the inline editor; keep just closes.
+  const applyChoice = () => {
     if (!chooser || !api) return;
-    // Write through the grid (valueSetter → onCellValueChanged) so the doc stays the source
-    // of truth; the highlight then clears since the cell now equals the fetched value.
-    api.getRowNode(chooser.rowId)?.setDataValue(chooser.colId, chooser.fetched);
+    const c = chooser;
     setChooser(null);
-  };
-  const editChooserCell = () => {
-    if (!chooser || !api) return;
-    const { rowIndex, colId } = chooser;
-    setChooser(null);
-    api.startEditingCell({ rowIndex, colKey: colId });
+    if (choice === "adopt") api.getRowNode(c.rowId)?.setDataValue(c.colId, c.fetched);
+    else if (choice === "edit") api.startEditingCell({ rowIndex: c.rowIndex, colKey: c.colId });
+    // keep: no change
   };
 
   // Managed row drag: read the grid's new order back into the doc.
@@ -140,21 +143,37 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
         <>
           <div className="sugg-backdrop" onClick={() => setChooser(null)} />
           <div className="sugg-chooser" style={{ left: chooser.left, top: chooser.top }}>
-            <div className="sugg-title">{chooser.label}</div>
-            <div className="sugg-row">
-              <span>現在の値</span>
-              <b>{chooser.current || "（空欄）"}</b>
+            <div className="sugg-title">提案の反映</div>
+            <div className="sugg-sub">列: {chooser.label}</div>
+            <div className="sugg-values">
+              <div className="sugg-row">
+                <span>現在の値</span>
+                <b>{chooser.current || "（空欄）"}</b>
+              </div>
+              <div className="sugg-row">
+                <span>MISUMI値</span>
+                <b>{chooser.fetched}</b>
+              </div>
             </div>
-            <div className="sugg-row">
-              <span>MISUMI値</span>
-              <b>{chooser.fetched}</b>
+            <div className="sugg-options">
+              <label>
+                <input type="radio" checked={choice === "adopt"} onChange={() => setChoice("adopt")} />
+                MISUMI値を採用
+              </label>
+              <label>
+                <input type="radio" checked={choice === "keep"} onChange={() => setChoice("keep")} />
+                今の値のまま
+              </label>
+              <label>
+                <input type="radio" checked={choice === "edit"} onChange={() => setChoice("edit")} />
+                自分で編集
+              </label>
             </div>
             <div className="sugg-actions">
-              <button className="primary" onClick={adoptFetched}>
-                MISUMI値を採用
+              <button onClick={() => setChooser(null)}>キャンセル</button>
+              <button className="primary" onClick={applyChoice}>
+                OK
               </button>
-              <button onClick={() => setChooser(null)}>今の値のまま</button>
-              <button onClick={editChooserCell}>自分で編集</button>
             </div>
           </div>
         </>

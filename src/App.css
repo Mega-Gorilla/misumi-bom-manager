@@ -417,44 +417,65 @@ button:disabled {
 .sugg-chooser {
   position: absolute;
   z-index: 7;
-  min-width: 230px;
-  max-width: 320px;
+  width: 420px;
+  max-width: 60vw;
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(16, 24, 40, 0.18);
-  padding: 10px 12px;
-  font-size: 0.82rem;
+  padding: 12px 14px;
+  font-size: 0.84rem;
 }
 .sugg-title {
   font-weight: 600;
-  margin-bottom: 6px;
+}
+.sugg-sub {
+  font-size: 0.76rem;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.sugg-values {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  background: var(--bg);
 }
 .sugg-row {
   display: flex;
   gap: 10px;
-  justify-content: space-between;
-  padding: 2px 0;
+  align-items: flex-start;
+  padding: 3px 0;
 }
 .sugg-row span {
   color: var(--muted);
-  flex: none;
+  flex: 0 0 72px;
 }
 .sugg-row b {
   font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  word-break: break-word;
+}
+.sugg-options {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 10px;
+}
+.sugg-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
 }
 .sugg-actions {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 10px;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
 }
 .sugg-actions button {
-  font-size: 0.8rem;
-  padding: 4px 9px;
+  font-size: 0.82rem;
+  padding: 5px 14px;
 }
 
 /* linked editable column: cell value differs from the fetched MISUMI value */
