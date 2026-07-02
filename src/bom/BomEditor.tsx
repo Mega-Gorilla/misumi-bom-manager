@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Ref } from "react";
 import { AgGridReact } from "ag-grid-react";
 import type {
+  CellClickedEvent,
   CellDoubleClickedEvent,
   CellValueChangedEvent,
   GridApi,
@@ -39,6 +40,9 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
   // Set when the chooser's "自分で編集" starts an edit, so the next commit on that cell is
   // treated as a deliberate reconciliation (ack ← fetched) rather than a plain edit.
   const pendingEditAckRef = useRef<{ rowId: string; colId: string; fetched: string } | null>(null);
+  // Anchor row for Excel-style Shift+↑/↓ range selection (custom; Community has no keyboard
+  // range). Set on a plain cell click, cleared on Ctrl/Shift-click and non-shift navigation.
+  const shiftAnchorRef = useRef<number | null>(null);
 
   // Columns only need to rebuild when the column set changes.
   const columnDefs = useMemo(() => buildColumnDefs(doc), [doc.columns]);
@@ -204,6 +208,49 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, doc, chooser, choice]);
 
+  // Plain click sets the range anchor to that row; Ctrl/Shift-click clears it (so the next
+  // Shift+↑/↓ re-anchors at the focused row).
+  const onCellClicked = useCallback((e: CellClickedEvent<BomRow>) => {
+    const me = e.event as MouseEvent | undefined;
+    shiftAnchorRef.current =
+      me && !me.shiftKey && !me.ctrlKey && e.rowIndex != null ? e.rowIndex : null;
+  }, []);
+
+  // Excel-style Shift+↑/↓ row-range selection. Captured on the wrapper so it runs before AG
+  // Grid's own navigation (which we then suppress) — extends the row selection from the
+  // anchor to the moved focus. Disabled while editing; non-shift keys reset the anchor.
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap || !api) return;
+    const onKeyCapture = (ev: KeyboardEvent) => {
+      if (!ev.shiftKey) {
+        shiftAnchorRef.current = null;
+        return;
+      }
+      if (ev.key !== "ArrowDown" && ev.key !== "ArrowUp") return;
+      if (api.getEditingCells().length > 0) return;
+      const fc = api.getFocusedCell();
+      if (!fc || fc.rowPinned) return;
+      const count = api.getDisplayedRowCount();
+      if (count <= 0) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (shiftAnchorRef.current == null) shiftAnchorRef.current = fc.rowIndex;
+      const target = Math.max(
+        0,
+        Math.min(count - 1, fc.rowIndex + (ev.key === "ArrowDown" ? 1 : -1)),
+      );
+      api.setFocusedCell(target, fc.column.getColId());
+      api.ensureIndexVisible(target);
+      const lo = Math.min(shiftAnchorRef.current, target);
+      const hi = Math.max(shiftAnchorRef.current, target);
+      api.deselectAll();
+      for (let i = lo; i <= hi; i++) api.getDisplayedRowAtIndex(i)?.setSelected(true);
+    };
+    wrap.addEventListener("keydown", onKeyCapture, true);
+    return () => wrap.removeEventListener("keydown", onKeyCapture, true);
+  }, [api]);
+
   // Managed row drag: read the grid's new order back into the doc.
   const onRowDragEnd = useCallback(
     (e: RowDragEndEvent<BomRow>) => {
@@ -229,6 +276,7 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
         onGridReady={(e: GridReadyEvent<BomRow>) => setApi(e.api)}
         onCellValueChanged={onCellValueChanged}
         onCellDoubleClicked={onCellDoubleClicked}
+        onCellClicked={onCellClicked}
         rowDragManaged
         onRowDragEnd={onRowDragEnd}
         quickFilterText={quickFilter}
