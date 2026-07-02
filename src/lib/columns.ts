@@ -58,6 +58,18 @@ export function applyLinkedColumns(doc: BomDoc): BomDoc {
   return { ...doc, rows };
 }
 
+/** Reserved row.custom key marking that a linked column's difference vs the fetched EC
+ *  value has been reconciled ("現在の値を採用"). It stores the fetched value it was resolved
+ *  against, so a later fetch that changes that value re-flags the cell. Hidden (no column
+ *  uses this key, so it never displays or exports) and persisted for free via row.custom. */
+export const ackKey = (colKey: string): string => `__mbmAck:${colKey}`;
+
+/** True if the cell was reconciled against the current fetched value (highlight suppressed). */
+function isResolved(row: BomRow, colKey: string, fetched: unknown): boolean {
+  const ack = row.custom?.[ackKey(colKey)];
+  return ack != null && ack === String(fetched ?? "").trim();
+}
+
 /** ColDef extras for an editable column linked to a supplier field: live diff highlight
  *  (cell value vs fetched) + a "MISUMI: <value>" tooltip. Stateless. */
 function linkExtras(c: ColumnDef, sourceCol?: ColumnDef): Partial<ColDef<BomRow>> {
@@ -74,12 +86,14 @@ function linkExtras(c: ColumnDef, sourceCol?: ColumnDef): Partial<ColDef<BomRow>
         if (fetched == null || fetched === "") return false;
         const cur = getCellValue(p.data, c);
         if (cur == null || String(cur).trim() === "") return false;
+        if (isResolved(p.data, c.key, fetched)) return false; // reconciled
         return String(cur).trim() !== String(fetched).trim();
       },
       "cell-link-suggest": (p) => {
         if (policy !== "suggest" || !p.data) return false;
         const fetched = getSupplierFieldValue(p.data, field, sourceCol);
         if (fetched == null || fetched === "") return false;
+        if (isResolved(p.data, c.key, fetched)) return false; // reconciled
         const cur = getCellValue(p.data, c);
         return cur == null || String(cur).trim() === "";
       },
@@ -152,6 +166,7 @@ export function pendingSuggestion(
   const fetchedRaw = getSupplierFieldValue(row, col.link.field, sourceCol);
   const fetched = fetchedRaw == null ? "" : String(fetchedRaw);
   if (fetched.trim() === "") return null;
+  if (isResolved(row, col.key, fetchedRaw)) return null; // already reconciled
   const curRaw = getCellValue(row, col);
   const current = curRaw == null ? "" : String(curRaw);
   if (current.trim() === fetched.trim()) return null;

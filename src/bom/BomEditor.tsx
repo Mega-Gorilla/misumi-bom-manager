@@ -10,7 +10,7 @@ import type {
 } from "ag-grid-community";
 import type { BomDoc, BomRow } from "../types/bom";
 import { partNoColumn } from "../types/bom";
-import { buildColumnDefs, pendingSuggestion } from "../lib/columns";
+import { ackKey, buildColumnDefs, pendingSuggestion } from "../lib/columns";
 import { bomTheme } from "../lib/agTheme";
 import { FillHandle } from "./FillHandle";
 
@@ -46,9 +46,17 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
       // back into the doc immutably so state stays the source of truth.
       // Editing the designated 型番列 (partNo role) invalidates the fetched EC result for
       // that row — resolve the role column dynamically, not the hardcoded "partsNo" key.
+      const colId = e.column.getColId();
       const partKey = partNoColumn(doc)?.key;
-      const updated =
-        e.column.getColId() === partKey ? { ...e.data, supplier: undefined } : { ...e.data };
+      const base = { ...e.data };
+      // A manual edit supersedes any prior "現在の値を採用" reconciliation on this cell, so a
+      // new difference re-flags. (Adopting the MISUMI value routes here too and clears it.)
+      const ak = ackKey(colId);
+      if (base.custom && ak in base.custom) {
+        base.custom = { ...base.custom };
+        delete base.custom[ak];
+      }
+      const updated = colId === partKey ? { ...base, supplier: undefined } : base;
       const rows = doc.rows.map((r) => (r.id === e.data.id ? updated : r));
       onChange({ ...doc, rows });
     },
@@ -93,16 +101,29 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
     [doc],
   );
 
-  // Apply the selected option on OK. Adopt writes through the grid (valueSetter →
-  // onCellValueChanged) so the doc stays authoritative and the highlight clears; edit opens
-  // the inline editor; keep just closes.
+  // Apply the selected option on OK.
+  //  - adopt : write the MISUMI value through the grid (valueSetter → onCellValueChanged);
+  //            current becomes fetched so the highlight clears naturally.
+  //  - edit  : open the inline editor.
+  //  - keep  : keep the current value but mark the difference reconciled (ack = fetched) so
+  //            the highlight clears until a future fetch changes the MISUMI value.
   const applyChoice = () => {
     if (!chooser || !api) return;
     const c = chooser;
     setChooser(null);
-    if (choice === "adopt") api.getRowNode(c.rowId)?.setDataValue(c.colId, c.fetched);
-    else if (choice === "edit") api.startEditingCell({ rowIndex: c.rowIndex, colKey: c.colId });
-    // keep: no change
+    if (choice === "adopt") {
+      api.getRowNode(c.rowId)?.setDataValue(c.colId, c.fetched);
+    } else if (choice === "edit") {
+      api.startEditingCell({ rowIndex: c.rowIndex, colKey: c.colId });
+    } else {
+      const key = ackKey(c.colId);
+      const rows = doc.rows.map((r) =>
+        r.id === c.rowId ? { ...r, custom: { ...r.custom, [key]: c.fetched.trim() } } : r,
+      );
+      onChange({ ...doc, rows });
+      // The ack isn't a displayed value, so nudge AG Grid to re-evaluate cellClassRules.
+      requestAnimationFrame(() => api.refreshCells({ force: true }));
+    }
   };
 
   // Managed row drag: read the grid's new order back into the doc.
@@ -162,7 +183,7 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
               </label>
               <label>
                 <input type="radio" checked={choice === "keep"} onChange={() => setChoice("keep")} />
-                今の値のまま
+                現在の値を採用
               </label>
               <label>
                 <input type="radio" checked={choice === "edit"} onChange={() => setChoice("edit")} />
