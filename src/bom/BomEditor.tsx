@@ -8,6 +8,7 @@ import type {
   RowDragEndEvent,
 } from "ag-grid-community";
 import type { BomDoc, BomRow } from "../types/bom";
+import { partNoColumn } from "../types/bom";
 import { buildColumnDefs } from "../lib/columns";
 import { bomTheme } from "../lib/agTheme";
 import { FillHandle } from "./FillHandle";
@@ -30,9 +31,11 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
     (e: CellValueChangedEvent<BomRow>) => {
       // AG Grid has already mutated e.data via field / valueSetter; reflect it
       // back into the doc immutably so state stays the source of truth.
-      // Changing the part number invalidates the fetched EC result for that row.
+      // Editing the designated 型番列 (partNo role) invalidates the fetched EC result for
+      // that row — resolve the role column dynamically, not the hardcoded "partsNo" key.
+      const partKey = partNoColumn(doc)?.key;
       const updated =
-        e.column.getColId() === "partsNo" ? { ...e.data, supplier: undefined } : { ...e.data };
+        e.column.getColId() === partKey ? { ...e.data, supplier: undefined } : { ...e.data };
       const rows = doc.rows.map((r) => (r.id === e.data.id ? updated : r));
       onChange({ ...doc, rows });
     },

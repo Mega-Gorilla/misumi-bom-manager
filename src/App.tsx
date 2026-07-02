@@ -150,15 +150,25 @@ export default function App() {
   };
 
   // Designate which column plays a fetch role (型番列 / EC発注先列). Each role has at most
-  // one column, so assigning it clears any previous holder.
+  // one column, so assigning it clears any previous holder. A role column is a fetch key,
+  // never an EC fill target, so we also drop any EC link it may have carried.
   const setColumnRole = (role: ColumnRole, key: string) => {
     if (!doc) return;
+    const prevPartKey = partNoColumn(doc)?.key;
     const columns = doc.columns.map((c) => {
-      if (c.key === key) return { ...c, role };
+      if (c.key === key) return { ...c, role, link: undefined };
       if (c.role === role) return { ...c, role: undefined };
       return c;
     });
-    setDoc({ ...doc, columns });
+    // Reassigning the 型番列 changes the fetch identity — previously fetched EC results no
+    // longer correspond to the new part number, so clear supplier from all rows (re-fetch
+    // resets them). Reassigning the 発注先列 doesn't change identity (supplierActive gates
+    // it live), so leave supplier intact there.
+    const rows =
+      role === "partNo" && prevPartKey !== key
+        ? doc.rows.map((r) => (r.supplier ? { ...r, supplier: undefined } : r))
+        : doc.rows;
+    setDoc({ ...doc, columns, rows });
   };
 
   // Map an EC field to a target column (field-anchored, per plan §7.3「フィールドを列に結ぶ」).

@@ -56,7 +56,10 @@ export function ColumnManager(p: Props) {
   // unlinked or already linked to this field (so one column receives at most one field).
   const targetOptions = (field: string) =>
     p.columns.filter((c) => canLink(c) && (!c.link || c.link.field === field));
-  const linkedColumn = (field: string) => p.columns.find((c) => c.link?.field === field);
+  // Only link-eligible columns count as a field's target (a role column or supplier column
+  // may still carry a stale link, but it is never the EC反映先).
+  const linkedColumn = (field: string) =>
+    p.columns.find((c) => c.link?.field === field && canLink(c));
 
   return (
     <div className="col-mgr-backdrop" onClick={p.onClose}>

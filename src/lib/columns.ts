@@ -31,7 +31,12 @@ export function applyLinkedColumns(doc: BomDoc): BomDoc {
   const srcKey = sourceCol?.key;
   const links = doc.columns.filter(
     (c) =>
-      c.kind !== "supplier" && c.editable && c.link && c.key !== partKey && c.key !== srcKey,
+      c.kind !== "supplier" &&
+      c.editable &&
+      c.link &&
+      !c.role &&
+      c.key !== partKey &&
+      c.key !== srcKey,
   );
   if (links.length === 0) return doc;
   const rows = doc.rows.map((r) => {
@@ -56,7 +61,9 @@ export function applyLinkedColumns(doc: BomDoc): BomDoc {
 /** ColDef extras for an editable column linked to a supplier field: live diff highlight
  *  (cell value vs fetched) + a "MISUMI: <value>" tooltip. Stateless. */
 function linkExtras(c: ColumnDef, sourceCol?: ColumnDef): Partial<ColDef<BomRow>> {
-  if (!c.link || c.kind === "supplier") return {};
+  // A role column (型番列 / EC発注先列) is a fetch key, never an EC fill target — ignore any
+  // stale link it may still carry so no diff highlight / tooltip is shown on it.
+  if (!c.link || c.kind === "supplier" || c.role) return {};
   const field = c.link.field;
   const policy = c.link.write;
   const extras: Partial<ColDef<BomRow>> = {
@@ -94,19 +101,19 @@ export function getCellValue(row: BomRow, col: ColumnDef): unknown {
 }
 
 /** Return a new row with `col` set to `value` (immutable). Mirrors the column
- *  valueSetter semantics (numeric parse for No./Qty, custom -> row.custom). */
+ *  valueSetter semantics (numeric parse for No./Qty, custom -> row.custom). Role-agnostic:
+ *  invalidating the fetched EC result when the 型番列 changes is the caller's job (it knows
+ *  the current partNo-role column via partNoColumn(doc)), since this pure setter has no doc. */
 export function setCellValue(row: BomRow, col: ColumnDef, value: unknown): BomRow {
   if (col.kind === "supplier" || !col.editable) return row;
   if (col.kind === "custom") {
     return { ...row, custom: { ...row.custom, [col.key]: value == null ? "" : String(value) } };
   }
-  // Changing the part number invalidates any fetched EC result for this row.
-  const r = col.key === "partsNo" && row.supplier ? { ...row, supplier: undefined } : row;
   if (NUMERIC_CORE_KEYS.has(col.key)) {
     const n = Number(value);
-    return { ...r, [col.key]: Number.isFinite(n) ? n : undefined };
+    return { ...row, [col.key]: Number.isFinite(n) ? n : undefined };
   }
-  return { ...r, [col.key]: value == null ? "" : String(value) };
+  return { ...row, [col.key]: value == null ? "" : String(value) };
 }
 
 function toColDef(c: ColumnDef, sourceCol?: ColumnDef): ColDef<BomRow> {
