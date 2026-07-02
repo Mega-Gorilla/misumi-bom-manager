@@ -124,7 +124,10 @@ export function ImportWizard(p: Props) {
 
   const buildDoc = (): BomDoc => {
     const doc = newBom(p.fileName || "取込BOM");
-    const cols = [...doc.columns];
+    // Import brings in only core columns + the columns the user mapped — NOT the default
+    // EC (supplier) columns that newBom() seeds. They can be added later via 列管理; MISUMI
+    // fetch works off the 型番列 / 発注先列, so nothing is lost by omitting them here.
+    const cols = doc.columns.filter((c) => c.kind !== "supplier");
     const used = new Set(cols.map((c) => c.key));
     // Resolve each spreadsheet column to a target column key (creating custom columns
     // for "__new__"). Role columns default to Parts No / ORDER via CORE_COLUMNS.
