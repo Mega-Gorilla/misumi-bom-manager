@@ -36,6 +36,9 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
     fetched: string;
   } | null>(null);
   const [choice, setChoice] = useState<"adopt" | "keep" | "edit">("adopt");
+  // Set when the chooser's "自分で編集" starts an edit, so the next commit on that cell is
+  // treated as a deliberate reconciliation (ack ← fetched) rather than a plain edit.
+  const pendingEditAckRef = useRef<{ rowId: string; colId: string; fetched: string } | null>(null);
 
   // Columns only need to rebuild when the column set changes.
   const columnDefs = useMemo(() => buildColumnDefs(doc), [doc.columns]);
@@ -48,13 +51,14 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
       // that row — resolve the role column dynamically, not the hardcoded "partsNo" key.
       const colId = e.column.getColId();
       const partKey = partNoColumn(doc)?.key;
-      const base = { ...e.data };
-      // A manual edit supersedes any prior "現在の値を採用" reconciliation on this cell, so a
-      // new difference re-flags. (Adopting the MISUMI value routes here too and clears it.)
-      const ak = ackKey(colId);
-      if (base.custom && ak in base.custom) {
-        base.custom = { ...base.custom };
-        delete base.custom[ak];
+      let base = { ...e.data };
+      // If this commit is the chooser's "自分で編集", record it as reconciled (ack ← fetched)
+      // so the difference highlight clears, matching the other two options. Plain edits leave
+      // any existing ack untouched (a re-fetch that changes the value re-flags it).
+      const pend = pendingEditAckRef.current;
+      if (pend && pend.rowId === e.data.id && pend.colId === colId) {
+        base = { ...base, custom: { ...base.custom, [ackKey(colId)]: pend.fetched } };
+        pendingEditAckRef.current = null;
       }
       const updated = colId === partKey ? { ...base, supplier: undefined } : base;
       const rows = doc.rows.map((r) => (r.id === e.data.id ? updated : r));
@@ -68,6 +72,7 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
   // editor. Cells with no pending suggestion edit normally.
   const onCellDoubleClicked = useCallback(
     (e: CellDoubleClickedEvent<BomRow>) => {
+      pendingEditAckRef.current = null; // reset any stale edit-myself intent
       if (!e.data || e.rowIndex == null) return;
       const colId = e.column.getColId();
       const col = doc.columns.find((c) => c.key === colId);
@@ -114,6 +119,8 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
     if (choice === "adopt") {
       api.getRowNode(c.rowId)?.setDataValue(c.colId, c.fetched);
     } else if (choice === "edit") {
+      // Remember this cell so its next commit is recorded as reconciled (highlight clears).
+      pendingEditAckRef.current = { rowId: c.rowId, colId: c.colId, fetched: c.fetched.trim() };
       api.startEditingCell({ rowIndex: c.rowIndex, colKey: c.colId });
     } else {
       const key = ackKey(c.colId);
