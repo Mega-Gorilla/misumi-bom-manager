@@ -316,9 +316,9 @@ export default function App() {
     }
   };
 
-  // Wizard confirmed: persist the built BomDoc as a new BOM and open it. When the user
-  // opted in, jump straight into 列管理 on the 取得・連携 tab to set up EC linking/fetch
-  // (imported BOMs have no EC columns yet, so this closes the loop).
+  // Wizard confirmed: persist the built BomDoc as a new BOM and open it. When the user opted
+  // in, open 列管理 on the 列の構成 tab — imported BOMs have no EC columns yet, and that tab
+  // is where "EC連携項目を列に追加" lives (the 取得・連携 tab only links to existing columns).
   const confirmImport = async (built: BomDoc, openEcSetup: boolean) => {
     setImportSrc(null);
     try {
@@ -327,7 +327,7 @@ export default function App() {
       await openBom(id);
       setStatus(`取込しました（${built.rows.length} 行）`);
       if (openEcSetup) {
-        setColumnsTab("ec");
+        setColumnsTab("columns");
         setShowColumns(true);
       }
     } catch (e) {

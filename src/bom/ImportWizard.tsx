@@ -78,13 +78,18 @@ export function ImportWizard(p: Props) {
     return Array.from({ length: colCount }, (_, i) => (src[i] ?? "").trim());
   }, [sheet, headerRow, hasHeader, colCount]);
 
-  // (Re)initialize the mapping with auto-guesses when the sheet or header changes.
+  // (Re)initialize the mapping with auto-guesses when the sheet or header changes. A core
+  // key is guessed at most once — a second column matching the same key falls back to SKIP
+  // (each core field can receive only one source column).
   const effectiveMapping = useMemo(() => {
     if (mappedSheet === sheetIndex && mapping.length === colCount) return mapping;
-    const guessed = Array.from({ length: colCount }, (_, i) =>
-      hasHeader ? guessKey(headerLabels[i]) : SKIP,
-    );
-    return guessed;
+    const seen = new Set<string>();
+    return Array.from({ length: colCount }, (_, i) => {
+      const g = hasHeader ? guessKey(headerLabels[i]) : SKIP;
+      if (g === SKIP || seen.has(g)) return SKIP;
+      seen.add(g);
+      return g;
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sheetIndex, colCount, hasHeader, headerLabels]);
 
@@ -266,11 +271,19 @@ export function ImportWizard(p: Props) {
                   <th key={ci}>
                     <select value={currentMapping[ci] ?? SKIP} onChange={(e) => setTarget(ci, e.currentTarget.value)}>
                       <option value={SKIP}>取込しない</option>
-                      {CORE_COLUMNS.map((c) => (
-                        <option key={c.key} value={c.key}>
-                          {c.label}
-                        </option>
-                      ))}
+                      {CORE_COLUMNS.map((c) => {
+                        // A core field takes only one source column: disable it where another
+                        // column already claims it (prevents silent overwrite on import).
+                        const takenElsewhere = currentMapping.some(
+                          (m, i) => i !== ci && m === c.key,
+                        );
+                        return (
+                          <option key={c.key} value={c.key} disabled={takenElsewhere}>
+                            {c.label}
+                            {takenElsewhere ? "（割当済）" : ""}
+                          </option>
+                        );
+                      })}
                       <option value={NEW}>＋ 新規列として追加</option>
                     </select>
                     {hasHeader && <div className="iw-header-label">{headerLabels[ci] || `列${ci + 1}`}</div>}
@@ -299,9 +312,9 @@ export function ImportWizard(p: Props) {
         </div>
 
         <div className="iw-actions">
-          <label className="iw-check iw-setup-ec">
+          <label className="iw-check iw-setup-ec" title="取込後に列管理を開き、EC取得列の追加や連携を設定できます">
             <input type="checkbox" checked={setupEc} onChange={(e) => setSetupEc(e.currentTarget.checked)} />
-            取込後にEC連携を設定する
+            取込後に列管理を開く（EC連携の設定）
           </label>
           <button onClick={p.onCancel}>キャンセル</button>
           <button
