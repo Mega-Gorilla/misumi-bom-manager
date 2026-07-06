@@ -291,24 +291,26 @@ function LeadTab({ entries, chrono }: { entries: PriceHistoryEntry[]; chrono: Pr
             <th>取得日時</th>
             <th>出荷日</th>
             <th className="num">リード日数</th>
-            <th className="num">出荷日変化</th>
+            <th className="num">前回比</th>
           </tr>
         </thead>
         <tbody>
           {entries.map((e, i) => {
             const ld = leadDays(e);
-            // ship date later than the previous fetch = 納期が延びた (bad→red), earlier = 早まった (green).
-            const prevShip = i + 1 < entries.length ? ymd(entries[i + 1].shipDate) : NaN;
-            const curShip = ymd(e.shipDate);
-            const dShip = Number.isFinite(curShip) && Number.isFinite(prevShip) ? (curShip - prevShip) / 86_400_000 : NaN;
-            const cls = !Number.isFinite(dShip) ? "" : dShip > 0 ? "ph-up" : dShip < 0 ? "ph-down" : "";
+            // Compare LEAD TIME, not the raw ship-date calendar move. The ship date drifts by
+            // the days elapsed between fetches, so its raw delta overstates the change
+            // (出荷日差 = リード変化 + 取得日の経過日数). Lead-time change is fetch-timing-neutral.
+            // Longer lead = 納期が延びた (worse→red), shorter = 早まった (green).
+            const prevLd = i + 1 < entries.length ? leadDays(entries[i + 1]) : NaN;
+            const dLead = Number.isFinite(ld) && Number.isFinite(prevLd) ? ld - prevLd : NaN;
+            const cls = !Number.isFinite(dLead) ? "" : dLead > 0 ? "ph-up" : dLead < 0 ? "ph-down" : "";
             return (
               <tr key={i}>
                 <td className="ph-muted">{(e.fetchedAt ?? "").slice(0, 16)}</td>
                 <td>{e.shipDate ?? "—"}</td>
                 <td className="num">{Number.isFinite(ld) ? `${ld}日` : "—"}</td>
                 <td className={`num ${cls}`}>
-                  {!Number.isFinite(dShip) ? "—" : dShip === 0 ? "±0" : `${dShip > 0 ? "+" : "−"}${Math.abs(dShip)}日`}
+                  {!Number.isFinite(dLead) ? "—" : dLead === 0 ? "±0" : `${dLead > 0 ? "+" : "−"}${Math.abs(dLead)}日`}
                 </td>
               </tr>
             );
