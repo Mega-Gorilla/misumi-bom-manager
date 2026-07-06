@@ -26,6 +26,8 @@ import { Toolbar } from "./bom/Toolbar";
 import { BomList } from "./bom/BomList";
 import { ColumnManager } from "./bom/ColumnManager";
 import { ImportWizard } from "./bom/ImportWizard";
+import { PriceHistory } from "./bom/PriceHistory";
+import { SummaryBar } from "./bom/SummaryBar";
 
 function slug(s: string): string {
   return (
@@ -53,6 +55,7 @@ export default function App() {
   const [showColumns, setShowColumns] = useState(false);
   const [columnsTab, setColumnsTab] = useState<"columns" | "ec">("columns");
   const [importSrc, setImportSrc] = useState<{ workbook: Workbook; fileName: string; path: string } | null>(null);
+  const [historyTarget, setHistoryTarget] = useState<{ supplier: string; partNo: string } | null>(null);
   const [quickFilter, setQuickFilter] = useState("");
   const [quoting, setQuoting] = useState(false);
   const gridRef = useRef<AgGridReact<BomRow>>(null);
@@ -345,6 +348,31 @@ export default function App() {
     }
   };
 
+  // Open the price/delivery history for the focused (else first-selected) row's part number.
+  // History is keyed by (supplier, 型番) and shared across all BOMs; supplier is MISUMI for now.
+  const openHistory = () => {
+    if (!doc) return;
+    const partCol = partNoColumn(doc);
+    if (!partCol) {
+      setStatus("型番列が未設定です（列の管理で設定）");
+      return;
+    }
+    const gridApi = gridRef.current?.api;
+    const fc = gridApi?.getFocusedCell();
+    const focusedRow = fc ? gridApi?.getDisplayedRowAtIndex(fc.rowIndex)?.data : undefined;
+    const row = focusedRow ?? gridApi?.getSelectedRows()[0];
+    if (!row) {
+      setStatus("履歴を表示する行を選択してください");
+      return;
+    }
+    const partNo = String(getCellValue(row, partCol) ?? "").trim();
+    if (!partNo) {
+      setStatus("型番のある行を選択してください");
+      return;
+    }
+    setHistoryTarget({ supplier: "MISUMI", partNo });
+  };
+
   const doDelete = async (id: string) => {
     try {
       await api.bomDelete(id);
@@ -381,6 +409,7 @@ export default function App() {
               setColumnsTab("columns");
               setShowColumns(true);
             }}
+            onHistory={openHistory}
             onExport={doExport}
             onRename={(name) => setDoc({ ...doc, meta: { ...doc.meta, name } })}
             onQuickFilter={setQuickFilter}
@@ -391,6 +420,7 @@ export default function App() {
             quoting={quoting}
           />
           <BomEditor doc={doc} onChange={setDoc} gridRef={gridRef} quickFilter={quickFilter} />
+          <SummaryBar doc={doc} />
           {showColumns && (
             <ColumnManager
               columns={doc.columns}
@@ -414,6 +444,13 @@ export default function App() {
           path={importSrc.path}
           onCancel={() => setImportSrc(null)}
           onConfirm={confirmImport}
+        />
+      )}
+      {historyTarget && (
+        <PriceHistory
+          supplier={historyTarget.supplier}
+          partNo={historyTarget.partNo}
+          onClose={() => setHistoryTarget(null)}
         />
       )}
     </div>

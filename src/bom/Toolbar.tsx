@@ -13,6 +13,7 @@ import {
   Search,
   DownloadCloud,
   RefreshCw,
+  History,
 } from "lucide-react";
 
 interface Props {
@@ -26,6 +27,7 @@ interface Props {
   onDelRows: () => void;
   onRenumber: () => void;
   onManageColumns: () => void;
+  onHistory: () => void;
   onExport: () => void;
   onRename: (name: string) => void;
   onQuickFilter: (text: string) => void;
@@ -105,6 +107,12 @@ export function Toolbar(p: Props) {
         title="最新化（キャッシュを無視して全件を再取得）"
       >
         <RefreshCw size={ICON} />
+      </button>
+      <button
+        onClick={p.onHistory}
+        title="選択中の行の型番について、価格・出荷日の履歴を表示（全BOM横断）"
+      >
+        <History size={ICON} /> 価格履歴
       </button>
 
       <span className="sep" />

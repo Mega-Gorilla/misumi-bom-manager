@@ -323,6 +323,29 @@ pub fn cache_put(
     Ok(())
 }
 
+/// Price/delivery history for a (supplier, part number), newest first (Phase 3).
+/// Reads the append-only `supplier_price_history` rows written by `cache_put`.
+pub fn price_history(
+    conn: &Connection,
+    supplier: &str,
+    parts_no: &str,
+    limit: i64,
+) -> rusqlite::Result<Vec<PriceHistoryEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT fetched_at, unit_price, currency, ship_date FROM supplier_price_history \
+         WHERE supplier_code = ?1 AND parts_no = ?2 ORDER BY fetched_at DESC, id DESC LIMIT ?3",
+    )?;
+    let it = stmt.query_map(params![supplier, parts_no, limit], |r| {
+        Ok(PriceHistoryEntry {
+            fetched_at: r.get(0)?,
+            unit_price: r.get(1)?,
+            currency: r.get(2)?,
+            ship_date: r.get(3)?,
+        })
+    })?;
+    it.collect()
+}
+
 /// SQLite's current timestamp string (for stamping a batch of quotes consistently).
 pub fn now_string(conn: &Connection) -> rusqlite::Result<String> {
     conn.query_row("SELECT datetime('now', 'localtime')", [], |r| r.get(0))
@@ -410,6 +433,53 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM bom_row", [], |r| r.get(0))
             .unwrap();
         assert_eq!(row_count, 0); // cascade
+    }
+
+    #[test]
+    fn price_history_appends_and_reads_newest_first() {
+        let conn = mem();
+        let mk = |price: &str, ship: &str, at: &str| SupplierQuote {
+            supplier_code: "MISUMI".into(),
+            status: "ok".into(),
+            product: None,
+            quote: Some(SupplierPricing {
+                currency: Some("JPY".into()),
+                unit_price: Some(price.into()),
+                ship_date: Some(ship.into()),
+                ..Default::default()
+            }),
+            errors: vec![],
+            warnings: vec![],
+            fetched_at: Some(at.into()),
+            raw: None,
+        };
+        // Two observations for the same part on different days (append-only history).
+        cache_put(
+            &conn,
+            "MISUMI",
+            "CBT3-8",
+            &mk("115", "2026-07-14", "2026-07-05 09:10:00"),
+        )
+        .unwrap();
+        cache_put(
+            &conn,
+            "MISUMI",
+            "CBT3-8",
+            &mk("120", "2026-07-15", "2026-07-06 15:20:00"),
+        )
+        .unwrap();
+
+        let hist = price_history(&conn, "MISUMI", "CBT3-8", 60).unwrap();
+        assert_eq!(hist.len(), 2);
+        // Newest first.
+        assert_eq!(hist[0].unit_price.as_deref(), Some("120"));
+        assert_eq!(hist[0].ship_date.as_deref(), Some("2026-07-15"));
+        assert_eq!(hist[1].unit_price.as_deref(), Some("115"));
+
+        // Unrelated part number has no history.
+        assert!(price_history(&conn, "MISUMI", "OTHER", 60)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

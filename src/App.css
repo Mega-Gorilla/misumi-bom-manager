@@ -660,3 +660,168 @@ button:disabled {
   color: var(--muted);
   cursor: pointer;
 }
+
+/* ---- BOM list: search / sort toolbar ---- */
+.list-tools {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+.list-tools .search-box .quick-filter {
+  padding: 6px 10px 6px 30px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--text);
+  font-size: 0.88rem;
+  min-width: 200px;
+}
+.list-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+.list-sort select {
+  font-size: 0.82rem;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}
+.list-count {
+  margin-left: auto;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+/* ---- summary bar (under the grid) ---- */
+.summary-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--card);
+  font-size: 0.86rem;
+  flex-wrap: wrap;
+}
+.summary-bar .sb-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.summary-bar .sb-label {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+.summary-bar .sb-amount {
+  font-size: 0.98rem;
+}
+.summary-bar .sb-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--border);
+}
+.summary-bar .sb-muted {
+  color: var(--muted);
+}
+.summary-bar .sb-error {
+  color: var(--error);
+  font-weight: 600;
+}
+
+/* ---- price history modal ---- */
+.ph-modal {
+  width: 560px;
+}
+.ph-modal h2 {
+  font-size: 1.05rem;
+  margin: 0;
+}
+.ph-supplier {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 400;
+  margin-left: 4px;
+}
+.ph-empty {
+  color: var(--muted);
+  padding: 20px 4px;
+}
+.ph-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ph-trend {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.ph-spark {
+  flex: none;
+}
+.ph-spark-line {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+.ph-spark-dot {
+  fill: var(--accent);
+}
+.ph-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.ph-summary b {
+  color: var(--text);
+  margin-left: 4px;
+}
+.ph-table-wrap {
+  max-height: 42vh;
+  overflow: auto;
+}
+.ph-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.86rem;
+}
+.ph-table th,
+.ph-table td {
+  text-align: left;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.ph-table th {
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  color: var(--muted);
+  font-weight: 600;
+  z-index: 1;
+}
+.ph-table .num {
+  text-align: right;
+}
+.ph-table .ph-muted {
+  color: var(--muted);
+}
+.ph-table .ph-up {
+  color: var(--error);
+}
+.ph-table .ph-down {
+  color: #157347;
+}

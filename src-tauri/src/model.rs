@@ -52,7 +52,7 @@ pub struct SupplierProduct {
     pub category: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SupplierPricing {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,4 +158,15 @@ pub struct BomSummary {
     pub name: Option<String>,
     pub row_count: i64,
     pub updated_at: Option<String>,
+}
+
+/// One appended price/delivery observation for a (supplier, part number), read back
+/// from `supplier_price_history` for the history view (Phase 3). Newest first.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PriceHistoryEntry {
+    pub fetched_at: String,
+    pub unit_price: Option<String>,
+    pub currency: Option<String>,
+    pub ship_date: Option<String>,
 }

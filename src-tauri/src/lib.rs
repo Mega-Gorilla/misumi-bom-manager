@@ -179,6 +179,19 @@ fn bom_delete(db: State<DbState>, id: String) -> Result<(), String> {
     db::delete_bom(&conn, &id).map_err(|e| e.to_string())
 }
 
+/// Price/delivery history for a (supplier, part number), newest first. Reads the
+/// append-only rows written on each fetch (`supplier_price_history`) for the history view.
+#[tauri::command]
+fn price_history(
+    db: State<DbState>,
+    supplier: String,
+    part_no: String,
+    limit: i64,
+) -> Result<Vec<model::PriceHistoryEntry>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::price_history(&conn, &supplier, &part_no, limit).map_err(|e| e.to_string())
+}
+
 /// Parse an Excel (.xlsx/.xls/.ods) or CSV file (path picked via the dialog plugin) into
 /// a flat string grid. The frontend import wizard maps rows/columns onto a BomDoc and
 /// persists via `bom_save` — backend stays a thin file<->grid converter.
@@ -416,6 +429,7 @@ pub fn run() {
             bom_load,
             bom_save,
             bom_delete,
+            price_history,
             spreadsheet_read,
             spreadsheet_write,
             quote
