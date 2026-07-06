@@ -368,19 +368,31 @@ export default function App() {
     return { kind: "row", partNo, supplier: src };
   };
 
-  // Toolbar toggle for the history drawer. When opening, seed it with the currently
-  // focused (else first-selected) row so it shows something immediately; while open it
-  // follows the selection via onActiveRowChange.
+  // The row the history button should act on. Prefer the user's SELECTION; only use the
+  // grid's focused row when there is no selection, or when the focused row is itself part of
+  // the selection. This avoids opening a different row's history than the one the user picked
+  // (e.g. after a Ctrl / multi-row selection leaves focus on a non-selected row).
+  const historyButtonRow = (): BomRow | null => {
+    const gridApi = gridRef.current?.api;
+    if (!gridApi) return null;
+    const selected = gridApi.getSelectedRows();
+    const fc = gridApi.getFocusedCell();
+    const focusedRow = fc ? (gridApi.getDisplayedRowAtIndex(fc.rowIndex)?.data ?? null) : null;
+    if (focusedRow && (selected.length === 0 || selected.some((r) => r.id === focusedRow.id))) {
+      return focusedRow;
+    }
+    return selected[0] ?? focusedRow ?? null;
+  };
+
+  // Toolbar toggle for the history drawer. When opening, seed it with the selected/focused
+  // row so it shows something immediately; while open it follows the active cell via
+  // onActiveRowChange.
   const toggleHistory = () => {
     if (historyOpen) {
       setHistoryOpen(false);
       return;
     }
-    const gridApi = gridRef.current?.api;
-    const fc = gridApi?.getFocusedCell();
-    const focusedRow = fc ? gridApi?.getDisplayedRowAtIndex(fc.rowIndex)?.data : undefined;
-    const row = focusedRow ?? gridApi?.getSelectedRows()[0] ?? null;
-    setActiveTarget(historyTargetOf(row));
+    setActiveTarget(historyTargetOf(historyButtonRow()));
     setHistoryOpen(true);
   };
 

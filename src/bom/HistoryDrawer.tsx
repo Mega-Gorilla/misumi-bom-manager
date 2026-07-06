@@ -291,7 +291,7 @@ function LeadTab({ entries, chrono }: { entries: PriceHistoryEntry[]; chrono: Pr
             <th>取得日時</th>
             <th>出荷日</th>
             <th className="num">リード日数</th>
-            <th className="num">前回比</th>
+            <th className="num">出荷日変化</th>
           </tr>
         </thead>
         <tbody>
