@@ -26,8 +26,11 @@ import { Toolbar } from "./bom/Toolbar";
 import { BomList } from "./bom/BomList";
 import { ColumnManager } from "./bom/ColumnManager";
 import { ImportWizard } from "./bom/ImportWizard";
-import { PriceHistory } from "./bom/PriceHistory";
+import { HistoryDrawer, type HistoryTarget } from "./bom/HistoryDrawer";
 import { SummaryBar } from "./bom/SummaryBar";
+
+// ORDER values that map to a supported EC provider (history/quotes exist only for these).
+const SUPPORTED_EC = ["MISUMI"];
 
 function slug(s: string): string {
   return (
@@ -55,7 +58,8 @@ export default function App() {
   const [showColumns, setShowColumns] = useState(false);
   const [columnsTab, setColumnsTab] = useState<"columns" | "ec">("columns");
   const [importSrc, setImportSrc] = useState<{ workbook: Workbook; fileName: string; path: string } | null>(null);
-  const [historyTarget, setHistoryTarget] = useState<{ supplier: string; partNo: string } | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [activeTarget, setActiveTarget] = useState<HistoryTarget>({ kind: "empty", reason: "no-row" });
   const [quickFilter, setQuickFilter] = useState("");
   const [quoting, setQuoting] = useState(false);
   const gridRef = useRef<AgGridReact<BomRow>>(null);
@@ -348,29 +352,36 @@ export default function App() {
     }
   };
 
-  // Open the price/delivery history for the focused (else first-selected) row's part number.
-  // History is keyed by (supplier, 型番) and shared across all BOMs; supplier is MISUMI for now.
-  const openHistory = () => {
-    if (!doc) return;
+  // Resolve what the history drawer should show for a row: only rows whose ORDER is an
+  // EC-supported source (currently just MISUMI) have history; otherwise carry the reason so
+  // the drawer can explain it (not-ec / no-part / no-row) rather than "まだありません".
+  const historyTargetOf = (row: BomRow | null): HistoryTarget => {
+    if (!row || !doc) return { kind: "empty", reason: "no-row" };
+    const srcCol = sourceColumn(doc);
+    const src = String((srcCol ? getCellValue(row, srcCol) : row.order) ?? "")
+      .trim()
+      .toUpperCase();
+    if (!SUPPORTED_EC.includes(src)) return { kind: "empty", reason: "not-ec" };
     const partCol = partNoColumn(doc);
-    if (!partCol) {
-      setStatus("型番列が未設定です（列の管理で設定）");
+    const partNo = partCol ? String(getCellValue(row, partCol) ?? "").trim() : "";
+    if (!partNo) return { kind: "empty", reason: "no-part" };
+    return { kind: "row", partNo, supplier: src };
+  };
+
+  // Toolbar toggle for the history drawer. When opening, seed it with the currently
+  // focused (else first-selected) row so it shows something immediately; while open it
+  // follows the selection via onActiveRowChange.
+  const toggleHistory = () => {
+    if (historyOpen) {
+      setHistoryOpen(false);
       return;
     }
     const gridApi = gridRef.current?.api;
     const fc = gridApi?.getFocusedCell();
     const focusedRow = fc ? gridApi?.getDisplayedRowAtIndex(fc.rowIndex)?.data : undefined;
-    const row = focusedRow ?? gridApi?.getSelectedRows()[0];
-    if (!row) {
-      setStatus("履歴を表示する行を選択してください");
-      return;
-    }
-    const partNo = String(getCellValue(row, partCol) ?? "").trim();
-    if (!partNo) {
-      setStatus("型番のある行を選択してください");
-      return;
-    }
-    setHistoryTarget({ supplier: "MISUMI", partNo });
+    const row = focusedRow ?? gridApi?.getSelectedRows()[0] ?? null;
+    setActiveTarget(historyTargetOf(row));
+    setHistoryOpen(true);
   };
 
   const doDelete = async (id: string) => {
@@ -409,7 +420,8 @@ export default function App() {
               setColumnsTab("columns");
               setShowColumns(true);
             }}
-            onHistory={openHistory}
+            onHistory={toggleHistory}
+            historyOpen={historyOpen}
             onExport={doExport}
             onRename={(name) => setDoc({ ...doc, meta: { ...doc.meta, name } })}
             onQuickFilter={setQuickFilter}
@@ -419,7 +431,16 @@ export default function App() {
             onQuote={runQuote}
             quoting={quoting}
           />
-          <BomEditor doc={doc} onChange={setDoc} gridRef={gridRef} quickFilter={quickFilter} />
+          <BomEditor
+            doc={doc}
+            onChange={setDoc}
+            gridRef={gridRef}
+            quickFilter={quickFilter}
+            onActiveRowChange={(row) => setActiveTarget(historyTargetOf(row))}
+          />
+          {historyOpen && (
+            <HistoryDrawer target={activeTarget} onClose={() => setHistoryOpen(false)} />
+          )}
           <SummaryBar doc={doc} />
           {showColumns && (
             <ColumnManager
@@ -444,13 +465,6 @@ export default function App() {
           path={importSrc.path}
           onCancel={() => setImportSrc(null)}
           onConfirm={confirmImport}
-        />
-      )}
-      {historyTarget && (
-        <PriceHistory
-          supplier={historyTarget.supplier}
-          partNo={historyTarget.partNo}
-          onClose={() => setHistoryTarget(null)}
         />
       )}
     </div>

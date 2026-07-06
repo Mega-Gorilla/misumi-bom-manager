@@ -95,6 +95,12 @@ button.link:hover {
   text-decoration: underline;
   box-shadow: none;
 }
+/* toggled-on toolbar button (e.g. 履歴 drawer open) */
+.toolbar button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: #eef4fd;
+}
 
 /* ---- toolbar ---- */
 .toolbar {
@@ -736,28 +742,111 @@ button:disabled {
   font-weight: 600;
 }
 
-/* ---- price history modal ---- */
-.ph-modal {
-  width: 560px;
+/* ---- history drawer (bottom dock, rises up) ---- */
+.history-drawer {
+  flex: none;
+  height: 300px; /* overridden by inline style (resizable); fallback only */
+  display: flex;
+  flex-direction: column;
+  background: var(--card);
+  overflow: hidden;
+  animation: drawer-rise 0.18s ease-out;
 }
-.ph-modal h2 {
-  font-size: 1.05rem;
-  margin: 0;
+@keyframes drawer-rise {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
 }
-.ph-supplier {
+/* draggable top edge (also serves as the divider above the drawer) */
+.hd-resize {
+  flex: none;
+  height: 6px;
+  cursor: ns-resize;
+  background: var(--border);
+  transition: background 0.12s;
+}
+.hd-resize:hover {
+  background: var(--accent);
+}
+body.hd-resizing {
+  cursor: ns-resize;
+  user-select: none;
+}
+.hd-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.hd-title {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.hd-heading {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.hd-part {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.9rem;
+}
+.hd-supplier {
   color: var(--muted);
-  font-size: 0.82rem;
-  font-weight: 400;
-  margin-left: 4px;
+  font-size: 0.8rem;
+}
+.hd-tabs {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+}
+.hd-tabs button {
+  border: none;
+  background: none;
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  padding: 5px 12px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.hd-tabs button:hover:not(:disabled) {
+  border-color: transparent;
+  border-bottom-color: var(--border);
+  box-shadow: none;
+  color: var(--text);
+}
+.hd-tabs button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.hd-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 .ph-empty {
   color: var(--muted);
-  padding: 20px 4px;
+  padding: 16px 4px;
 }
-.ph-body {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+.ph-note {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
 }
 .ph-trend {
   display: flex;
@@ -789,10 +878,6 @@ button:disabled {
 .ph-summary b {
   color: var(--text);
   margin-left: 4px;
-}
-.ph-table-wrap {
-  max-height: 42vh;
-  overflow: auto;
 }
 .ph-table {
   width: 100%;

@@ -169,4 +169,6 @@ pub struct PriceHistoryEntry {
     pub unit_price: Option<String>,
     pub currency: Option<String>,
     pub ship_date: Option<String>,
+    /// Immediate-shippable stock at fetch time (recorded from schema V3 on; NULL before).
+    pub stock: Option<i64>,
 }

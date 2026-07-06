@@ -19,6 +19,8 @@ export interface PriceHistoryEntry {
   unitPrice?: string | null;
   currency?: string | null;
   shipDate?: string | null;
+  /** Immediate-shippable stock at fetch time (recorded from schema V3 on; null before). */
+  stock?: number | null;
 }
 
 /** Read the append-only price/delivery history for a part number (all-BOM, cross-cache). */

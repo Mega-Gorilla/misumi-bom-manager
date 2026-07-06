@@ -28,6 +28,7 @@ interface Props {
   onRenumber: () => void;
   onManageColumns: () => void;
   onHistory: () => void;
+  historyOpen: boolean;
   onExport: () => void;
   onRename: (name: string) => void;
   onQuickFilter: (text: string) => void;
@@ -109,10 +110,11 @@ export function Toolbar(p: Props) {
         <RefreshCw size={ICON} />
       </button>
       <button
+        className={p.historyOpen ? "active" : ""}
         onClick={p.onHistory}
-        title="選択中の行の型番について、価格・出荷日の履歴を表示（全BOM横断）"
+        title="選択中の行の型番の履歴（価格・納期・在庫）を下部パネルに表示。開いている間は選択に追従"
       >
-        <History size={ICON} /> 価格履歴
+        <History size={ICON} /> 履歴
       </button>
 
       <span className="sep" />
