@@ -77,9 +77,8 @@ export function PriceHistory({ supplier, partNo, onClose }: Props) {
   }, [entries]);
 
   return (
-    <>
-      <div className="col-mgr-backdrop" onClick={onClose} />
-      <div className="col-mgr ph-modal">
+    <div className="col-mgr-backdrop" onClick={onClose}>
+      <div className="col-mgr ph-modal" onClick={(e) => e.stopPropagation()}>
         <div className="col-mgr-head">
           <h2>
             価格履歴: {partNo}
@@ -157,6 +156,6 @@ export function PriceHistory({ supplier, partNo, onClose }: Props) {
           </div>
         )}
       </div>
-    </>
+    </div>
   );
 }
