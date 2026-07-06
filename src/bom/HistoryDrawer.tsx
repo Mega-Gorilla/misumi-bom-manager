@@ -237,8 +237,7 @@ function PriceTab({ entries, chrono }: { entries: PriceHistoryEntry[]; chrono: P
           <tr>
             <th>取得日時</th>
             <th className="num">単価</th>
-            <th className="num">前回比</th>
-            <th>出荷日</th>
+            <th className="num">前回差</th>
           </tr>
         </thead>
         <tbody>
@@ -258,7 +257,6 @@ function PriceTab({ entries, chrono }: { entries: PriceHistoryEntry[]; chrono: P
                       ? "±0"
                       : `${diff > 0 ? "+" : "−"}${sym(e.currency)}${Math.abs(diff).toLocaleString()}`}
                 </td>
-                <td>{e.shipDate ?? "—"}</td>
               </tr>
             );
           })}
@@ -291,7 +289,7 @@ function LeadTab({ entries, chrono }: { entries: PriceHistoryEntry[]; chrono: Pr
             <th>取得日時</th>
             <th>出荷日</th>
             <th className="num">リード日数</th>
-            <th className="num">前回比</th>
+            <th className="num">前回差</th>
           </tr>
         </thead>
         <tbody>
@@ -349,7 +347,7 @@ function StockTab({ entries, chrono }: { entries: PriceHistoryEntry[]; chrono: P
           <tr>
             <th>取得日時</th>
             <th className="num">即納在庫数</th>
-            <th className="num">前回比</th>
+            <th className="num">前回差</th>
           </tr>
         </thead>
         <tbody>
