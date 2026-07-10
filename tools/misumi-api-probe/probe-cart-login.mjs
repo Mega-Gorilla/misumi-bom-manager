@@ -29,16 +29,23 @@ const TSV = 'CBT3-8\t2\nCBT3-10\t3\nSFJ3-10\t1';
 writeFileSync(LOG, `# MISUMI cart-add observation ${new Date().toISOString?.() ?? ''}\n`);
 const misumi = /^https:\/\/[a-z0-9.-]*misumi-ec\.com\//i;
 const asset = /\.(js|css|png|jpe?g|gif|svg|woff2?|ico)(\?|$)|_next\/|akam|pixel|sensor|cameleer|recommend-|log\/add/i;
-// Mask cookie/token-ish values so the log is safe to share.
+// Mask cookie/token-ish values so the log is safe to share. This MUST cover the
+// `sessionId=` URL query param (a session-cookie-equivalent token) — request/response
+// URLs carry it, so masking only JSON bodies is not enough.
 const mask = (s) =>
   (s ?? '')
+    .replace(/sessionId=[A-Za-z0-9_.\-]+/gi, 'sessionId=***')
+    .replace(/\bat=[A-Za-z0-9_.\-]{12,}/gi, 'at=***')
+    .replace(/"sensor_data":"[^"]*"/g, '"sensor_data":"***"')
     .replace(/("(?:cookie|authorization|token|refreshToken|accessToken|sessionId|customerCode|userId)"\s*:\s*)"[^"]*"/gi, '$1"***"')
     .replace(/(Cookie|Authorization|x-[a-z-]*token)[:=]\s*[^\s;]+/gi, '$1: ***');
 
 let recording = false;
+// Apply mask() to EVERYTHING written/printed (URLs included) — never rely on callers.
 const line = (s) => {
-  appendFileSync(LOG, s + '\n');
-  if (recording) console.log(s);
+  const m = mask(s);
+  appendFileSync(LOG, m + '\n');
+  if (recording) console.log(m);
 };
 
 const browser = await chromium.launch({ channel: 'msedge', headless: false });
@@ -52,7 +59,7 @@ page.on('request', (r) => {
   if (r.method() === 'GET' && !/cart|order\/|quotation|estimate|\/api\//.test(u)) return;
   line(`\n>> ${r.method()} ${u}`);
   const pd = r.postData();
-  if (pd) line(`   body: ${mask(pd).slice(0, 1500)}`);
+  if (pd) line(`   body: ${pd.slice(0, 1500)}`);
 });
 page.on('response', async (r) => {
   if (!recording) return;
@@ -61,7 +68,7 @@ page.on('response', async (r) => {
   if (!/cart|order\/|quotation|estimate/.test(u) && !/\/api\//.test(u)) return;
   let body = '';
   try {
-    body = mask(await r.text()).slice(0, 1500);
+    body = (await r.text()).slice(0, 1500);
   } catch {
     body = '(no body)';
   }
