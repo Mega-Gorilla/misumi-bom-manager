@@ -178,7 +178,7 @@ export function HistoryDrawer({ target, onClose }: Props) {
             <Truck size={14} /> 納期
           </button>
           <button className={tab === "stock" ? "active" : ""} onClick={() => setTab("stock")}>
-            <Package size={14} /> 在庫
+            <Package size={14} /> EC在庫
           </button>
         </div>
         <button className="icon-btn" onClick={onClose} title="閉じる">
