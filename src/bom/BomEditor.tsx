@@ -4,6 +4,7 @@ import { AgGridReact } from "ag-grid-react";
 import type {
   CellClickedEvent,
   CellDoubleClickedEvent,
+  CellFocusedEvent,
   CellValueChangedEvent,
   GridApi,
   GridReadyEvent,
@@ -20,9 +21,12 @@ interface Props {
   onChange: (d: BomDoc) => void;
   gridRef: Ref<AgGridReact<BomRow>>;
   quickFilter: string;
+  /** Fires with the row under the focused cell (or null) so the history drawer can follow
+   *  the selection. */
+  onActiveRowChange?: (row: BomRow | null) => void;
 }
 
-export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
+export function BomEditor({ doc, onChange, gridRef, quickFilter, onActiveRowChange }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [api, setApi] = useState<GridApi<BomRow> | null>(null);
   // Open when a linked cell with a pending EC suggestion is double-clicked (adopt / keep / edit).
@@ -219,6 +223,18 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
       me && !me.shiftKey && !me.ctrlKey && e.rowIndex != null ? e.rowIndex : null;
   }, []);
 
+  // Report the row under the focused cell (via click or keyboard navigation) so the history
+  // drawer can follow the current selection.
+  const onCellFocused = useCallback(
+    (e: CellFocusedEvent<BomRow>) => {
+      if (!onActiveRowChange) return;
+      const idx = e.rowIndex;
+      const row = idx == null ? null : (e.api.getDisplayedRowAtIndex(idx)?.data ?? null);
+      onActiveRowChange(row);
+    },
+    [onActiveRowChange],
+  );
+
   // Excel-style Shift+↑/↓ row-range selection. Captured on the wrapper so it runs before AG
   // Grid's own navigation (which we then suppress) — extends the row selection from the
   // anchor to the moved focus. Disabled while editing; non-shift keys reset the anchor.
@@ -280,6 +296,7 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter }: Props) {
         onCellValueChanged={onCellValueChanged}
         onCellDoubleClicked={onCellDoubleClicked}
         onCellClicked={onCellClicked}
+        onCellFocused={onCellFocused}
         rowDragManaged
         onRowDragEnd={onRowDragEnd}
         quickFilterText={quickFilter}

@@ -26,6 +26,23 @@ import { Toolbar } from "./bom/Toolbar";
 import { BomList } from "./bom/BomList";
 import { ColumnManager } from "./bom/ColumnManager";
 import { ImportWizard } from "./bom/ImportWizard";
+import { HistoryDrawer, type HistoryTarget } from "./bom/HistoryDrawer";
+import { SummaryBar } from "./bom/SummaryBar";
+
+// ORDER values that map to a supported EC provider (history/quotes exist only for these).
+const SUPPORTED_EC = ["MISUMI"];
+
+// The history drawer is a togglable panel, not a popup: once the user opens it we keep it
+// open across BOM switches and app restarts (it follows the selected row while open). Persist
+// just the open/closed preference so re-entering the editor restores the user's last choice.
+const HISTORY_OPEN_KEY = "mbm.historyOpen";
+function initialHistoryOpen(): boolean {
+  try {
+    return localStorage.getItem(HISTORY_OPEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 function slug(s: string): string {
   return (
@@ -53,9 +70,15 @@ export default function App() {
   const [showColumns, setShowColumns] = useState(false);
   const [columnsTab, setColumnsTab] = useState<"columns" | "ec">("columns");
   const [importSrc, setImportSrc] = useState<{ workbook: Workbook; fileName: string; path: string } | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(initialHistoryOpen);
+  const [confirmBack, setConfirmBack] = useState(false);
+  const [activeTarget, setActiveTarget] = useState<HistoryTarget>({ kind: "empty", reason: "no-row" });
   const [quickFilter, setQuickFilter] = useState("");
   const [quoting, setQuoting] = useState(false);
   const gridRef = useRef<AgGridReact<BomRow>>(null);
+  // JSON snapshot of the doc as of the last load/save; back() compares against it to detect
+  // unsaved changes. A freshly created (untouched) BOM counts as clean, like Notepad.
+  const savedSnapRef = useRef("");
 
   const reloadList = useCallback(async () => {
     try {
@@ -69,11 +92,21 @@ export default function App() {
     reloadList();
   }, [reloadList]);
 
+  // Remember the drawer's open/closed state so it persists across editor sessions & restarts.
+  useEffect(() => {
+    try {
+      localStorage.setItem(HISTORY_OPEN_KEY, historyOpen ? "1" : "0");
+    } catch {
+      /* localStorage unavailable — non-fatal */
+    }
+  }, [historyOpen]);
+
   const openBom = useCallback(async (id: string) => {
     try {
       const d = await api.bomLoad(id);
       if (d) {
         setDoc(d);
+        savedSnapRef.current = JSON.stringify(d);
         setStatus("");
         setView("editor");
       }
@@ -83,7 +116,9 @@ export default function App() {
   }, []);
 
   const createBom = useCallback(() => {
-    setDoc(newBom());
+    const d = newBom();
+    setDoc(d);
+    savedSnapRef.current = JSON.stringify(d);
     setStatus("");
     setView("editor");
   }, []);
@@ -288,18 +323,42 @@ export default function App() {
     if (!doc) return;
     try {
       const id = await api.bomSave(doc);
-      setDoc({ ...doc, id });
+      const saved = { ...doc, id };
+      setDoc(saved);
+      savedSnapRef.current = JSON.stringify(saved);
       setStatus("保存しました");
     } catch (e) {
       setStatus(String(e));
     }
   };
 
-  const back = async () => {
+  const doBack = async () => {
+    setConfirmBack(false);
     setView("list");
     setDoc(null);
     setStatus("");
     await reloadList();
+  };
+
+  // Leaving the editor with unsaved changes prompts 保存/破棄/キャンセル (Windows convention).
+  const back = () => {
+    if (doc && JSON.stringify(doc) !== savedSnapRef.current) {
+      setConfirmBack(true);
+      return;
+    }
+    void doBack();
+  };
+
+  const saveAndBack = async () => {
+    if (!doc) return;
+    try {
+      await api.bomSave(doc);
+    } catch (e) {
+      setConfirmBack(false);
+      setStatus(String(e));
+      return;
+    }
+    await doBack();
   };
 
   // Import: pick an Excel/CSV file, parse it to a grid, and open the mapping wizard.
@@ -345,6 +404,50 @@ export default function App() {
     }
   };
 
+  // Resolve what the history drawer should show for a row: only rows whose ORDER is an
+  // EC-supported source (currently just MISUMI) have history; otherwise carry the reason so
+  // the drawer can explain it (not-ec / no-part / no-row) rather than "まだありません".
+  const historyTargetOf = (row: BomRow | null): HistoryTarget => {
+    if (!row || !doc) return { kind: "empty", reason: "no-row" };
+    const srcCol = sourceColumn(doc);
+    const src = String((srcCol ? getCellValue(row, srcCol) : row.order) ?? "")
+      .trim()
+      .toUpperCase();
+    if (!SUPPORTED_EC.includes(src)) return { kind: "empty", reason: "not-ec" };
+    const partCol = partNoColumn(doc);
+    const partNo = partCol ? String(getCellValue(row, partCol) ?? "").trim() : "";
+    if (!partNo) return { kind: "empty", reason: "no-part" };
+    return { kind: "row", partNo, supplier: src };
+  };
+
+  // The row the history button should act on. Prefer the user's SELECTION; only use the
+  // grid's focused row when there is no selection, or when the focused row is itself part of
+  // the selection. This avoids opening a different row's history than the one the user picked
+  // (e.g. after a Ctrl / multi-row selection leaves focus on a non-selected row).
+  const historyButtonRow = (): BomRow | null => {
+    const gridApi = gridRef.current?.api;
+    if (!gridApi) return null;
+    const selected = gridApi.getSelectedRows();
+    const fc = gridApi.getFocusedCell();
+    const focusedRow = fc ? (gridApi.getDisplayedRowAtIndex(fc.rowIndex)?.data ?? null) : null;
+    if (focusedRow && (selected.length === 0 || selected.some((r) => r.id === focusedRow.id))) {
+      return focusedRow;
+    }
+    return selected[0] ?? focusedRow ?? null;
+  };
+
+  // Toolbar toggle for the history drawer. When opening, seed it with the selected/focused
+  // row so it shows something immediately; while open it follows the active cell via
+  // onActiveRowChange.
+  const toggleHistory = () => {
+    if (historyOpen) {
+      setHistoryOpen(false);
+      return;
+    }
+    setActiveTarget(historyTargetOf(historyButtonRow()));
+    setHistoryOpen(true);
+  };
+
   const doDelete = async (id: string) => {
     try {
       await api.bomDelete(id);
@@ -381,6 +484,8 @@ export default function App() {
               setColumnsTab("columns");
               setShowColumns(true);
             }}
+            onHistory={toggleHistory}
+            historyOpen={historyOpen}
             onExport={doExport}
             onRename={(name) => setDoc({ ...doc, meta: { ...doc.meta, name } })}
             onQuickFilter={setQuickFilter}
@@ -390,7 +495,36 @@ export default function App() {
             onQuote={runQuote}
             quoting={quoting}
           />
-          <BomEditor doc={doc} onChange={setDoc} gridRef={gridRef} quickFilter={quickFilter} />
+          <BomEditor
+            doc={doc}
+            onChange={setDoc}
+            gridRef={gridRef}
+            quickFilter={quickFilter}
+            onActiveRowChange={(row) => setActiveTarget(historyTargetOf(row))}
+          />
+          {historyOpen && (
+            <HistoryDrawer target={activeTarget} onClose={() => setHistoryOpen(false)} />
+          )}
+          <SummaryBar doc={doc} />
+          {confirmBack && (
+            <div className="col-mgr-backdrop" onClick={() => setConfirmBack(false)}>
+              <div className="confirm-dlg" onClick={(e) => e.stopPropagation()}>
+                <h3>変更が保存されていません</h3>
+                <p>
+                  「{doc.meta.name?.trim() || "無題の BOM"}」への変更を保存しますか？
+                  <br />
+                  保存せずに戻ると、編集内容と取得結果は失われます。
+                </p>
+                <div className="confirm-actions">
+                  <button className="primary" onClick={saveAndBack}>
+                    保存して戻る
+                  </button>
+                  <button onClick={doBack}>保存せずに戻る</button>
+                  <button onClick={() => setConfirmBack(false)}>キャンセル</button>
+                </div>
+              </div>
+            </div>
+          )}
           {showColumns && (
             <ColumnManager
               columns={doc.columns}

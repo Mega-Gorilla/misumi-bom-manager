@@ -13,6 +13,23 @@ export const bomLoad = (id: string): Promise<BomDoc | null> => invoke("bom_load"
 export const bomSave = (doc: BomDoc): Promise<string> => invoke("bom_save", { doc });
 export const bomDelete = (id: string): Promise<void> => invoke("bom_delete", { id });
 
+/** One price/delivery observation for a (supplier, part number), newest first. */
+export interface PriceHistoryEntry {
+  fetchedAt: string;
+  unitPrice?: string | null;
+  currency?: string | null;
+  shipDate?: string | null;
+  /** Immediate-shippable stock at fetch time (recorded from schema V3 on; null before). */
+  stock?: number | null;
+}
+
+/** Read the append-only price/delivery history for a part number (all-BOM, cross-cache). */
+export const priceHistory = (
+  supplier: string,
+  partNo: string,
+  limit = 60,
+): Promise<PriceHistoryEntry[]> => invoke("price_history", { supplier, partNo, limit });
+
 /** A picked spreadsheet file: its absolute path + base name (for the new BOM title). */
 export interface PickedFile {
   path: string;

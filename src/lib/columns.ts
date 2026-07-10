@@ -151,6 +151,61 @@ export function buildExportGrid(doc: BomDoc): { headers: string[]; rows: string[
   return { headers, rows };
 }
 
+/** BOM-wide aggregate over the fetched EC data (Phase 3 合計). Computed live from the
+ *  current rows so it tracks Qty/ORDER edits without a re-fetch. */
+export interface BomTotals {
+  /** Currency of the summed amount (first seen among active rows; "JPY" default). */
+  currency: string;
+  /** Σ subtotal (unitPrice × Qty × qtyMultiplier) over active rows with a numeric price. */
+  totalAmount: number;
+  /** Active rows that contributed a numeric amount. */
+  pricedRows: number;
+  /** Rows whose ORDER still matches the supplier they were fetched from. */
+  activeRows: number;
+  /** Active rows whose fetch ended in error. */
+  errorRows: number;
+  /** Latest ship date among active rows ("" if none). MISUMI dates are zero-padded
+   *  YYYY-MM-DD, so a string max equals the chronological max. */
+  latestShipDate: string;
+}
+
+/** Aggregate the fetched EC data across the BOM. Reuses supplierValue/supplierActive so the
+ *  numbers match the grid's per-row supplier columns exactly. */
+export function computeTotals(doc: BomDoc): BomTotals {
+  const sourceCol = sourceColumn(doc);
+  const mult = doc.meta.qtyMultiplier ?? 1;
+  let currency = "";
+  let totalAmount = 0;
+  let pricedRows = 0;
+  let activeRows = 0;
+  let errorRows = 0;
+  let latestShipDate = "";
+  for (const r of doc.rows) {
+    if (!supplierActive(r, sourceCol)) continue;
+    activeRows++;
+    if (r.supplier?.status === "error") errorRows++;
+    if (!currency) currency = r.supplier?.quote?.currency ?? "";
+    // supplierValue returns "" when there's no unit price; Number("") is 0 (finite), so gate
+    // on the raw value being non-empty before counting it as a priced row.
+    const subRaw = supplierValue(r, "quote.subtotal", mult, sourceCol);
+    const sub = Number(subRaw);
+    if (String(subRaw) !== "" && Number.isFinite(sub)) {
+      totalAmount += sub;
+      pricedRows++;
+    }
+    const ship = String(supplierValue(r, "quote.shipDate", mult, sourceCol) ?? "").trim();
+    if (ship && ship > latestShipDate) latestShipDate = ship;
+  }
+  return {
+    currency: currency || "JPY",
+    totalAmount,
+    pricedRows,
+    activeRows,
+    errorRows,
+    latestShipDate,
+  };
+}
+
 /** If a linked editable column has a fetched EC value that differs from the cell's current
  *  value (an empty cell counts as differing), return both so the UI can offer to adopt it.
  *  Returns null when there is nothing to reconcile: no link, a role/fetch-key column, no
