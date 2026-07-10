@@ -1,0 +1,7 @@
+# Observation artifacts — may contain session cookies / customer data. Never commit.
+*.log
+*.png
+*.txt
+node_modules/
+# Dedicated Edge profile for logged-in probes — contains live session cookies.
+.edge-profile/
