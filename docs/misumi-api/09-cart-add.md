@@ -156,19 +156,36 @@ POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/search       → 
   `idempotency-key`（＝重複投入防止。**再試行を安全にできる**ので必ず付ける）。
   `x-datadog-*` は分散トレース用で認証には無関係（送らなくてよい）。
 
-#### Phase B 実装時に確定すべき残点：**Bearer トークンの入手経路**
-> ⚠️ **重要**：認証は **Cookie ではなく `Authorization: Bearer`**。
+#### ✅ 注入 JS によるトークン**直接取得（B1）は不可**（2026-07-11 スパイクで確定）
+> ⚠️ **前提**：認証は **Cookie ではなく `Authorization: Bearer`**。
 > Cookie は同一オリジンの `fetch` が自動付与するが、**`Authorization` ヘッダは `fetch` では自動付与されない**。
-> したがって「ログイン済み WebView のページ文脈で生の `fetch('https://api-jp…/cart-detail/add', …)` を投げれば通る」わけではなく、
-> **Authorization を付けなければ 401/403 になる**。Phase B では下記いずれかで**明示的に Bearer を付与する**ことが必須。
+> よって「ページ文脈で生の `fetch('https://api-jp…/cart-detail/add', …)` を投げれば通る」わけではなく、Authorization を付けなければ 401/403。
 
-- **(a) トークンを明示取得して自前で付与**：アクセストークンを取り出し、リクエストに `Authorization: Bearer <token>` を明示セットする。
-  取り出し元は要確認 —
-  `GACCESSTOKEN` Cookie が **非 HttpOnly なら** `document.cookie` から読める／**HttpOnly なら** SPA の memory・`localStorage`・`sessionStorage` 等を確認する。
-  この「トークンがどこから読めるか」の1点は、ログイン済み WebView 内で `document.cookie` と各ストレージを覗けば判明する。
-- **(b) サイト既存の JS API クライアント/ラッパーを呼ぶ**：MISUMI フロントが api-jp を叩く際に Bearer を内部付与しているラッパー関数を特定し、
-  ページ文脈からそれを呼ぶ（トークン管理・リフレッシュをサイト側に委ねられる）。
-- いずれの方式でも「トークン入手経路（またはラッパー特定）」の確認が Phase B 着手時に**1回だけ**必要。認証**機構**自体（＝Bearer）は確定済みなので設計の不確実性は小さい。
+`tools/misumi-api-probe/probe-cart-spike.mjs`（ログイン済み・読み取り専用・トークン値は非記録）で「注入 JS がトークンを取得できるか」を検証した結果：
+
+- **`GACCESSTOKEN` / `GACCESSTOKENKEY` / `GREFRESHTOKENHASH` / `ACCESS_TOKEN_EXPIRATION` はすべて `document.cookie` で読めない**。
+  これらは PR #13 のヘッダ観測で**リクエスト Cookie ヘッダ上の存在を確認済み**なので、読めない＝**存在しないのではなく HttpOnly** と確定できる。
+- **`localStorage` / `sessionStorage` にトークンは存在しない**（optimizely・計測・ルーティング系のみ、JWT 形状もゼロ）。
+- → **注入 JS からアクセストークンを直接取り出す方法は無い**（HttpOnly Cookie ＋ 実トークンは SPA のメモリ内保持とみられる）。
+  よって「トークンを自前構築して直叩き」する素朴な直取得方式（**B1**）は**不可**。
+
+#### ✅ B2-a（fetch/XHR フック方式）を実証（2026-07-11 `probe-cart-hook.mjs`）
+document_start で `window.fetch`/`XMLHttpRequest` をフックし、**サイト自身が出す api-jp 呼び出しから
+`Authorization: Bearer`（と付随ヘッダ）を捕捉できること／それを再利用して我々が api-jp を叩けること**を実証した。
+
+- **捕捉 ✅**：ログイン後の api-jp リクエスト（`customer/v1/user/get`）から `Authorization: Bearer`（len≈455、XHR 経由）を捕捉。
+  同時に付随ヘッダの**具体値**も判明：**`x-client-program: JP_ORDER`** / **`x-language-code: JPN`**。
+- **再利用 ✅**：捕捉した `Authorization` ＋ `x-client-program` ＋ `x-language-code` を付けて、
+  **我々自身の `fetch` で読み取り専用 `cart-detail/count` を叩き 200（`{"totalCount":0}`）** を確認。
+  - 補足：`Authorization` **だけ**で叩くと 400 `"Client Program is null."`（＝トークンは受理されており、`x-client-program` 欠落が原因）。**付随ヘッダの同送が必須**。
+
+#### → 実装方針は B2-a（fetch/XHR フック捕捉→自前発行）に確定
+- **B2-a（採用・実証済み）** — ログイン済み WebView に `window.fetch`/`XMLHttpRequest` フックを document_start で注入し、
+  サイトがロード時に出す api-jp 呼び出しから `Authorization: Bearer` ＋ `x-client-program`/`x-language-code` を**1回キャプチャ**して保持。
+  以降は**我々が `cart-detail/add` を直接発行**（キャプチャした Bearer ＋ 付随ヘッダ）。単一エンドポイント一括投入を DOM 自動操作なしで実現・HttpOnly 回避・既存 bridge WebView＋eval 基盤に載る。401 時は再キャプチャ。
+- **B2-b：サイト UI 自動操作方式（実証済み fallback）** — 一括入力 textarea → 次へ → 列マッピング → カートへ追加 をプログラム操作（`probe-cart-b.mjs` で**実証済み**）。
+  トークン管理は不要だが DOM/フロー変更に弱い。B2-a が将来壊れた場合の**保険**として維持。
+- **共通の前提**：どちらも「**可視ログイン＋永続プロファイルの WebView**」が新規に必要（現 bridge WebView は匿名 `needs_auth:false`）。
 
 ---
 
@@ -180,16 +197,17 @@ POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/search       → 
 3. 既定ブラウザで `order/part-number/create` を開き、トーストで「一括入力欄に貼り付け → 次へ」を案内。
 - **ログイン情報も自動操作も一切不要**。ToS 的にも通常利用と同一。
 
-### Phase B：エンドポイント直叩き（全自動）
-1. アプリ内 WebView に一度ログイン（セッションは永続プロファイルに保持）。
-2. 対象行の `{qty, brandCode, inputProductCode}` を組み立て、
-   ログイン済み WebView の**ページ文脈内**で
+### Phase B：エンドポイント直叩き（全自動 / 方式 B2-a）
+1. **可視ログイン＋永続プロファイルの WebView** を用意し、一度ログイン（セッションは WebView2 の永続ユーザーデータフォルダに保持）。
+2. document_start で `window.fetch`/`XMLHttpRequest` フックを注入し、サイトがロード時に出す api-jp 呼び出しから
+   `Authorization: Bearer` ＋ `x-client-program`（=`JP_ORDER`）/ `x-language-code`（=`JPN`）を**1回キャプチャ**
+   （トークンは HttpOnly ＋ メモリ内保持のため注入 JS からは直接読めない＝実証済み）。
+3. 対象行の `{qty, brandCode, inputProductCode}` を組み立て、キャプチャした Bearer ＋
+   `content-type: application/json` / `x-client-program` / `x-language-code` / `idempotency-key` を付けて
    `POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/add` を発行。
-   **`Authorization: Bearer <token>` を明示付与**（生 `fetch` では自動付与されない）し、
-   併せて `x-client-program` / `x-language-code` / `idempotency-key` を付ける。
-3. レスポンス（`cartDetailId`・価格・納期）をアプリに反映し、「カートを開く」導線を提示。
-- **認証機構は確定済み（上記「✅ 認証機構」参照＝Bearer JWT）**。残るのは
-  上記「Bearer トークンの入手経路」＝(a) トークンを明示取得して付与 or (b) サイト既存ラッパーを呼ぶ、の1点のみ。
+   （**付随ヘッダの同送は必須**。`Authorization` だけだと 400 `"Client Program is null."` になる＝`probe-cart-hook.mjs` で確認済み）
+4. レスポンス（`cartDetailId`・価格・納期）をアプリに反映し、「カートを開く」導線を提示。401 時は Bearer を再キャプチャして再試行。
+- フォールバックは **B2-b（サイト UI 自動操作）**。詳細は上記「→ 実装方針は B2」参照。
 
 ---
 
@@ -204,6 +222,8 @@ POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/search       → 
 | `probe-cart-login.mjs` | ログイン後の一括入力パネル → 各エンドポイント観測（`sessionId` マスキング） |
 | `probe-cart-b.mjs` | **永続プロファイル**でログインを再利用し、一括入力→列マッピング→カート投入まで自動化して `cart-detail/add` を捕捉 |
 | `probe-cart-auth.mjs` | **非永続**（毎回ログイン・プロファイル不要）でカート投入まで自動化し、**リクエスト/レスポンスのヘッダ**を捕捉して認証機構（Bearer/CORS）を確定。Cookie は名前のみ・値は全マスク、`sessionId`/`at`/`rt`/`set-cookie` 値も全マスク |
+| `probe-cart-spike.mjs` | **非永続**でログイン後、注入 JS が Bearer トークンを取得できるか（`document.cookie`/`localStorage`/`sessionStorage`）を検証し **B1 不可を確定**。読み取り専用（`cart-detail/count`）でカートを汚さず、**トークン値は一切記録しない**（長さ・キー名・HTTP ステータスのみ） |
+| `probe-cart-hook.mjs` | **非永続**でログイン後、document_start の `fetch`/`XHR` フックがサイトの `Authorization: Bearer` ＋ `x-client-program`/`x-language-code` を捕捉→再利用して `cart-detail/count` が 200 になることを実証し **B2-a を確定**。読み取り専用・**トークン値は非記録**（付随ヘッダ値は非機密なので記録） |
 
 ```bash
 cd tools/misumi-api-probe
