@@ -156,12 +156,19 @@ POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/search       → 
   `idempotency-key`（＝重複投入防止。**再試行を安全にできる**ので必ず付ける）。
   `x-datadog-*` は分散トレース用で認証には無関係（送らなくてよい）。
 
-#### Phase B 実装時に確認する**軽微な残点（ブロッカーではない）**
-- **Bearer トークンをアプリ側 JS からどう読むか**（`GACCESSTOKEN` Cookie が `document.cookie` で読めるか＝非 HttpOnly か、
-  あるいは SPA の memory/localStorage 保持か）は未確認。
-  ログイン済み WebView 内で `document.cookie` を 1 行読むだけで判明する軽微な確認事項で、着手を妨げない。
-  最悪、**トークン抽出に頼らず**「ログイン済み WebView の**ページ文脈内で `fetch('/…/cart-detail/add', …)` を実行**」すれば、
-  サイトと同じ経路でトークンが付与され、この残点自体が不要になる。
+#### Phase B 実装時に確定すべき残点：**Bearer トークンの入手経路**
+> ⚠️ **重要**：認証は **Cookie ではなく `Authorization: Bearer`**。
+> Cookie は同一オリジンの `fetch` が自動付与するが、**`Authorization` ヘッダは `fetch` では自動付与されない**。
+> したがって「ログイン済み WebView のページ文脈で生の `fetch('https://api-jp…/cart-detail/add', …)` を投げれば通る」わけではなく、
+> **Authorization を付けなければ 401/403 になる**。Phase B では下記いずれかで**明示的に Bearer を付与する**ことが必須。
+
+- **(a) トークンを明示取得して自前で付与**：アクセストークンを取り出し、リクエストに `Authorization: Bearer <token>` を明示セットする。
+  取り出し元は要確認 —
+  `GACCESSTOKEN` Cookie が **非 HttpOnly なら** `document.cookie` から読める／**HttpOnly なら** SPA の memory・`localStorage`・`sessionStorage` 等を確認する。
+  この「トークンがどこから読めるか」の1点は、ログイン済み WebView 内で `document.cookie` と各ストレージを覗けば判明する。
+- **(b) サイト既存の JS API クライアント/ラッパーを呼ぶ**：MISUMI フロントが api-jp を叩く際に Bearer を内部付与しているラッパー関数を特定し、
+  ページ文脈からそれを呼ぶ（トークン管理・リフレッシュをサイト側に委ねられる）。
+- いずれの方式でも「トークン入手経路（またはラッパー特定）」の確認が Phase B 着手時に**1回だけ**必要。認証**機構**自体（＝Bearer）は確定済みなので設計の不確実性は小さい。
 
 ---
 
@@ -177,11 +184,12 @@ POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/search       → 
 1. アプリ内 WebView に一度ログイン（セッションは永続プロファイルに保持）。
 2. 対象行の `{qty, brandCode, inputProductCode}` を組み立て、
    ログイン済み WebView の**ページ文脈内**で
-   `POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/add` を発行
-   （`Authorization: Bearer <token>` ＋ `x-client-program` / `x-language-code` / `idempotency-key` を付与）。
+   `POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/add` を発行。
+   **`Authorization: Bearer <token>` を明示付与**（生 `fetch` では自動付与されない）し、
+   併せて `x-client-program` / `x-language-code` / `idempotency-key` を付ける。
 3. レスポンス（`cartDetailId`・価格・納期）をアプリに反映し、「カートを開く」導線を提示。
-- **認証機構は確定済み（上記「✅ 認証機構」参照＝Bearer JWT）**。残るのは「トークンの読み出し方」の軽微確認のみで、
-  ページ文脈内 `fetch` にすればそれも不要。
+- **認証機構は確定済み（上記「✅ 認証機構」参照＝Bearer JWT）**。残るのは
+  上記「Bearer トークンの入手経路」＝(a) トークンを明示取得して付与 or (b) サイト既存ラッパーを呼ぶ、の1点のみ。
 
 ---
 
