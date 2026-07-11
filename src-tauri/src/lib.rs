@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
-use tauri::{AppHandle, Emitter, Listener, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    AppHandle, Emitter, Listener, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+};
 use tokio::sync::oneshot;
 
 mod db;
@@ -40,6 +42,23 @@ const BRIDGE_URL: &str = "https://jp.misumi-ec.com/order/part-number/create";
 /// Single source of truth for the suggest -> price/delivery fetch chain, shared
 /// with the headless CLI (tools/misumi-cli). Defines `window.MisumiCore`.
 const LOOKUP_CORE_JS: &str = include_str!("../../shared/misumi-lookup.js");
+
+/// Injected at document_start on the bridge (via initialization_script) so it hooks
+/// window.fetch/XHR BEFORE the page's own scripts run and captures the site's
+/// `Authorization: Bearer` (+ side headers) for cart-detail/add. See
+/// shared/misumi-auth-hook.js and docs/misumi-api/09-cart-add.md.
+const AUTH_HOOK_JS: &str = include_str!("../../shared/misumi-auth-hook.js");
+
+/// One line to add to the MISUMI cart. `brand_code` is optional — `addToCart` resolves it
+/// via suggest when absent (mirrors the price-lookup normalization; usually "MSM1").
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CartItem {
+    input_product_code: String,
+    qty: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    brand_code: Option<String>,
+}
 
 #[derive(Default)]
 struct Bridge {
@@ -366,6 +385,120 @@ async fn quote(
     Ok(results)
 }
 
+// ---- Cart (MISUMI) — add BOM rows to the logged-in cart via the bridge ----
+//
+// The cart requires login. The bridge's auth hook (AUTH_HOOK_JS) captures the site's
+// `Authorization: Bearer` from its own api-jp calls; `MisumiCore.addToCart` reuses it to
+// POST cart-detail/add. The Bearer never leaves the page — we only receive the result.
+
+/// Wait until the bridge webview has cleared Akamai (shared by lookup/quote/cart).
+async fn wait_bridge_ready(bridge: &Arc<Bridge>) -> Result<(), String> {
+    let mut waited = 0u64;
+    while !bridge.ready.load(Ordering::Relaxed) {
+        if waited >= 30_000 {
+            return Err("ブリッジの初期化がタイムアウトしました".into());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        waited += 200;
+    }
+    Ok(())
+}
+
+/// Add `items` to the supplier's cart (currently MISUMI). Returns the JS result object
+/// `{ ok, result }` on success or `{ ok:false, error }` (e.g. "NOT_LOGGED_IN"/"AUTH_EXPIRED").
+#[tauri::command]
+async fn cart_add(app: AppHandle, supplier: String, items: Vec<CartItem>) -> Result<Value, String> {
+    if !supplier.eq_ignore_ascii_case("MISUMI") {
+        return Err(format!("カート投入は未対応のECです: {supplier}"));
+    }
+    if items.is_empty() {
+        return Err("カートに追加する行がありません".into());
+    }
+    let bridge = app.state::<Arc<Bridge>>().inner().clone();
+    wait_bridge_ready(&bridge).await?;
+    let items_json = serde_json::to_string(&items).map_err(|e| e.to_string())?;
+    let id = bridge.counter.fetch_add(1, Ordering::Relaxed);
+    let script = bridge_script(id, &format!("window.MisumiCore.addToCart({items_json})"));
+    bridge_fetch(&app, &bridge, id, script, 120).await
+}
+
+/// Report MISUMI login/auth state: `{ ok, loggedIn, captured }`. `captured` means a Bearer
+/// has been intercepted and cart-detail/add is callable.
+#[tauri::command]
+async fn misumi_auth_status(app: AppHandle) -> Result<Value, String> {
+    let bridge = app.state::<Arc<Bridge>>().inner().clone();
+    if !bridge.ready.load(Ordering::Relaxed) {
+        return Ok(serde_json::json!({ "ok": true, "loggedIn": false, "captured": false }));
+    }
+    let id = bridge.counter.fetch_add(1, Ordering::Relaxed);
+    let script = bridge_script(id, "window.MisumiCore.authStatus()");
+    bridge_fetch(&app, &bridge, id, script, 15).await
+}
+
+/// Show the bridge webview so the user can log in to MISUMI, then poll until a Bearer is
+/// captured (= logged in) or ~5 min elapses, and hide it again. Returns `{ loggedIn }`.
+/// Login happens entirely in the WebView — this app never sees the password.
+#[tauri::command]
+async fn misumi_login(app: AppHandle) -> Result<Value, String> {
+    let webview = app
+        .get_webview_window("bridge")
+        .ok_or_else(|| "ブリッジWebViewが見つかりません".to_string())?;
+    let _ = webview.set_title("MISUMI ログイン");
+    let _ = webview.show();
+    let _ = webview.set_focus();
+
+    let bridge = app.state::<Arc<Bridge>>().inner().clone();
+    let start = std::time::Instant::now();
+    let deadline = Duration::from_secs(300);
+    let mut captured = false;
+    let mut nudged = false;
+    while start.elapsed() < deadline {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Only probe on jp.misumi-ec.com — never eval into the SSO/login pages mid-flow.
+        let on_jp = webview
+            .url()
+            .map(|u| u.host_str() == Some("jp.misumi-ec.com"))
+            .unwrap_or(false);
+        if !on_jp {
+            continue;
+        }
+        let id = bridge.counter.fetch_add(1, Ordering::Relaxed);
+        let script = bridge_script(id, "window.MisumiCore.authStatus()");
+        if let Ok(v) = bridge_fetch(&app, &bridge, id, script, 8).await {
+            if v.get("captured").and_then(Value::as_bool).unwrap_or(false) {
+                captured = true;
+                break;
+            }
+            // Logged in but no Bearer captured yet (landed on a page that made no api-jp
+            // call). Nudge the bridge to the order page once — it reliably fires an
+            // authenticated api-jp request, which the hook captures.
+            let logged_in = v.get("loggedIn").and_then(Value::as_bool).unwrap_or(false);
+            if logged_in && !nudged {
+                let _ = webview.eval(&format!("window.location.href={:?};", BRIDGE_URL));
+                nudged = true;
+            }
+        }
+    }
+    let _ = webview.hide();
+    let _ = webview.set_title("misumi-bridge");
+    Ok(serde_json::json!({ "loggedIn": captured }))
+}
+
+/// Show the (authenticated) bridge navigated to the MISUMI order/cart page so the user can
+/// review what was added. The cart lives in THIS WebView's session, so the default browser
+/// (logged out) would show an empty cart — hence we surface it in the bridge.
+#[tauri::command]
+async fn misumi_open_cart(app: AppHandle) -> Result<(), String> {
+    let webview = app
+        .get_webview_window("bridge")
+        .ok_or_else(|| "ブリッジWebViewが見つかりません".to_string())?;
+    let _ = webview.set_title("MISUMI カート");
+    let _ = webview.eval(&format!("window.location.href={:?};", BRIDGE_URL));
+    let _ = webview.show();
+    let _ = webview.set_focus();
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -390,15 +523,17 @@ pub fn run() {
                 }
             });
 
-            // Build the hidden bridge webview and intercept the mbm:// fallback.
+            // Build the hidden bridge webview: inject the auth-capture hook at document_start,
+            // and intercept the mbm:// fallback.
             let nav_bridge = bridge.clone();
-            WebviewWindowBuilder::new(
+            let bridge_win = WebviewWindowBuilder::new(
                 app.handle(),
                 "bridge",
                 WebviewUrl::External(BRIDGE_URL.parse().expect("valid bridge url")),
             )
             .title("misumi-bridge")
             .visible(false)
+            .initialization_script(AUTH_HOOK_JS)
             .on_navigation(move |url| {
                 if url.scheme() == "mbm" {
                     let pairs: HashMap<String, String> = url.query_pairs().into_owned().collect();
@@ -412,6 +547,16 @@ pub fn run() {
                 true
             })
             .build()?;
+
+            // The bridge doubles as the login / cart-view window when shown. Closing it must
+            // HIDE (not destroy) it, or the price-lookup + cart engine would die.
+            let hide_win = bridge_win.clone();
+            bridge_win.on_window_event(move |event| {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = hide_win.hide();
+                }
+            });
 
             // Mark ready after the page has had time to load and satisfy Akamai.
             let ready_bridge = bridge.clone();
@@ -432,7 +577,11 @@ pub fn run() {
             price_history,
             spreadsheet_read,
             spreadsheet_write,
-            quote
+            quote,
+            cart_add,
+            misumi_auth_status,
+            misumi_login,
+            misumi_open_cart
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

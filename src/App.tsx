@@ -75,6 +75,13 @@ export default function App() {
   const [activeTarget, setActiveTarget] = useState<HistoryTarget>({ kind: "empty", reason: "no-row" });
   const [quickFilter, setQuickFilter] = useState("");
   const [quoting, setQuoting] = useState(false);
+  const [addingCart, setAddingCart] = useState(false);
+  const [confirmCart, setConfirmCart] = useState<{
+    items: api.CartItem[];
+    count: number;
+    totalQty: number;
+  } | null>(null);
+  const [cartDone, setCartDone] = useState(false);
   const gridRef = useRef<AgGridReact<BomRow>>(null);
   // JSON snapshot of the doc as of the last load/save; back() compares against it to detect
   // unsaved changes. A freshly created (untouched) BOM counts as clean, like Notepad.
@@ -305,6 +312,84 @@ export default function App() {
     }
   };
 
+  // Collect MISUMI cart lines: same target rows as runQuote (ORDER=MISUMI + 型番あり),
+  // merged by part number with qty summed as Qty × 数量倍率 (min 1 per part).
+  const collectCartItems = ():
+    | { items: api.CartItem[]; count: number; totalQty: number }
+    | null => {
+    if (!doc) return null;
+    const partCol = partNoColumn(doc);
+    const srcCol = sourceColumn(doc);
+    if (!partCol || !srcCol) {
+      setStatus("型番列 / EC発注先列 が未設定です（列の管理で設定）");
+      return null;
+    }
+    const partOf = (r: BomRow) => String(getCellValue(r, partCol) ?? "").trim();
+    const isMisumi = (r: BomRow) =>
+      String(getCellValue(r, srcCol) ?? "")
+        .trim()
+        .toUpperCase() === "MISUMI";
+    const mult = doc.meta.qtyMultiplier ?? 1;
+    const byPart = new Map<string, number>();
+    for (const r of doc.rows) {
+      if (!isMisumi(r)) continue;
+      const p = partOf(r);
+      if (!p) continue;
+      const base = r.qty && r.qty > 0 ? r.qty : 1;
+      byPart.set(p, (byPart.get(p) ?? 0) + Math.max(1, Math.round(base * mult)));
+    }
+    if (byPart.size === 0) {
+      setStatus("EC発注先=MISUMI かつ 型番のある行がありません");
+      return null;
+    }
+    const items = Array.from(byPart, ([inputProductCode, qty]) => ({ inputProductCode, qty }));
+    const totalQty = items.reduce((s, it) => s + it.qty, 0);
+    return { items, count: items.length, totalQty };
+  };
+
+  // Toolbar「カートに追加」: gather targets and open the confirmation dialog.
+  const addToCart = () => {
+    if (addingCart) return;
+    const collected = collectCartItems();
+    if (collected) setConfirmCart(collected);
+  };
+
+  // Confirmed: POST cart-detail/add via the bridge. If not logged in, prompt login (the
+  // bridge WebView shows for the user) and retry once. No order is placed — cart only.
+  const doAddToCart = async () => {
+    const collected = confirmCart;
+    setConfirmCart(null);
+    if (!collected || addingCart) return;
+    setAddingCart(true);
+    setCartDone(false);
+    setStatus("カートに追加中…");
+    try {
+      let res = await api.cartAdd("MISUMI", collected.items);
+      if (!res.ok && (res.error === "NOT_LOGGED_IN" || res.error === "AUTH_EXPIRED")) {
+        setStatus("MISUMI へのログインが必要です。開いたウィンドウでログインしてください…");
+        const { loggedIn } = await api.misumiLogin();
+        if (!loggedIn) {
+          setStatus("ログインが確認できませんでした。もう一度お試しください");
+          return;
+        }
+        setStatus("カートに追加中…");
+        res = await api.cartAdd("MISUMI", collected.items);
+      }
+      if (res.ok) {
+        setStatus(
+          `MISUMI カートに ${collected.count} 型番（合計 ${collected.totalQty} 個）を追加しました`,
+        );
+        setCartDone(true);
+      } else {
+        setStatus(`カート追加に失敗しました: ${res.error ?? "不明なエラー"}`);
+      }
+    } catch (e) {
+      setStatus(String(e));
+    } finally {
+      setAddingCart(false);
+    }
+  };
+
   const undo = () => gridRef.current?.api?.undoCellEditing();
   const redo = () => gridRef.current?.api?.redoCellEditing();
   const autoSize = () => gridRef.current?.api?.autoSizeAllColumns();
@@ -494,6 +579,8 @@ export default function App() {
             onAutoSize={autoSize}
             onQuote={runQuote}
             quoting={quoting}
+            onAddToCart={addToCart}
+            addingCart={addingCart}
           />
           <BomEditor
             doc={doc}
@@ -506,6 +593,34 @@ export default function App() {
             <HistoryDrawer target={activeTarget} onClose={() => setHistoryOpen(false)} />
           )}
           <SummaryBar doc={doc} />
+          {cartDone && (
+            <div className="cart-toast">
+              <span>MISUMI カートに追加しました。</span>
+              <button className="primary" onClick={() => void api.misumiOpenCart()}>
+                カートを開く
+              </button>
+              <button onClick={() => setCartDone(false)}>閉じる</button>
+            </div>
+          )}
+          {confirmCart && (
+            <div className="col-mgr-backdrop" onClick={() => setConfirmCart(null)}>
+              <div className="confirm-dlg" onClick={(e) => e.stopPropagation()}>
+                <h3>MISUMI カートに追加</h3>
+                <p>
+                  ORDER=MISUMI の {confirmCart.count} 型番（合計 {confirmCart.totalQty} 個）を
+                  MISUMI のカートに追加します。
+                  <br />
+                  これは注文ではありません（カートに入るだけで、いつでも削除できます）。
+                </p>
+                <div className="confirm-actions">
+                  <button className="primary" onClick={doAddToCart}>
+                    カートに追加
+                  </button>
+                  <button onClick={() => setConfirmCart(null)}>キャンセル</button>
+                </div>
+              </div>
+            </div>
+          )}
           {confirmBack && (
             <div className="col-mgr-backdrop" onClick={() => setConfirmBack(false)}>
               <div className="confirm-dlg" onClick={(e) => e.stopPropagation()}>

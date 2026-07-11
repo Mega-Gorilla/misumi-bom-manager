@@ -94,3 +94,35 @@ export const quote = (
 /** Subscribe to backend `quote-progress` events. Await the returned fn to stop. */
 export const onQuoteProgress = (cb: (p: QuoteProgress) => void): Promise<UnlistenFn> =>
   listen<QuoteProgress>("quote-progress", (e) => cb(e.payload));
+
+// ---- MISUMI cart (add BOM rows to the logged-in cart via the bridge WebView) ----
+
+/** One line to add to the cart. brandCode is optional (backend resolves it via suggest). */
+export interface CartItem {
+  inputProductCode: string;
+  qty: number;
+  brandCode?: string;
+}
+
+/** Result of a cart-add attempt. `error` carries "NOT_LOGGED_IN" / "AUTH_EXPIRED" so the
+ *  caller can trigger a login, or a MISUMI error message otherwise. */
+export interface CartAddResult {
+  ok: boolean;
+  error?: string;
+  status?: number;
+  result?: unknown;
+}
+
+/** Add items to the supplier's cart (currently MISUMI). Requires a logged-in bridge. */
+export const cartAdd = (supplier: string, items: CartItem[]): Promise<CartAddResult> =>
+  invoke("cart_add", { supplier, items });
+
+/** Current MISUMI auth state. `captured` = a Bearer is available (cart-add is callable). */
+export const misumiAuthStatus = (): Promise<{ loggedIn: boolean; captured: boolean }> =>
+  invoke("misumi_auth_status");
+
+/** Show the bridge for the user to log in; resolves once logged in (or times out). */
+export const misumiLogin = (): Promise<{ loggedIn: boolean }> => invoke("misumi_login");
+
+/** Show the authenticated bridge navigated to the MISUMI cart/order page. */
+export const misumiOpenCart = (): Promise<void> => invoke("misumi_open_cart");

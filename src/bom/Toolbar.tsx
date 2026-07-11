@@ -18,6 +18,7 @@ import {
   ChevronDown,
   Check,
   Pencil,
+  ShoppingCart,
 } from "lucide-react";
 
 interface Props {
@@ -41,6 +42,8 @@ interface Props {
   onAutoSize: () => void;
   onQuote: (force: boolean) => void;
   quoting: boolean;
+  onAddToCart: () => void;
+  addingCart: boolean;
 }
 
 const ICON = 16;
@@ -252,6 +255,14 @@ export function Toolbar(p: Props) {
               disabled={p.quoting}
               onClick={run(() => p.onQuote(true))}
             />
+            <div className="menu-sep" />
+            <MenuItem
+              icon={<ShoppingCart size={MENU_ICON} />}
+              label="カートに追加（MISUMI）"
+              hint="要ログイン"
+              disabled={p.addingCart}
+              onClick={run(p.onAddToCart)}
+            />
           </TopMenu>
         </div>
 
@@ -307,6 +318,13 @@ export function Toolbar(p: Props) {
           title="最新化（キャッシュを無視して全件を再取得）"
         >
           <RefreshCw size={ICON} />
+        </button>
+        <button
+          onClick={p.onAddToCart}
+          disabled={p.addingCart}
+          title="ORDER=MISUMI の行を MISUMI のカートにまとめて追加（要ログイン・注文ではなくカート投入）"
+        >
+          <ShoppingCart size={ICON} /> カートに追加
         </button>
         <button
           className={p.historyOpen ? "active" : ""}
