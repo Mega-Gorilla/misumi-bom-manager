@@ -134,12 +134,41 @@ POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/search       → 
 これを**可視ログイン可能にし、WebView2 の永続ユーザーデータフォルダにセッションを保持**すれば、
 価格取得もカート投入も認証済みで動く。パスワードは保存しない。
 
-### ⚠️ 実装着手時に確定すべき未解決点
-- **`api-jp` 系（`cart-detail/add` 等）への認証情報の渡し方**（Cookie か Bearer ヘッダか `sessionId` か）は、
-  今回のログ（ボディのみ記録）では未確定。
-  価格 API（`sales-price-delivery/check`）は CORS `ACAO:*` のため**資格情報なし**で呼ぶ必要がある（[05-akamai-and-auth.md](./05-akamai-and-auth.md)）が、
-  カート系は**認証必須**なので別の認証機構（ヘッダ or オリジン限定 CORS + Cookie）を使っているはず。
-  → **Phase B 着手時にリクエストヘッダ/レスポンス CORS ヘッダを 1 回捕捉して確定する**（probe を拡張済み）。
+### ✅ 認証機構（2026-07-11 ヘッダ観測で確定）
+
+`tools/misumi-api-probe/probe-cart-auth.mjs`（リクエスト/レスポンスヘッダを捕捉。Cookie は**名前のみ**・値は全マスク）で、
+`cart-detail/add` を含む全 api-jp 呼び出しの認証機構を確定した。
+
+- **`api-jp.misumi-ec.com` 系（`cart-detail/add` / `search` / `count` / `price-delivery-calculation/check` / `sales-order/file/parse`）は
+  `Authorization: Bearer <JWT 約455文字>` で認証する。Cookie は送っていない。**
+  - レスポンス CORS は **`Access-Control-Allow-Origin: *` ＋ `Access-Control-Allow-Credentials: false`**（`expose-headers: *`）。
+    つまり **ステートレス・オリジン非依存**で、Bearer トークンさえ付ければ**どのオリジンからでも**呼べる
+    （＝ Cookie/同一オリジン制約なし。ただし後述の Akamai gate は残る）。
+  - 価格 API（`sales-price-delivery/check`）と**完全に同じ CORS/認証パターン**。価格取得基盤で確立済みの方式がそのまま使える。
+- **`jp.misumi-ec.com/api/v1/*`（`auth/check` / `brand`・`inner`・`category`/search）は別方式**＝
+  **`sessionId` クエリ＋Cookie・同一オリジン・`Allow-Credentials: true`**（サイト BFF）。カート投入には**使わない**。
+- **Bearer トークンの出所**：ログイン時に発行され、`.misumi-ec.com` の Cookie
+  `GACCESSTOKEN` / `GACCESSTOKENKEY` / `GREFRESHTOKENHASH` / `ACCESS_TOKEN_EXPIRATION` 一式で保持。
+  期限切れ時は `POST https://jp.sso.misumi-ec.com/api-auth-v2/auth/api/sso/satellite/misumi-ec`（body `at=…&rt=…`）でリフレッシュ。
+  → **ログイン済み WebView 内なら、サイトの JS がこのリフレッシュを自動継続する**ので、アプリはトークン失効を意識しなくて済む。
+- **複製すべき付随ヘッダ**（`cart-detail/add` の実測キー）：
+  `content-type: application/json` / `x-client-program` / `x-language-code` /
+  `idempotency-key`（＝重複投入防止。**再試行を安全にできる**ので必ず付ける）。
+  `x-datadog-*` は分散トレース用で認証には無関係（送らなくてよい）。
+
+#### Phase B 実装時に確定すべき残点：**Bearer トークンの入手経路**
+> ⚠️ **重要**：認証は **Cookie ではなく `Authorization: Bearer`**。
+> Cookie は同一オリジンの `fetch` が自動付与するが、**`Authorization` ヘッダは `fetch` では自動付与されない**。
+> したがって「ログイン済み WebView のページ文脈で生の `fetch('https://api-jp…/cart-detail/add', …)` を投げれば通る」わけではなく、
+> **Authorization を付けなければ 401/403 になる**。Phase B では下記いずれかで**明示的に Bearer を付与する**ことが必須。
+
+- **(a) トークンを明示取得して自前で付与**：アクセストークンを取り出し、リクエストに `Authorization: Bearer <token>` を明示セットする。
+  取り出し元は要確認 —
+  `GACCESSTOKEN` Cookie が **非 HttpOnly なら** `document.cookie` から読める／**HttpOnly なら** SPA の memory・`localStorage`・`sessionStorage` 等を確認する。
+  この「トークンがどこから読めるか」の1点は、ログイン済み WebView 内で `document.cookie` と各ストレージを覗けば判明する。
+- **(b) サイト既存の JS API クライアント/ラッパーを呼ぶ**：MISUMI フロントが api-jp を叩く際に Bearer を内部付与しているラッパー関数を特定し、
+  ページ文脈からそれを呼ぶ（トークン管理・リフレッシュをサイト側に委ねられる）。
+- いずれの方式でも「トークン入手経路（またはラッパー特定）」の確認が Phase B 着手時に**1回だけ**必要。認証**機構**自体（＝Bearer）は確定済みなので設計の不確実性は小さい。
 
 ---
 
@@ -154,9 +183,13 @@ POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/search       → 
 ### Phase B：エンドポイント直叩き（全自動）
 1. アプリ内 WebView に一度ログイン（セッションは永続プロファイルに保持）。
 2. 対象行の `{qty, brandCode, inputProductCode}` を組み立て、
-   認証済み WebView から `POST shopping-cart/v1/cart-detail/add` を直接発行。
+   ログイン済み WebView の**ページ文脈内**で
+   `POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/add` を発行。
+   **`Authorization: Bearer <token>` を明示付与**（生 `fetch` では自動付与されない）し、
+   併せて `x-client-program` / `x-language-code` / `idempotency-key` を付ける。
 3. レスポンス（`cartDetailId`・価格・納期）をアプリに反映し、「カートを開く」導線を提示。
-- 着手前に上記「未解決点（認証ヘッダ）」を 1 回の probe で確定する。
+- **認証機構は確定済み（上記「✅ 認証機構」参照＝Bearer JWT）**。残るのは
+  上記「Bearer トークンの入手経路」＝(a) トークンを明示取得して付与 or (b) サイト既存ラッパーを呼ぶ、の1点のみ。
 
 ---
 
@@ -170,6 +203,7 @@ POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/search       → 
 | `probe-paste.mjs` | 型番グリッドへの複数行ペースト挙動の確認 |
 | `probe-cart-login.mjs` | ログイン後の一括入力パネル → 各エンドポイント観測（`sessionId` マスキング） |
 | `probe-cart-b.mjs` | **永続プロファイル**でログインを再利用し、一括入力→列マッピング→カート投入まで自動化して `cart-detail/add` を捕捉 |
+| `probe-cart-auth.mjs` | **非永続**（毎回ログイン・プロファイル不要）でカート投入まで自動化し、**リクエスト/レスポンスのヘッダ**を捕捉して認証機構（Bearer/CORS）を確定。Cookie は名前のみ・値は全マスク、`sessionId`/`at`/`rt`/`set-cookie` 値も全マスク |
 
 ```bash
 cd tools/misumi-api-probe
