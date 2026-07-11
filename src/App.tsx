@@ -80,14 +80,18 @@ export default function App() {
     items: api.CartItem[];
     count: number;
     totalQty: number;
+    mode: "selection" | "all";
   } | null>(null);
   const [cartDone, setCartDone] = useState(false);
   const [loginPrompt, setLoginPrompt] = useState<null | { phase: "ask" | "waiting" | "failed" }>(
     null,
   );
-  const pendingCartRef = useRef<{ items: api.CartItem[]; count: number; totalQty: number } | null>(
-    null,
-  );
+  const pendingCartRef = useRef<{
+    items: api.CartItem[];
+    count: number;
+    totalQty: number;
+    mode: "selection" | "all";
+  } | null>(null);
   const gridRef = useRef<AgGridReact<BomRow>>(null);
   // JSON snapshot of the doc as of the last load/save; back() compares against it to detect
   // unsaved changes. A freshly created (untouched) BOM counts as clean, like Notepad.
@@ -318,10 +322,11 @@ export default function App() {
     }
   };
 
-  // Collect MISUMI cart lines: same target rows as runQuote (ORDER=MISUMI + 型番あり),
-  // merged by part number with qty summed as Qty × 数量倍率 (min 1 per part).
+  // Collect MISUMI cart lines. If rows are checked (selected), use ONLY those; otherwise all
+  // rows. In both cases keep ORDER=MISUMI + 型番あり, merged by part number with qty summed as
+  // Qty × 数量倍率 (min 1 per part).
   const collectCartItems = ():
-    | { items: api.CartItem[]; count: number; totalQty: number }
+    | { items: api.CartItem[]; count: number; totalQty: number; mode: "selection" | "all" }
     | null => {
     if (!doc) return null;
     const partCol = partNoColumn(doc);
@@ -336,8 +341,13 @@ export default function App() {
         .trim()
         .toUpperCase() === "MISUMI";
     const mult = doc.meta.qtyMultiplier ?? 1;
+    // Checked rows scope the cart add; with none checked, fall back to the whole BOM.
+    const sel = selectedRows();
+    const useSelection = sel.length > 0;
+    const selIds = new Set(sel.map((r) => r.id));
+    const scope = useSelection ? doc.rows.filter((r) => selIds.has(r.id)) : doc.rows;
     const byPart = new Map<string, number>();
-    for (const r of doc.rows) {
+    for (const r of scope) {
       if (!isMisumi(r)) continue;
       const p = partOf(r);
       if (!p) continue;
@@ -345,12 +355,16 @@ export default function App() {
       byPart.set(p, (byPart.get(p) ?? 0) + Math.max(1, Math.round(base * mult)));
     }
     if (byPart.size === 0) {
-      setStatus("EC発注先=MISUMI かつ 型番のある行がありません");
+      setStatus(
+        useSelection
+          ? "チェックした行に EC発注先=MISUMI かつ 型番のある行がありません"
+          : "EC発注先=MISUMI かつ 型番のある行がありません",
+      );
       return null;
     }
     const items = Array.from(byPart, ([inputProductCode, qty]) => ({ inputProductCode, qty }));
     const totalQty = items.reduce((s, it) => s + it.qty, 0);
-    return { items, count: items.length, totalQty };
+    return { items, count: items.length, totalQty, mode: useSelection ? "selection" : "all" };
   };
 
   // Toolbar「カートに追加」: gather targets and open the confirmation dialog.
@@ -367,6 +381,7 @@ export default function App() {
     items: api.CartItem[];
     count: number;
     totalQty: number;
+    mode: "selection" | "all";
   }) => {
     setAddingCart(true);
     setCartDone(false);
@@ -638,8 +653,10 @@ export default function App() {
               <div className="confirm-dlg" onClick={(e) => e.stopPropagation()}>
                 <h3>MISUMI カートに追加</h3>
                 <p>
-                  ORDER=MISUMI の {confirmCart.count} 型番（合計 {confirmCart.totalQty} 個）を
-                  MISUMI のカートに追加します。
+                  {confirmCart.mode === "selection"
+                    ? `チェックした ${confirmCart.count} 型番`
+                    : `ORDER=MISUMI の ${confirmCart.count} 型番`}
+                  （合計 {confirmCart.totalQty} 個）を MISUMI のカートに追加します。
                   <br />
                   これは注文ではありません（カートに入るだけで、いつでも削除できます）。
                 </p>
