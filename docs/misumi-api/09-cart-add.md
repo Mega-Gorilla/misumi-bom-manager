@@ -217,7 +217,8 @@ document_start で `window.fetch`/`XMLHttpRequest` をフックし、**サイト
 - `shared/misumi-auth-hook.js`（新規）：bridge に `initialization_script` として document_start 注入。`fetch`/`XHR` をラップし api-jp の `Authorization: Bearer` ＋ `x-client-program`/`x-language-code` を `window.__mbmAuth` に捕捉（値はページ内のみ・passthrough）。
 - `shared/misumi-lookup.js`：`MisumiCore.authStatus()` / `addToCart(items)` を追加。捕捉ヘッダ＋`idempotency-key` で `cart-detail/add` を発行、`brandCode` は `suggest` で解決。
 - `src-tauri/src/lib.rs`：`cart_add` / `misumi_auth_status` / `misumi_login`（bridge を表示→ログイン→Bearer 捕捉を検知→hide。着地ページが api-jp を呼ばない場合は注文ページへ nudge）/ `misumi_open_cart`。bridge の close を **hide** に差し替え（＝ログイン/カート表示に使い回す）。
-- フロント：ツールバー「カートに追加（MISUMI）」→ `ORDER=MISUMI` 全行を型番マージ・Qty×倍率で収集 → 確認ダイアログ → `cart_add`（未ログインは `misumi_login`→再試行）→「カートを開く」。
+- フロント：ツールバー「カートに追加（MISUMI）」→ 対象行を型番マージ・Qty×倍率で収集 → 確認ダイアログ → `cart_add`（未ログインは `misumi_login`→再試行）→「カートを開く」。
+  対象行は **グリッドのチェックボックスで選択した行があればその行のみ、未選択なら `ORDER=MISUMI` の全行**（いずれも `ORDER=MISUMI`＋型番あり）。確認ダイアログにどちらのモードかを明示する。
 - 認証情報の扱い：パスワードはアプリを通さず、Bearer はページ内 `window.__mbmAuth` のみで保持し Rust/ログ/DB に一切出さない。セッションは WebView2 の永続プロファイルで維持。
 
 ---
