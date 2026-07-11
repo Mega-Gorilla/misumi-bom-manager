@@ -82,6 +82,12 @@ export default function App() {
     totalQty: number;
   } | null>(null);
   const [cartDone, setCartDone] = useState(false);
+  const [loginPrompt, setLoginPrompt] = useState<null | { phase: "ask" | "waiting" | "failed" }>(
+    null,
+  );
+  const pendingCartRef = useRef<{ items: api.CartItem[]; count: number; totalQty: number } | null>(
+    null,
+  );
   const gridRef = useRef<AgGridReact<BomRow>>(null);
   // JSON snapshot of the doc as of the last load/save; back() compares against it to detect
   // unsaved changes. A freshly created (untouched) BOM counts as clean, like Notepad.
@@ -354,26 +360,24 @@ export default function App() {
     if (collected) setConfirmCart(collected);
   };
 
-  // Confirmed: POST cart-detail/add via the bridge. If not logged in, prompt login (the
-  // bridge WebView shows for the user) and retry once. No order is placed — cart only.
-  const doAddToCart = async () => {
-    const collected = confirmCart;
-    setConfirmCart(null);
-    if (!collected || addingCart) return;
+  // POST cart-detail/add via the bridge. If not logged in, remember the pending items and
+  // raise the in-app login prompt (rather than silently popping the bridge window) so the
+  // separate login window has clear in-app context. No order is placed — cart only.
+  const runCartAdd = async (collected: {
+    items: api.CartItem[];
+    count: number;
+    totalQty: number;
+  }) => {
     setAddingCart(true);
     setCartDone(false);
     setStatus("カートに追加中…");
     try {
-      let res = await api.cartAdd("MISUMI", collected.items);
+      const res = await api.cartAdd("MISUMI", collected.items);
       if (!res.ok && (res.error === "NOT_LOGGED_IN" || res.error === "AUTH_EXPIRED")) {
-        setStatus("MISUMI へのログインが必要です。開いたウィンドウでログインしてください…");
-        const { loggedIn } = await api.misumiLogin();
-        if (!loggedIn) {
-          setStatus("ログインが確認できませんでした。もう一度お試しください");
-          return;
-        }
-        setStatus("カートに追加中…");
-        res = await api.cartAdd("MISUMI", collected.items);
+        pendingCartRef.current = collected;
+        setLoginPrompt({ phase: "ask" });
+        setStatus("");
+        return;
       }
       if (res.ok) {
         setStatus(
@@ -387,6 +391,33 @@ export default function App() {
       setStatus(String(e));
     } finally {
       setAddingCart(false);
+    }
+  };
+
+  // Confirm dialog accepted → attempt the add.
+  const doAddToCart = () => {
+    const collected = confirmCart;
+    setConfirmCart(null);
+    if (!collected || addingCart) return;
+    void runCartAdd(collected);
+  };
+
+  // Login prompt「ログイン画面を開く」/「再試行」: show the bridge for login, then on success
+  // close the prompt and continue the pending cart add automatically.
+  const startLogin = async () => {
+    setLoginPrompt({ phase: "waiting" });
+    try {
+      const { loggedIn } = await api.misumiLogin();
+      if (loggedIn) {
+        setLoginPrompt(null);
+        const collected = pendingCartRef.current;
+        if (collected) void runCartAdd(collected);
+      } else {
+        setLoginPrompt({ phase: "failed" });
+      }
+    } catch (e) {
+      setStatus(String(e));
+      setLoginPrompt({ phase: "failed" });
     }
   };
 
@@ -618,6 +649,56 @@ export default function App() {
                   </button>
                   <button onClick={() => setConfirmCart(null)}>キャンセル</button>
                 </div>
+              </div>
+            </div>
+          )}
+          {loginPrompt && (
+            <div
+              className="col-mgr-backdrop"
+              onClick={() => loginPrompt.phase !== "waiting" && setLoginPrompt(null)}
+            >
+              <div className="confirm-dlg" onClick={(e) => e.stopPropagation()}>
+                <h3>MISUMI へのログインが必要です</h3>
+                {loginPrompt.phase === "ask" && (
+                  <>
+                    <p>
+                      カートに追加するには MISUMI へのログインが必要です。
+                      <br />
+                      「ログイン画面を開く」を押すと別ウィンドウが開きます。ログインが完了すると自動でカートに追加します。
+                    </p>
+                    <div className="confirm-actions">
+                      <button className="primary" onClick={startLogin}>
+                        ログイン画面を開く
+                      </button>
+                      <button
+                        onClick={() => {
+                          setLoginPrompt(null);
+                          setStatus("キャンセルしました");
+                        }}
+                      >
+                        キャンセル
+                      </button>
+                    </div>
+                  </>
+                )}
+                {loginPrompt.phase === "waiting" && (
+                  <p>
+                    開いたウィンドウで MISUMI にログインしてください。
+                    <br />
+                    ログインを検知すると、自動でウィンドウを閉じてカートに追加します…
+                  </p>
+                )}
+                {loginPrompt.phase === "failed" && (
+                  <>
+                    <p>ログインが確認できませんでした。もう一度お試しください。</p>
+                    <div className="confirm-actions">
+                      <button className="primary" onClick={startLogin}>
+                        再試行
+                      </button>
+                      <button onClick={() => setLoginPrompt(null)}>閉じる</button>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
           )}
