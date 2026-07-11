@@ -38,6 +38,8 @@ use supplier::{provider_for, QuoteItem};
 struct DbState(std::sync::Mutex<rusqlite::Connection>);
 
 const BRIDGE_URL: &str = "https://jp.misumi-ec.com/order/part-number/create";
+/// MISUMI cart page — shown (in the authenticated bridge) by `misumi_open_cart`.
+const CART_URL: &str = "https://jp.misumi-ec.com/order/cart";
 
 /// Single source of truth for the suggest -> price/delivery fetch chain, shared
 /// with the headless CLI (tools/misumi-cli). Defines `window.MisumiCore`.
@@ -493,7 +495,7 @@ async fn misumi_open_cart(app: AppHandle) -> Result<(), String> {
         .get_webview_window("bridge")
         .ok_or_else(|| "ブリッジWebViewが見つかりません".to_string())?;
     let _ = webview.set_title("MISUMI カート");
-    let _ = webview.eval(&format!("window.location.href={:?};", BRIDGE_URL));
+    let _ = webview.eval(&format!("window.location.href={:?};", CART_URL));
     let _ = webview.show();
     let _ = webview.set_focus();
     Ok(())
