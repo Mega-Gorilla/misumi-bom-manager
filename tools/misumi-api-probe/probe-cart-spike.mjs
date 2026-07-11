@@ -9,8 +9,12 @@
 //   2. DECISIVE: with a readable token candidate, does a real authed call succeed?
 //      Uses the READ-ONLY `cart-detail/count` (GET) so the cart is NOT modified.
 //   → 200 + count ⇒ B1 viable (build Authorization ourselves).
-//   → no readable token / 401 / 403 ⇒ B1 blocked ⇒ use B2 (UI automation, already
-//     proven by probe-cart-b.mjs; the site attaches the token for us).
+//   → no readable token / 401 / 403 ⇒ B1 blocked ⇒ use B2 (site's authenticated
+//     context). Taxonomy (see docs/misumi-api/09-cart-add.md):
+//       B2-a = fetch/XHR intercept: hook the site's own request, capture its
+//              Authorization: Bearer, then WE issue cart-detail/add (verify separately).
+//       B2-b = UI automation: drive the bulk-input UI (proven by probe-cart-b.mjs);
+//              the site attaches the token for us — the reliable fallback.
 //
 // SECURITY: the token VALUE never leaves the page — evaluate() returns only lengths,
 // booleans, key NAMES, and HTTP status. No token is ever written to the log. The
@@ -174,8 +178,10 @@ if (b1Works) {
   line(`B1 VIABLE ✅ — token readable from ${win.source}; cart-detail/count returned 200 with totalCount.`);
   line('→ Phase B は cart-detail/add 直叩き(B1)で実装可。Authorization: Bearer を自前構築できる。');
 } else {
-  line('B1 NOT confirmed ✗ — no readable token produced a 200 on cart-detail/count.');
-  line('→ Phase B は B2(ログイン済み WebView でサイト UI を自動操作)を採用（サイトが Bearer を付与）。');
+  line('B1 NOT viable ✗ — 注入 JS からトークンを直接取得できない(HttpOnly + メモリ内保持)。');
+  line('→ Phase B は B2(サイト自身の認証済みコンテキストを使う)を採用:');
+  line('   B2-a(第一候補): fetch/XHR フックでサイトの Authorization: Bearer を捕捉→我々が cart-detail/add を発行(要検証: probe-cart-hook.mjs)。');
+  line('   B2-b(実証済み fallback): 一括入力 UI をプログラム操作(probe-cart-b.mjs)。サイトが Bearer を付与。');
 }
 
 line(`\n== ${LOG} written (no token values). Browser stays open 30s.`);
