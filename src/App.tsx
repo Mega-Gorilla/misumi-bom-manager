@@ -17,6 +17,7 @@ import {
   SUPPLIER_FIELDS,
   partNoColumn,
   sourceColumn,
+  orderNoColumn,
 } from "./types/bom";
 import type { Workbook } from "./types/bom";
 import { applyLinkedColumns, getCellValue, buildExportGrid } from "./lib/columns";
@@ -335,7 +336,10 @@ export default function App() {
       setStatus("型番列 / EC発注先列 が未設定です（列の管理で設定）");
       return null;
     }
+    const orderNoCol = orderNoColumn(doc);
     const partOf = (r: BomRow) => String(getCellValue(r, partCol) ?? "").trim();
+    const orderNoOf = (r: BomRow) =>
+      orderNoCol ? String(getCellValue(r, orderNoCol) ?? "").trim() : "";
     const isMisumi = (r: BomRow) =>
       String(getCellValue(r, srcCol) ?? "")
         .trim()
@@ -346,15 +350,22 @@ export default function App() {
     const useSelection = sel.length > 0;
     const selIds = new Set(sel.map((r) => r.id));
     const scope = useSelection ? doc.rows.filter((r) => selIds.has(r.id)) : doc.rows;
-    const byPart = new Map<string, number>();
+    // Merge by 型番 + お客様注文番号: same part with a different order number stays a separate
+    // cart line (each carries its own customerItemSubReference); same part+number sums qty.
+    const merged = new Map<string, { part: string; orderNo: string; qty: number }>();
     for (const r of scope) {
       if (!isMisumi(r)) continue;
       const p = partOf(r);
       if (!p) continue;
+      const orderNo = orderNoOf(r);
+      const key = `${p}\x00${orderNo}`;
       const base = r.qty && r.qty > 0 ? r.qty : 1;
-      byPart.set(p, (byPart.get(p) ?? 0) + Math.max(1, Math.round(base * mult)));
+      const add = Math.max(1, Math.round(base * mult));
+      const cur = merged.get(key);
+      if (cur) cur.qty += add;
+      else merged.set(key, { part: p, orderNo, qty: add });
     }
-    if (byPart.size === 0) {
+    if (merged.size === 0) {
       setStatus(
         useSelection
           ? "チェックした行に EC発注先=MISUMI かつ 型番のある行がありません"
@@ -362,7 +373,11 @@ export default function App() {
       );
       return null;
     }
-    const items = Array.from(byPart, ([inputProductCode, qty]) => ({ inputProductCode, qty }));
+    const items: api.CartItem[] = Array.from(merged.values(), (m) => ({
+      inputProductCode: m.part,
+      qty: m.qty,
+      ...(m.orderNo ? { customerItemSubReference: m.orderNo } : {}),
+    }));
     const totalQty = items.reduce((s, it) => s + it.qty, 0);
     return { items, count: items.length, totalQty, mode: useSelection ? "selection" : "all" };
   };

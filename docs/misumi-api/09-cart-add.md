@@ -60,8 +60,12 @@ Content-Type: application/json
 | 取り込み不要 | `noUse` |
 | 型番【必須】 | `productCode` |
 | 数量【必須】 | `qty` |
-| メーカー名 | （brandName 相当） |
-| 注文番号1〜3 | （orderNo 相当） |
+| メーカー名 | `brandName` |
+| 注文番号1 | `customerItemSubReferenceFirst` |
+| 注文番号2 | `customerItemSubReferenceSecond` |
+| 注文番号3 | `customerItemSubReferenceThird` |
+
+> ⚠️ **お客様注文番号は「3スロット」だが、カート上は単一フィールド**（2026-07-13 `probe-cart-orderno.mjs` で実証）。上記 `First/Second/Third` は一括貼り付け UI の**入力列マッピング**にすぎず、カート投入時には **区切り文字なしで連結**され、明細1件につき**単一の `customerItemSubReference`** として送られる（例: 注文番号1〜3 に `PO-TEST-A`/`PO-TEST-B`/`PO-TEST-C` → `"customerItemSubReference":"PO-TEST-APO-TEST-BPO-TEST-C"`）。∴ データモデル上、お客様注文番号は**1明細＝1個**。アプリ側では「お客様注文番号列」を1列だけ割り当て、その値をそのまま `customerItemSubReference` として送る設計とした（Issue #14）。
 
 ### (2) 価格・出荷日チェック（グリッド確定時／ログイン時は `shipToCode` 付き）
 
@@ -81,7 +85,7 @@ POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/add
 Content-Type: application/json
 
 { "cartDetailList": [
-    { "qty": 2, "brandCode": "MSM1", "inputProductCode": "CBT3-8" },
+    { "qty": 2, "brandCode": "MSM1", "inputProductCode": "CBT3-8", "customerItemSubReference": "PO-2026-001" },
     { "qty": 3, "brandCode": "MSM1", "inputProductCode": "CBT3-10" },
     { "qty": 1, "brandCode": "MSM1", "inputProductCode": "SFJ3-10" }
   ],
@@ -101,6 +105,7 @@ Content-Type: application/json
 
 - **リクエストは `cartDetailList` の配列で複数明細を一括投入**できる。
 - 必須と思われるフィールド：`qty` / `brandCode`（ミスミ＝`MSM1`）/ `inputProductCode`（型番）。
+- **`customerItemSubReference`（お客様注文番号）は任意**の明細フィールド。指定するとレスポンスの各明細にもそのままエコーされる（空なら送らない）。上表のとおり単一フィールド＝1明細1個。
 - レスポンスは追加された各明細（`cartDetailId`・価格・納期・案内メッセージ）を返す＝そのまま UI 反映に使える。
 - `indirectSalesOrderInstrumentationFlag` は計測フラグとみられる（`"1"` 固定で観測）。
 

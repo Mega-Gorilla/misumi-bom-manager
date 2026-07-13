@@ -97,11 +97,13 @@ export const onQuoteProgress = (cb: (p: QuoteProgress) => void): Promise<Unliste
 
 // ---- MISUMI cart (add BOM rows to the logged-in cart via the bridge WebView) ----
 
-/** One line to add to the cart. brandCode is optional (backend resolves it via suggest). */
+/** One line to add to the cart. brandCode is optional (backend resolves it via suggest).
+ *  customerItemSubReference is the お客様注文番号 (single field per line; omitted when empty). */
 export interface CartItem {
   inputProductCode: string;
   qty: number;
   brandCode?: string;
+  customerItemSubReference?: string;
 }
 
 /** Result of a cart-add attempt. `error` carries "NOT_LOGGED_IN" / "AUTH_EXPIRED" so the

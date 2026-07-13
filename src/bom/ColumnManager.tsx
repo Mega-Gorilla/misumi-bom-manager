@@ -48,12 +48,18 @@ export function ColumnManager(p: Props) {
     setNewLabel("");
   };
 
-  // Role columns (型番列 / EC発注先列) are fetch keys, excluded from EC連携 fill targets.
+  // Role columns (型番列 / EC発注先列 / お客様注文番号列) are fetch/入力キーで、EC連携 反映先から除外。
   const partKey = roleKey(p.columns, "partNo", "partsNo");
   const srcKey = roleKey(p.columns, "source", "order");
+  // お客様注文番号列 is optional — no default fallback (unset = 注文番号なし).
+  const orderKey = p.columns.find((c) => c.role === "orderNo")?.key;
   const assignable = p.columns.filter((c) => c.kind !== "supplier" && c.editable);
   const canLink = (c: ColumnDef) =>
-    c.kind !== "supplier" && c.editable && c.key !== partKey && c.key !== srcKey;
+    c.kind !== "supplier" &&
+    c.editable &&
+    c.key !== partKey &&
+    c.key !== srcKey &&
+    c.key !== orderKey;
   // Field-anchored mapping: a field's target options are link-eligible columns that are
   // unlinked or already linked to this field (so one column receives at most one field).
   const targetOptions = (field: string) =>
@@ -191,7 +197,7 @@ export function ColumnManager(p: Props) {
                   onChange={(e) => p.onSetRole("partNo", e.currentTarget.value)}
                 >
                   {assignable
-                    .filter((c) => c.key !== srcKey)
+                    .filter((c) => c.key !== srcKey && c.key !== orderKey)
                     .map((c) => (
                       <option key={c.key} value={c.key}>
                         {c.label}
@@ -206,13 +212,32 @@ export function ColumnManager(p: Props) {
                   onChange={(e) => p.onSetRole("source", e.currentTarget.value)}
                 >
                   {assignable
-                    .filter((c) => c.key !== partKey)
+                    .filter((c) => c.key !== partKey && c.key !== orderKey)
                     .map((c) => (
                       <option key={c.key} value={c.key}>
                         {c.label}
                       </option>
                     ))}
                 </select>
+              </div>
+              <div className="role-row">
+                <span className="role-label">お客様注文番号列</span>
+                <select
+                  value={orderKey ?? ""}
+                  onChange={(e) => p.onSetRole("orderNo", e.currentTarget.value)}
+                >
+                  <option value="">なし</option>
+                  {assignable
+                    .filter((c) => c.key !== partKey && c.key !== srcKey)
+                    .map((c) => (
+                      <option key={c.key} value={c.key}>
+                        {c.label}
+                      </option>
+                    ))}
+                </select>
+              </div>
+              <div className="role-hint">
+                お客様注文番号は MISUMI カート追加時に各行へ付与されます（1行1個・任意）。
               </div>
             </div>
 

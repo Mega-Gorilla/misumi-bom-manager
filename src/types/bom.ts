@@ -2,8 +2,8 @@
 
 export type ColumnKind = "core" | "custom" | "supplier";
 export type WritePolicy = "overwrite" | "fillEmpty" | "suggest";
-/** Fetch-pipeline role: which column is the part number / which selects the EC source. */
-export type ColumnRole = "partNo" | "source";
+/** Fetch-pipeline role: 型番列 / EC発注先列 / お客様注文番号列（カート投入時に付与）。 */
+export type ColumnRole = "partNo" | "source" | "orderNo";
 
 export interface ColumnLink {
   /** Dotted path on SupplierQuote, e.g. "quote.unitPrice" / "product.name". */
@@ -125,6 +125,10 @@ export const partNoColumn = (doc: BomDoc): ColumnDef | undefined =>
 /** Column whose value selects the EC source (matched against the supplier code). */
 export const sourceColumn = (doc: BomDoc): ColumnDef | undefined =>
   roleColumn(doc, "source", "order");
+/** Optional column whose value is the お客様注文番号 (customerItemSubReference) sent per line
+ *  when adding to the MISUMI cart. No default fallback — unset means「注文番号なし」。 */
+export const orderNoColumn = (doc: BomDoc): ColumnDef | undefined =>
+  doc.columns.find((c) => c.role === "orderNo");
 
 /** MISUMI/supplier fields that can be added as read-only linked columns.
  *  `field` is a dotted path on SupplierQuote, or a computed key (status/messages).

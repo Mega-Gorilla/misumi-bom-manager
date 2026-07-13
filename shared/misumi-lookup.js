@@ -118,7 +118,13 @@
             brand = "MSM1";
           }
         }
-        return { qty: it.qty, brandCode: brand, inputProductCode: code };
+        var line = { qty: it.qty, brandCode: brand, inputProductCode: code };
+        // お客様注文番号（単一フィールド）。空なら送らない。09-cart-add.md 参照。
+        var ref = it.customerItemSubReference;
+        if (ref != null && String(ref).trim() !== "") {
+          line.customerItemSubReference = String(ref).trim();
+        }
+        return line;
       })
     );
     var idem =

@@ -60,6 +60,10 @@ struct CartItem {
     qty: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     brand_code: Option<String>,
+    /// お客様注文番号 (customerItemSubReference). Single free-text field per line; omitted
+    /// when empty. The value passes through to cart-detail/add unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    customer_item_sub_reference: Option<String>,
 }
 
 #[derive(Default)]
