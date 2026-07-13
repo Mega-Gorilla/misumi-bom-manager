@@ -291,7 +291,12 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter, onActiveRowChan
         columnDefs={columnDefs}
         getRowId={(p) => p.data.id}
         context={{ qtyMultiplier: doc.meta.qtyMultiplier ?? 1 }}
-        rowSelection={{ mode: "multiRow", enableClickSelection: true }}
+        rowSelection={{
+          mode: "multiRow",
+          enableClickSelection: true,
+          checkboxes: true,
+          headerCheckbox: true,
+        }}
         onGridReady={(e: GridReadyEvent<BomRow>) => setApi(e.api)}
         onCellValueChanged={onCellValueChanged}
         onCellDoubleClicked={onCellDoubleClicked}

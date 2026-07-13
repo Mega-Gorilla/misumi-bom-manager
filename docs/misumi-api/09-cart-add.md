@@ -60,8 +60,14 @@ Content-Type: application/json
 | 取り込み不要 | `noUse` |
 | 型番【必須】 | `productCode` |
 | 数量【必須】 | `qty` |
-| メーカー名 | （brandName 相当） |
-| 注文番号1〜3 | （orderNo 相当） |
+| メーカー名 | `brandName` |
+| 注文番号1 | `customerItemSubReferenceFirst` |
+| 注文番号2 | `customerItemSubReferenceSecond` |
+| 注文番号3 | `customerItemSubReferenceThird` |
+
+> ⚠️ **お客様注文番号は「3スロット」だが、カート上は単一フィールド**（2026-07-13 `probe-cart-orderno.mjs` で実証）。上記 `First/Second/Third` は一括貼り付け UI の**入力列マッピング**にすぎず、カート投入時には **区切り文字なしで連結**され、明細1件につき**単一の `customerItemSubReference`** として送られる（例: 注文番号1〜3 に `PO-TEST-A`/`PO-TEST-B`/`PO-TEST-C` → `"customerItemSubReference":"PO-TEST-APO-TEST-BPO-TEST-C"`）。∴ データモデル上、お客様注文番号は**1明細＝1個**。
+>
+> **アプリ側の設計（Issue #14）**: 「取得・連携」に **お客様注文番号列1/2/3**（role=`orderNo1`/`orderNo2`/`orderNo3`・任意）を用意し、各行で**空でないスロットを区切り文字（BOM ごとに設定・`meta.orderNoSeparator`、既定は半角スペース）で連結**して単一の `customerItemSubReference` として送る。MISUMI 純正は無区切り連結だが、可読性のため**区切り文字は設定可能**とした（既定スペース、`""` にすれば MISUMI 純正と同じ無区切り連結）。カート上は 1 明細 1 個。型番＋連結後の注文番号でマージ（同一型番でも注文番号が異なれば別明細）。
 
 ### (2) 価格・出荷日チェック（グリッド確定時／ログイン時は `shipToCode` 付き）
 
@@ -81,7 +87,7 @@ POST https://api-jp.misumi-ec.com/shopping-cart/v1/cart-detail/add
 Content-Type: application/json
 
 { "cartDetailList": [
-    { "qty": 2, "brandCode": "MSM1", "inputProductCode": "CBT3-8" },
+    { "qty": 2, "brandCode": "MSM1", "inputProductCode": "CBT3-8", "customerItemSubReference": "PO-2026-001" },
     { "qty": 3, "brandCode": "MSM1", "inputProductCode": "CBT3-10" },
     { "qty": 1, "brandCode": "MSM1", "inputProductCode": "SFJ3-10" }
   ],
@@ -101,6 +107,7 @@ Content-Type: application/json
 
 - **リクエストは `cartDetailList` の配列で複数明細を一括投入**できる。
 - 必須と思われるフィールド：`qty` / `brandCode`（ミスミ＝`MSM1`）/ `inputProductCode`（型番）。
+- **`customerItemSubReference`（お客様注文番号）は任意**の明細フィールド。指定するとレスポンスの各明細にもそのままエコーされる（空なら送らない）。上表のとおり単一フィールド＝1明細1個。
 - レスポンスは追加された各明細（`cartDetailId`・価格・納期・案内メッセージ）を返す＝そのまま UI 反映に使える。
 - `indirectSalesOrderInstrumentationFlag` は計測フラグとみられる（`"1"` 固定で観測）。
 
@@ -208,6 +215,18 @@ document_start で `window.fetch`/`XMLHttpRequest` をフックし、**サイト
    （**付随ヘッダの同送は必須**。`Authorization` だけだと 400 `"Client Program is null."` になる＝`probe-cart-hook.mjs` で確認済み）
 4. レスポンス（`cartDetailId`・価格・納期）をアプリに反映し、「カートを開く」導線を提示。401 時は Bearer を再キャプチャして再試行。
 - フォールバックは **B2-b（サイト UI 自動操作）**。詳細は上記「→ 実装方針は B2」参照。
+
+---
+
+## 実装（Phase B / B2-a・2026-07-11）
+アプリ本体に B2-a を実装済み（Issue #14）。既存の隠し bridge WebView を認証エンジンとして拡張：
+
+- `shared/misumi-auth-hook.js`（新規）：bridge に `initialization_script` として document_start 注入。`fetch`/`XHR` をラップし api-jp の `Authorization: Bearer` ＋ `x-client-program`/`x-language-code` を `window.__mbmAuth` に捕捉（値はページ内のみ・passthrough）。
+- `shared/misumi-lookup.js`：`MisumiCore.authStatus()` / `addToCart(items)` を追加。捕捉ヘッダ＋`idempotency-key` で `cart-detail/add` を発行、`brandCode` は `suggest` で解決。
+- `src-tauri/src/lib.rs`：`cart_add` / `misumi_auth_status` / `misumi_login`（bridge を表示→ログイン→Bearer 捕捉を検知→hide。着地ページが api-jp を呼ばない場合は注文ページへ nudge）/ `misumi_open_cart`。bridge の close を **hide** に差し替え（＝ログイン/カート表示に使い回す）。
+- フロント：ツールバー「カートに追加（MISUMI）」→ 対象行を型番マージ・Qty×倍率で収集 → 確認ダイアログ → `cart_add`（未ログインは `misumi_login`→再試行）→「カートを開く」。
+  対象行は **グリッドのチェックボックスで選択した行があればその行のみ、未選択なら `ORDER=MISUMI` の全行**（いずれも `ORDER=MISUMI`＋型番あり）。確認ダイアログにどちらのモードかを明示する。
+- 認証情報の扱い：パスワードはアプリを通さず、Bearer はページ内 `window.__mbmAuth` のみで保持し Rust/ログ/DB に一切出さない。セッションは WebView2 の永続プロファイルで維持。
 
 ---
 

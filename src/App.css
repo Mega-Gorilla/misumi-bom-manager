@@ -482,12 +482,27 @@ body.fill-dragging {
   margin: 4px 0;
 }
 .role-label {
-  width: 90px;
+  width: 108px;
   font-size: 0.82rem;
+}
+.role-hint {
+  margin-top: 8px;
+  font-size: 0.72rem;
+  color: var(--muted);
+  line-height: 1.5;
 }
 .role-row select {
   font-size: 0.8rem;
   padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}
+.role-sep-input {
+  font-size: 0.8rem;
+  padding: 4px 8px;
+  width: 96px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--card);
@@ -902,6 +917,21 @@ button:disabled {
 .summary-bar .sb-error {
   color: var(--error);
   font-weight: 600;
+}
+
+/* ---- cart-add success strip (offers to open the MISUMI cart) ---- */
+.cart-toast {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent, #2563eb) 10%, var(--card));
+  font-size: 0.86rem;
+}
+.cart-toast span {
+  margin-right: auto;
 }
 
 /* ---- history drawer (bottom dock, rises up) ---- */

@@ -21,7 +21,7 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
 
 // Append-only list of migrations. Index i => schema version i+1.
 // NEVER edit a shipped migration string — only append a new one.
-const MIGRATIONS: &[&str] = &[V1, V2, V3];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     let mut v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -119,6 +119,12 @@ const V3: &str = r#"
 ALTER TABLE supplier_price_history ADD COLUMN stock INTEGER;
 "#;
 
+// V4: per-BOM separator for joining お客様注文番号1/2/3 columns into the single
+// customerItemSubReference at cart-add time. NULL → frontend default (space).
+const V4: &str = r#"
+ALTER TABLE bom ADD COLUMN order_no_separator TEXT;
+"#;
+
 pub fn new_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -151,7 +157,8 @@ pub fn list_boms(conn: &Connection) -> rusqlite::Result<Vec<BomSummary>> {
 pub fn load_bom(conn: &Connection, id: &str) -> rusqlite::Result<Option<BomDoc>> {
     let meta = conn
         .query_row(
-            "SELECT name, qty_multiplier, imported_from, updated_at FROM bom WHERE id = ?1",
+            "SELECT name, qty_multiplier, imported_from, updated_at, order_no_separator \
+             FROM bom WHERE id = ?1",
             [id],
             |r| {
                 Ok(BomMeta {
@@ -159,6 +166,7 @@ pub fn load_bom(conn: &Connection, id: &str) -> rusqlite::Result<Option<BomDoc>>
                     qty_multiplier: r.get(1)?,
                     imported_from: r.get(2)?,
                     updated_at: r.get(3)?,
+                    order_no_separator: r.get(4)?,
                 })
             },
         )
@@ -234,16 +242,18 @@ pub fn save_bom(conn: &mut Connection, doc: &BomDoc) -> rusqlite::Result<String>
     let id = doc.id.clone().unwrap_or_else(new_id);
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO bom(id, name, qty_multiplier, imported_from, created_at, updated_at) \
-         VALUES(?1, ?2, ?3, ?4, datetime('now', 'localtime'), datetime('now', 'localtime')) \
+        "INSERT INTO bom(id, name, qty_multiplier, imported_from, order_no_separator, created_at, updated_at) \
+         VALUES(?1, ?2, ?3, ?4, ?5, datetime('now', 'localtime'), datetime('now', 'localtime')) \
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, \
            qty_multiplier = excluded.qty_multiplier, imported_from = excluded.imported_from, \
+           order_no_separator = excluded.order_no_separator, \
            updated_at = datetime('now', 'localtime')",
         params![
             id,
             doc.meta.name,
             doc.meta.qty_multiplier,
-            doc.meta.imported_from
+            doc.meta.imported_from,
+            doc.meta.order_no_separator
         ],
     )?;
 
@@ -388,6 +398,7 @@ mod tests {
                 name: Some("test".into()),
                 imported_from: None,
                 qty_multiplier: 3.0,
+                order_no_separator: None,
                 updated_at: None,
             },
             columns: vec![ColumnDef {
