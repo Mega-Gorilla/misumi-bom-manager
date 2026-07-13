@@ -17,7 +17,8 @@ import {
   SUPPLIER_FIELDS,
   partNoColumn,
   sourceColumn,
-  orderNoColumn,
+  orderNoColumns,
+  DEFAULT_ORDER_NO_SEPARATOR,
 } from "./types/bom";
 import type { Workbook } from "./types/bom";
 import { applyLinkedColumns, getCellValue, buildExportGrid } from "./lib/columns";
@@ -336,10 +337,15 @@ export default function App() {
       setStatus("型番列 / EC発注先列 が未設定です（列の管理で設定）");
       return null;
     }
-    const orderNoCol = orderNoColumn(doc);
+    const orderNoCols = orderNoColumns(doc);
+    const sep = doc.meta.orderNoSeparator ?? DEFAULT_ORDER_NO_SEPARATOR;
     const partOf = (r: BomRow) => String(getCellValue(r, partCol) ?? "").trim();
+    // Join the assigned お客様注文番号1/2/3 slots (non-empty only) into a single value.
     const orderNoOf = (r: BomRow) =>
-      orderNoCol ? String(getCellValue(r, orderNoCol) ?? "").trim() : "";
+      orderNoCols
+        .map((c) => String(getCellValue(r, c) ?? "").trim())
+        .filter((v) => v !== "")
+        .join(sep);
     const isMisumi = (r: BomRow) =>
       String(getCellValue(r, srcCol) ?? "")
         .trim()
@@ -757,10 +763,14 @@ export default function App() {
             <ColumnManager
               columns={doc.columns}
               initialTab={columnsTab}
+              orderNoSeparator={doc.meta.orderNoSeparator ?? DEFAULT_ORDER_NO_SEPARATOR}
               onAdd={addColumn}
               onAddSupplier={addSupplierColumn}
               onSetFieldLink={setFieldLink}
               onSetRole={setColumnRole}
+              onSetOrderNoSeparator={(sep) =>
+                setDoc({ ...doc, meta: { ...doc.meta, orderNoSeparator: sep } })
+              }
               onRename={renameColumn}
               onDelete={deleteColumn}
               onMove={moveColumn}

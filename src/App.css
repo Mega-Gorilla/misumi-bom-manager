@@ -499,6 +499,15 @@ body.fill-dragging {
   background: var(--card);
   color: var(--text);
 }
+.role-sep-input {
+  font-size: 0.8rem;
+  padding: 4px 8px;
+  width: 96px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}
 .col-table {
   width: 100%;
   border-collapse: collapse;

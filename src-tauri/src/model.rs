@@ -34,7 +34,8 @@ pub struct ColumnDef {
     pub width: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<ColumnLink>,
-    /// Designated role for the fetch pipeline: "partNo" (型番列) | "source" (EC発注先列).
+    /// Designated role for the fetch pipeline: "partNo" (型番列) | "source" (EC発注先列) |
+    /// "orderNo1"|"orderNo2"|"orderNo3" (お客様注文番号列; joined into customerItemSubReference).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
 }
@@ -132,6 +133,10 @@ pub struct BomMeta {
     pub imported_from: Option<String>,
     #[serde(default = "one_f")]
     pub qty_multiplier: f64,
+    /// Separator used to join お客様注文番号1/2/3 columns into the single
+    /// customerItemSubReference at cart-add time. None → frontend default (space).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_no_separator: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
 }

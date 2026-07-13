@@ -65,7 +65,9 @@ Content-Type: application/json
 | 注文番号2 | `customerItemSubReferenceSecond` |
 | 注文番号3 | `customerItemSubReferenceThird` |
 
-> ⚠️ **お客様注文番号は「3スロット」だが、カート上は単一フィールド**（2026-07-13 `probe-cart-orderno.mjs` で実証）。上記 `First/Second/Third` は一括貼り付け UI の**入力列マッピング**にすぎず、カート投入時には **区切り文字なしで連結**され、明細1件につき**単一の `customerItemSubReference`** として送られる（例: 注文番号1〜3 に `PO-TEST-A`/`PO-TEST-B`/`PO-TEST-C` → `"customerItemSubReference":"PO-TEST-APO-TEST-BPO-TEST-C"`）。∴ データモデル上、お客様注文番号は**1明細＝1個**。アプリ側では「お客様注文番号列」を1列だけ割り当て、その値をそのまま `customerItemSubReference` として送る設計とした（Issue #14）。
+> ⚠️ **お客様注文番号は「3スロット」だが、カート上は単一フィールド**（2026-07-13 `probe-cart-orderno.mjs` で実証）。上記 `First/Second/Third` は一括貼り付け UI の**入力列マッピング**にすぎず、カート投入時には **区切り文字なしで連結**され、明細1件につき**単一の `customerItemSubReference`** として送られる（例: 注文番号1〜3 に `PO-TEST-A`/`PO-TEST-B`/`PO-TEST-C` → `"customerItemSubReference":"PO-TEST-APO-TEST-BPO-TEST-C"`）。∴ データモデル上、お客様注文番号は**1明細＝1個**。
+>
+> **アプリ側の設計（Issue #14）**: 「取得・連携」に **お客様注文番号列1/2/3**（role=`orderNo1`/`orderNo2`/`orderNo3`・任意）を用意し、各行で**空でないスロットを区切り文字（BOM ごとに設定・`meta.orderNoSeparator`、既定は半角スペース）で連結**して単一の `customerItemSubReference` として送る。MISUMI 純正は無区切り連結だが、可読性のため**区切り文字は設定可能**とした（既定スペース、`""` にすれば MISUMI 純正と同じ無区切り連結）。カート上は 1 明細 1 個。型番＋連結後の注文番号でマージ（同一型番でも注文番号が異なれば別明細）。
 
 ### (2) 価格・出荷日チェック（グリッド確定時／ログイン時は `shipToCode` 付き）
 

@@ -1,21 +1,30 @@
 import { useState } from "react";
 import { X, ChevronUp, ChevronDown, Trash2, Plus } from "lucide-react";
 import type { ColumnDef, ColumnRole, WritePolicy } from "../types/bom";
-import { SUPPLIER_FIELDS, WRITE_POLICIES } from "../types/bom";
+import { SUPPLIER_FIELDS, WRITE_POLICIES, ORDER_NO_ROLES } from "../types/bom";
 
 interface Props {
   columns: ColumnDef[];
   /** Which tab to open on (default "columns"). Import flow opens on "ec". */
   initialTab?: "columns" | "ec";
+  /** Separator joining お客様注文番号1/2/3 columns at cart-add time. */
+  orderNoSeparator: string;
   onAdd: (label: string) => void;
   onAddSupplier: (field: string, label: string) => void;
   onSetFieldLink: (field: string, columnKey: string | null, write: WritePolicy) => void;
   onSetRole: (role: ColumnRole, key: string) => void;
+  onSetOrderNoSeparator: (sep: string) => void;
   onRename: (key: string, label: string) => void;
   onDelete: (key: string) => void;
   onMove: (key: string, dir: -1 | 1) => void;
   onClose: () => void;
 }
+
+const ORDER_NO_LABELS: Record<string, string> = {
+  orderNo1: "お客様注文番号1",
+  orderNo2: "お客様注文番号2",
+  orderNo3: "お客様注文番号3",
+};
 
 // Supplier data fields that can drive an existing editable column (write policy).
 const LINKABLE = SUPPLIER_FIELDS.filter((f) => f.linkable);
@@ -48,18 +57,19 @@ export function ColumnManager(p: Props) {
     setNewLabel("");
   };
 
-  // Role columns (型番列 / EC発注先列 / お客様注文番号列) are fetch/入力キーで、EC連携 反映先から除外。
+  // Role columns (型番列 / EC発注先列 / お客様注文番号列1〜3) are fetch/入力キーで、EC連携 反映先から除外。
   const partKey = roleKey(p.columns, "partNo", "partsNo");
   const srcKey = roleKey(p.columns, "source", "order");
-  // お客様注文番号列 is optional — no default fallback (unset = 注文番号なし).
-  const orderKey = p.columns.find((c) => c.role === "orderNo")?.key;
+  // お客様注文番号スロットは任意（デフォルトなし）。role→割り当て列キーの対応。
+  const orderKeyOf = (role: ColumnRole) => p.columns.find((c) => c.role === role)?.key;
+  const orderKeys = new Set(ORDER_NO_ROLES.map(orderKeyOf).filter(Boolean) as string[]);
   const assignable = p.columns.filter((c) => c.kind !== "supplier" && c.editable);
   const canLink = (c: ColumnDef) =>
     c.kind !== "supplier" &&
     c.editable &&
     c.key !== partKey &&
     c.key !== srcKey &&
-    c.key !== orderKey;
+    !orderKeys.has(c.key);
   // Field-anchored mapping: a field's target options are link-eligible columns that are
   // unlinked or already linked to this field (so one column receives at most one field).
   const targetOptions = (field: string) =>
@@ -197,7 +207,7 @@ export function ColumnManager(p: Props) {
                   onChange={(e) => p.onSetRole("partNo", e.currentTarget.value)}
                 >
                   {assignable
-                    .filter((c) => c.key !== srcKey && c.key !== orderKey)
+                    .filter((c) => c.key !== srcKey && !orderKeys.has(c.key))
                     .map((c) => (
                       <option key={c.key} value={c.key}>
                         {c.label}
@@ -212,7 +222,7 @@ export function ColumnManager(p: Props) {
                   onChange={(e) => p.onSetRole("source", e.currentTarget.value)}
                 >
                   {assignable
-                    .filter((c) => c.key !== partKey && c.key !== orderKey)
+                    .filter((c) => c.key !== partKey && !orderKeys.has(c.key))
                     .map((c) => (
                       <option key={c.key} value={c.key}>
                         {c.label}
@@ -220,24 +230,46 @@ export function ColumnManager(p: Props) {
                     ))}
                 </select>
               </div>
+              {ORDER_NO_ROLES.map((role) => {
+                const myKey = orderKeyOf(role);
+                return (
+                  <div className="role-row" key={role}>
+                    <span className="role-label">{ORDER_NO_LABELS[role]}</span>
+                    <select
+                      value={myKey ?? ""}
+                      onChange={(e) => p.onSetRole(role, e.currentTarget.value)}
+                    >
+                      <option value="">なし</option>
+                      {assignable
+                        // exclude 型番/EC発注先 and the OTHER order-no slots (keep this slot's own)
+                        .filter(
+                          (c) =>
+                            c.key !== partKey &&
+                            c.key !== srcKey &&
+                            (!orderKeys.has(c.key) || c.key === myKey),
+                        )
+                        .map((c) => (
+                          <option key={c.key} value={c.key}>
+                            {c.label}
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+                );
+              })}
               <div className="role-row">
-                <span className="role-label">お客様注文番号列</span>
-                <select
-                  value={orderKey ?? ""}
-                  onChange={(e) => p.onSetRole("orderNo", e.currentTarget.value)}
-                >
-                  <option value="">なし</option>
-                  {assignable
-                    .filter((c) => c.key !== partKey && c.key !== srcKey)
-                    .map((c) => (
-                      <option key={c.key} value={c.key}>
-                        {c.label}
-                      </option>
-                    ))}
-                </select>
+                <span className="role-label">注文番号の区切り</span>
+                <input
+                  className="role-sep-input"
+                  type="text"
+                  value={p.orderNoSeparator}
+                  onChange={(e) => p.onSetOrderNoSeparator(e.currentTarget.value)}
+                  placeholder="(スペース)"
+                />
               </div>
               <div className="role-hint">
-                お客様注文番号は MISUMI カート追加時に各行へ付与されます（1行1個・任意）。
+                お客様注文番号は MISUMI カート追加時に各行へ付与されます（任意）。1〜3 に列を割り当てると、
+                空でないものを上の区切り文字で連結して 1 つの注文番号として送ります（カート上は 1 明細 1 個）。
               </div>
             </div>
 

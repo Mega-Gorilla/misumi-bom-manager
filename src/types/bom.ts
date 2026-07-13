@@ -2,8 +2,13 @@
 
 export type ColumnKind = "core" | "custom" | "supplier";
 export type WritePolicy = "overwrite" | "fillEmpty" | "suggest";
-/** Fetch-pipeline role: 型番列 / EC発注先列 / お客様注文番号列（カート投入時に付与）。 */
-export type ColumnRole = "partNo" | "source" | "orderNo";
+/** Fetch-pipeline role: 型番列 / EC発注先列 / お客様注文番号列1〜3（カート投入時に連結して付与）。 */
+export type ColumnRole = "partNo" | "source" | "orderNo1" | "orderNo2" | "orderNo3";
+
+/** お客様注文番号のスロット role（連結順）。 */
+export const ORDER_NO_ROLES: ColumnRole[] = ["orderNo1", "orderNo2", "orderNo3"];
+/** meta.orderNoSeparator 未設定時に注文番号スロットを連結する既定の区切り文字。 */
+export const DEFAULT_ORDER_NO_SEPARATOR = " ";
 
 export interface ColumnLink {
   /** Dotted path on SupplierQuote, e.g. "quote.unitPrice" / "product.name". */
@@ -69,6 +74,8 @@ export interface BomMeta {
   name?: string;
   importedFrom?: string;
   qtyMultiplier: number;
+  /** Separator joining お客様注文番号1/2/3 into customerItemSubReference (undefined → default space). */
+  orderNoSeparator?: string;
   updatedAt?: string;
 }
 
@@ -125,10 +132,12 @@ export const partNoColumn = (doc: BomDoc): ColumnDef | undefined =>
 /** Column whose value selects the EC source (matched against the supplier code). */
 export const sourceColumn = (doc: BomDoc): ColumnDef | undefined =>
   roleColumn(doc, "source", "order");
-/** Optional column whose value is the お客様注文番号 (customerItemSubReference) sent per line
- *  when adding to the MISUMI cart. No default fallback — unset means「注文番号なし」。 */
-export const orderNoColumn = (doc: BomDoc): ColumnDef | undefined =>
-  doc.columns.find((c) => c.role === "orderNo");
+/** お客様注文番号スロット（role=orderNo1/2/3）に割り当てられた列を連結順で返す。
+ *  未割り当てスロットは欠番として詰める（任意・全て未設定なら空配列）。 */
+export const orderNoColumns = (doc: BomDoc): ColumnDef[] =>
+  ORDER_NO_ROLES.map((role) => doc.columns.find((c) => c.role === role)).filter(
+    (c): c is ColumnDef => c !== undefined,
+  );
 
 /** MISUMI/supplier fields that can be added as read-only linked columns.
  *  `field` is a dotted path on SupplierQuote, or a computed key (status/messages).
