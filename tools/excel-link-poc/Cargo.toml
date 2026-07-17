@@ -1,0 +1,10 @@
+[package]
+name = "excel-link-poc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Go/no-go probe for read-modify-write of existing .xlsx (docs/plans/0018-excel-link-mode §7 step 1)"
+
+[dependencies]
+umya-spreadsheet = "3"
+zip = "2"

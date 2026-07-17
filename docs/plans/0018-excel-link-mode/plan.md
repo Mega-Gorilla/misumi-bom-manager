@@ -228,6 +228,81 @@ GoogleDriveFS 稼働: True     実体のFS: NTFS
 > タイミングとの競合、および**競合コピー**（`… (1).xlsx`）の発生（§6.2）。これらは**ファイルシステムの
 > 意味論ではなく同期の振る舞い**の問題であり、短時間の実測では確認できない。
 
+### 3.9 read-modify-write は「zip 直編集」で成立する。`umya-spreadsheet` は不採用（実測）
+
+**技術検証ステップ1**（`tools/excel-link-poc/`、2026-07-17 実測、Excel 16.0 / umya-spreadsheet 3.0.1）。
+実 Excel（COM）に**20要素**を含む fixture を作らせ、**`D2` を1セルだけ更新して保存**し、
+zip パートと XML マーカーを機械比較したうえで**実 Excel で開いて値を確認**した。
+
+| 検証項目（§7 ステップ1） | `umya-spreadsheet` | **zip 直編集** |
+|---|---|---|
+| 1. 一部セル更新で保持されるか | **✗ 配列数式が壊れる** | **✓ 意図した差分のみ** |
+| 2. 数式セルを識別できるか | ✓（`Array`/`Shared`/`Normal` と `ref` まで） | ✓（XML から直接） |
+| 3. dirty-cell のみ更新できるか | ✗（副作用あり） | **✓ 他パートはバイト単位でコピー** |
+| 4. `calcPr fullCalcOnLoad` を設定できるか | **✗ API が存在しない** | **✓** |
+| Excel の破損報告（`RepairedRecords`） | 0 | 0 |
+
+#### `umya-spreadsheet` を不採用とする理由
+
+**配列数式が静かに誤った値になる。** これが決定的。
+
+| | 元ファイル | umya 出力 |
+|---|---|---|
+| XML | `<f t="array" ref="J2">SUM(C2:C4*D2:D4)</f>` | `<f>SUM(C2:C4*D2:D4)</f>` |
+| Excel | `HasArray=True` / **3950**（正） | `HasArray=False` / **2468**（**誤**。正は 5618） |
+
+`t="array"` と `ref` を失って通常数式に降格し、暗黙のインターセクションで別の数値になる。
+**書き込んだ `D2` から離れた `J2` が壊れる**ため、§4.4.2 の「書き込み対象との交差検出」では防げない。
+BOM の小計・合計で起きれば**誤発注に直結**する。原因はソース上明白
+（`cell_formula.rs` の `write_to` が `Array` のとき `t` を書かない）。
+
+あわせて `xl/metadata.xml`（動的配列メタデータ）が落ち、`calcPr` は
+`calcId="191029"` → **ハードコードの `122211`** に置換される（リーダーに `calcPr` のパースが無い）。
+**`fullCalcOnLoad` の設定 API は存在しない**（ソースでコメントアウト）。
+
+> **注意**: umya 出力でも依存数式は再計算された（`E2`=2468）が、これは **`calcId` が Excel の
+> `191029` より古くなったことで偶然フル再計算が誘発された副作用**であり、設計された挙動ではない
+> （キャッシュ値自体は古い `<v>800</v>` のまま書かれていた）。**この偶然に依存してはならない。**
+
+根本原因は設計。umya は**全パートをデシリアライズ→再シリアライズ**するため、
+**モデル化されていない要素は保存時に落ちる**（verbatim 保持ではない）。
+
+#### zip 直編集を採用する理由
+
+**触ったのは `xl/worksheets/sheet1.xml` と `xl/workbook.xml` の2パートだけ。残り17パートは
+バイト単位でコピー**（`raw_copy_file`）。**触っていないものは原理的に壊れない。**
+
+```
+-- package parts: 20 -> 19 --
+   [LOST] xl/calcChain.xml            ← 意図的に削除（Excel が再構築する）
+-- workbook.xml --
+          before: <calcPr calcId="191029"/>
+          after : <calcPr calcId="191029" fullCalcOnLoad="1"/>
+-- xl/worksheets/sheet1.xml --   [ ok ] all markers unchanged
+```
+
+実 Excel での確認（`RepairedRecords: 0`）:
+
+```
+D2 = 1234                          アプリが書いた値
+E2 = 2468                          fullCalcOnLoad で正しく再計算（§4.4.1 案 A が成立）
+J2 HasArray = True / value = 5618  配列数式が保たれ、正しく再計算された
+J5=CBT3-8 J6=CBT3-10 J7=SFB6-20    動的配列のスピルも健在
+Shapes=2 Charts=1 Tables=1 Merged=True ColWidthB=22 Orientation=2 CondFmt=1
+PrintArea=$A$1:$F$8  PrintTitleRows=$1:$1
+```
+
+#### この PoC が**証明していないこと**（実装時に潰す）
+
+方式は成立したが、本実装には穴がある。
+
+- `patch_cell` は `<c r="D2"` を**文字列検索**する。Excel は `r` を先頭に書くが、
+  **他の writer が属性順を変えた場合はマッチしない**
+- **対象セルが存在しない場合の挿入**（`<c>` / `<row>` の生成、`spans` 更新）は未実装
+- **文字列値の書き込み**（`sharedStrings` か `inlineStr` か）は未検証（今回は数値のみ）
+- シート名 → `sheetN.xml` の解決を**シート順**で行っている。正しくは **`r:id` リレーション経由**
+- 検証は**この fixture 1本**。実 BOM での確認は §7 ステップ3
+
 ---
 
 ## 4. 設計
@@ -841,12 +916,17 @@ Drive / OneDrive は**競合コピー**（`... (1).xlsx`）を静かに生成す
 Drive 上に置けば「他の人が編集中」を高い確率で検知できる。ただし**アドバイザリ**であり、
 Drive の同期遅延（秒オーダー）による競合は残るため**保証にはならない**。
 
-### 6.1 【最大】read-modify-write ライブラリが成立するか
+### 6.1 【解消済み】read-modify-write の方式（2026-07-17 実測・§3.9）
 
-`rust_xlsxwriter` は新規作成専用のため使えない。`umya-spreadsheet` 等が候補だが、
-**セルを部分更新できても未対応の Excel 要素を保存時に落とす可能性がある**。
+**最大リスクだったが、技術検証ステップ1（`tools/excel-link-poc/`）で解消した。**
 
-ここが成立しなければ**設計ごと見直し**になるため、他に手を付ける前に潰す（§7 ステップ1）。
+当初の候補 `umya-spreadsheet` は **no-go**、**代替の「zip 直編集」が go** となった（詳細は §3.9）。
+
+- `rust_xlsxwriter` は新規作成専用のため使えない（変わらず）
+- `umya-spreadsheet` は**配列数式を静かに壊し**、`calcPr fullCalcOnLoad` を**設定できない** → **不採用**
+- **zip 直編集**（触るパート以外をバイト単位でコピー）は**意図した差分のみ**を生み、`fullCalcOnLoad` も制御できる → **採用**
+
+**設計ごとの見直しは不要**になった。ただし本実装には未対応の穴が残る（§3.9 の「証明していないこと」）。
 
 ### 6.2 【中】クラウド同期クライアントとの相互作用（**未検証**）
 
@@ -921,7 +1001,7 @@ COM 自動化で起動中の Excel インスタンスに直接書けば実現で
 
 | # | 内容 | 備考 |
 |---|---|---|
-| 1 | **read-modify-write の技術検証** | 一部セル更新で数式・書式・複数シート・図形・印刷設定が保持されるか／**数式セルを識別できるか**／dirty-cell のみ更新できるか／**`calcPr fullCalcOnLoad` を保持・設定できるか**（§6.1 / §4.4.1） |
+| 1 | ~~**read-modify-write の技術検証**~~ **完了（2026-07-17・§3.9）** | **`umya-spreadsheet` は no-go**（配列数式が静かに壊れる／`fullCalcOnLoad` 不可）。**「zip 直編集」を採用**。`tools/excel-link-poc/` に再現ハーネスあり |
 | 2 | **数式 PoC（§7.1）** | `fullCalcOnLoad` ＋ `stale` 運用が成立するか。**実 BOM で `stale` の発生頻度を測り、§5 の MVP 境界を決定する** |
 | 3 | **構造変更 PoC（§7.2）＋ 実ファイル保持テスト** | 代表的な実 BOM を複製し、保存前後で数式・書式・図形・印刷設定を比較 |
 | 3b | **環境判定 PoC（§4.10）** | 実体パス・実体ボリュームの解決。ショートカット／ジャンクション／シンボリックリンク経由。ストリーミング構成の判別 |
@@ -1027,8 +1107,8 @@ PoC の一時確認で終わらせず、以下は**単体テストとして残�
 
 | ファイル | 内容 |
 |---|---|
-| `src-tauri/Cargo.toml` | `rust_xlsxwriter` → read-modify-write 対応クレートへ（検証結果次第） |
-| `src-tauri/src/spreadsheet.rs` | 部分更新の書き込み、`worksheet_formula` 併読（**座標系オフセット必須**・§3.4.1）、`calcPr fullCalcOnLoad` 設定、`truncated` ガード、原子的置換 |
+| `src-tauri/Cargo.toml` | `rust_xlsxwriter` は**新規作成（従来の書き出し）用に残す**。リンクモードの書き戻しは **`zip` クレートで直編集**（§3.9 で確定。RMW クレートは不採用） |
+| `src-tauri/src/spreadsheet.rs` | **zip 直編集による部分更新**（§3.9。触るパート以外は `raw_copy_file` でバイト単位コピー、`calcChain.xml` は削除）、`worksheet_formula` 併読（**座標系オフセット必須**・§3.4.1）、`calcPr fullCalcOnLoad` 設定、`truncated` ガード、原子的置換 |
 | `src-tauri/src/db.rs` | 構造契約（V5 マイグレーション） |
 | `src-tauri/src/model.rs` | リンク設定・列所有権・計算状態・指紋・同期状態 |
 | `src-tauri/src/lib.rs` | リンク BOM 用コマンド（読込／構造検証／反映／反映待ち状態） |

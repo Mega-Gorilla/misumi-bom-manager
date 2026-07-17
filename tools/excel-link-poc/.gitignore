@@ -1,0 +1,6 @@
+# PoC artifacts — regenerate with gen-fixture.ps1 / cargo run. Never commit.
+fixtures/
+out/
+target/
+Cargo.lock
+*.log
