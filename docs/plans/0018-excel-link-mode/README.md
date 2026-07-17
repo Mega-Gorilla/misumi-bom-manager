@@ -3,7 +3,7 @@
 Excel を BOM の正本（唯一のエディタ）とし、アプリは**読み取りと EC 列の書き戻しに徹する**ことで、
 インポート／エクスポートの手動往復をなくす機能の計画ドキュメント。
 
-- 関連 Issue: [#18 Excel リンクモード（Excel を BOM の正本とし、編集権の受け渡しで同期）](https://github.com/Mega-Gorilla/misumi-bom-manager/issues/18)
+- 関連 Issue: [#18 Excel リンクモード（Excel を BOM の正本とし、アプリは読み取りと EC 列の書き戻しに徹する）](https://github.com/Mega-Gorilla/misumi-bom-manager/issues/18)
 - ステータス: **計画中・未着手**（本ドキュメントの合意 → 技術検証 → 実装）
 
 ## ドキュメント
