@@ -47,7 +47,7 @@ cargo run -- rmw fixtures/rich.xlsx zip-nofco      # 対照: fullCalcOnLoad な�
 pwsh -File lifecycle.ps1                            # 対照実験つき stale→trusted 実 Excel ループ
 
 # --- ステップ3＋3b: 構造変更 PoC / 保持テスト / 環境判定 ---
-pwsh -File gen-mutations.ps1                        # base + 変異体14本（Excel 必要）
+pwsh -File gen-mutations.ps1                        # base + 変異体20本（Excel 必要）
 cargo run -- verify-structure fixtures/mutations    # 期待(ファイル名) vs 判定 → 全PASS / exit 0
 python dump-testbom.py                              # TestBom → TSV（SELECT のみ・gitignore 領域）
 pwsh -File gen-testbom.ps1                          # 準実 BOM 生成
@@ -253,11 +253,11 @@ zip 直編集は**方式**として成立するが、本実装には未対応の
 ## ステップ3＋3b の結果（2026-07-19 実測 / Excel 16.0）
 
 構造変更の3判定（§4.9）・実ファイル保持テスト・環境判定（§4.10）。判定器は純関数として
-`src/structure.rs` に実装し、**Excel 不要の回帰テスト14本**で固定。実測は COM fixture で機械照合。
+`src/structure.rs` に実装し、**Excel 不要の回帰テスト19本**で固定。実測は COM fixture で機械照合。
 
-### (A) 構造変更の3判定 — 変異体 15/15 が期待どおり
+### (A) 構造変更の3判定 — 変異体 21/21 が期待どおり
 
-`gen-mutations.ps1` が base＋14変異体を実 Excel で生成（**ファイル名プレフィクスが期待判定**）。
+`gen-mutations.ps1` が base＋20変異体を実 Excel で生成（**ファイル名プレフィクスが期待判定**）。
 `verify-structure fixtures/mutations` が判定と照合し、**不一致があれば非ゼロ終了**する。
 
 ```
@@ -276,6 +276,8 @@ zip 直編集は**方式**として成立するが、本実装には未対応の
 [ ok ] broken-rename-app-col      Broken("app-owned column 'EC単価' missing or renamed")
 [ ok ] broken-combo-movedhdr-formula  Broken("formula found in app-owned ...")  ← 複合: 移動+数式
 [ ok ] broken-combo-rename-delapp     Broken("app-owned column 'EC単価' ...")   ← 複合: 改名+削除
+[ ok ] broken-combo-rename-formula     Broken("formula found in app-owned ...")  ← 複合: 改名+数式
+[ ok ] broken-combo-rename-dup         Broken("header '型番' appears ...")       ← 複合: 改名+重複
 [ ok ] safe-reorder-sheets            Safe（r:id 経由でないと別シートを読み誤判定）
 [ ok ] warn-headerless-col            Confirm("column G has data but no usable header")
 [PASS] every mutation judged as its file name expects   (exit 0)
@@ -329,7 +331,7 @@ H:\マイドライブ.lnk → C:\GoogleDrive_hahahadesu（NTFS）→ Allow ← �
 ### この PoC が**証明していない**こと
 
 - 変異体は**合成**。3判定の**判定器が仕様どおり動くこと**の証明であり、実運用の多様な編集を
-  網羅したものではない（複合は**2要素×2種**のみ検証。3要素以上・全組合せは未検証）
+  網羅したものではない（複合は**2要素×4種**を検証。3要素以上・全組合せは未検証）
 - **契約は PoC 版**（`(label, ownership)` の連続列前提）。本実装の構造契約（§4.7・DB）は
   **そのままでは移設できない**: 安定キー `ColumnDef.key`・`role`（partNo/source/orderNo1-3）・
   supplier 列の `link.field`・読み飛ばし列・任意の Excel 列位置を持ち、**ヘッダ名は列の恒久的な

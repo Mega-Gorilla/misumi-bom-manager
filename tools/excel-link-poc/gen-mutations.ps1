@@ -124,6 +124,17 @@ New-Mutant 'broken-combo-rename-delapp' {
     $s.Columns('D').Delete() | Out-Null           # AND the app-owned column deleted (Broken)
 }
 
+New-Mutant 'broken-combo-rename-formula' {
+    param($wb, $s)
+    $s.Range('C1').Value2 = '数'                  # user header renamed (Confirm on its own)
+    $s.Range('D3').Formula = '=C3*100'            # AND a formula in the surviving app column (Broken)
+}
+New-Mutant 'broken-combo-rename-dup' {
+    param($wb, $s)
+    $s.Range('C1').Value2 = '数'                  # user header renamed (Confirm on its own)
+    $s.Range('G1').Value2 = '型番'                # AND a duplicated surviving header (Broken)
+}
+
 # ---- sheet reorder (PR #22 review finding 2): order-based part lookup reads the WRONG sheet ----
 New-Mutant 'safe-reorder-sheets' {
     param($wb, $s)

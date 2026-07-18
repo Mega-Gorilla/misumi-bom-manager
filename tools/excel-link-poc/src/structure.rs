@@ -151,9 +151,14 @@ pub fn verify_structure(c: &Contract, sheets: &[(String, SheetObs)]) -> Verdict 
                 *row
             }
             [] => {
-                // Constellation nowhere. Diagnose every missing column on the contract row and
-                // stop: without a resolved header row, position-dependent checks cannot run.
-                diagnose_missing(c, obs.row_labels(c.header_row), &mut brokens, &mut confirms);
+                // Constellation nowhere. Diagnose every missing column on the contract row —
+                // and then KEEP CHECKING what can still be checked on the partially-recognised
+                // row (PR #22 review round 2): a duplicate among the surviving headers or a
+                // formula under a still-unique app column is a Broken and must not hide behind
+                // the rename/disappearance Confirms.
+                let contract_row = obs.row_labels(c.header_row);
+                diagnose_missing(c, contract_row, &mut brokens, &mut confirms);
+                partial_row_checks(c, obs, contract_row, &mut brokens, &mut confirms);
                 return finalize(brokens, confirms, vec![]);
             }
             many => {
@@ -275,6 +280,53 @@ fn col_name(mut col: u32) -> String {
         col = col / 26 - 1;
     }
     s
+}
+
+/// Checks that stay possible on a PARTIALLY recognised contract row (PR #22 review round 2):
+/// the full constellation is gone, but a surviving header can still be duplicated, a still-
+/// unique app-owned column can still hide a formula, and occupied columns without any label
+/// still deserve a Confirm. Without this, those Brokens hid behind diagnose_missing's Confirms.
+fn partial_row_checks(
+    c: &Contract,
+    obs: &SheetObs,
+    row: &[(u32, String)],
+    brokens: &mut Vec<String>,
+    confirms: &mut Vec<String>,
+) {
+    // 1. duplicates among surviving contract headers
+    for (label, _) in c.columns {
+        let count = row.iter().filter(|(_, l)| l == label).count();
+        if count > 1 {
+            brokens.push(format!("header '{label}' appears more than once"));
+        }
+    }
+    // 2. formulas under app-owned columns whose position is still unique
+    for (label, own) in c.columns {
+        if *own != Ownership::App {
+            continue;
+        }
+        if let Some(col) = unique_pos(row, label) {
+            if obs
+                .formulas
+                .iter()
+                .any(|(r, cc)| *r > c.header_row && *cc == col)
+            {
+                brokens.push(format!(
+                    "formula found in app-owned column '{label}' data area"
+                ));
+            }
+        }
+    }
+    // 3. occupied columns with no label at all on the contract row
+    let labelled: BTreeSet<u32> = row.iter().map(|(col, _)| *col).collect();
+    for col in &obs.occupied_cols {
+        if !labelled.contains(col) {
+            confirms.push(format!(
+                "column {} has data but no usable header (empty or unsupported header type)",
+                col_name(*col)
+            ));
+        }
+    }
 }
 
 /// The header constellation exists nowhere. Diagnose EVERY missing column (review finding 1:
@@ -622,6 +674,51 @@ mod tests {
         o.occupied_cols = (0..=6).collect();
         assert!(
             matches!(verify_structure(&C, &book(o)), Verdict::Broken(m) if m.contains("more than once"))
+        );
+    }
+
+    #[test]
+    fn user_rename_with_app_formula_is_broken() {
+        // Review round 2: 数量→数 (rename, Confirm) AND a formula in EC単価's data area
+        // (Broken). EC単価 survives at a unique position, so the formula IS checkable — the
+        // partial-header path previously returned right after diagnose_missing and missed it.
+        let mut o = base_obs();
+        o.labels.insert(
+            1,
+            header(&[
+                (0, "No"),
+                (1, "型番"),
+                (2, "数"),
+                (3, "EC単価"),
+                (4, "小計"),
+                (5, "注文番号"),
+            ]),
+        );
+        o.formulas.push((3, 3)); // formula under the still-unique app column
+        assert!(
+            matches!(verify_structure(&C, &book(o)), Verdict::Broken(m) if m.contains("formula")),
+            "app-column formula must outrank the rename Confirm"
+        );
+    }
+
+    #[test]
+    fn user_rename_with_duplicate_is_broken() {
+        // Review round 2: 数量→数 (rename, Confirm) AND 型番 duplicated (Broken).
+        let mut o = base_obs();
+        let mut hdr = header(&[
+            (0, "No"),
+            (1, "型番"),
+            (2, "数"),
+            (3, "EC単価"),
+            (4, "小計"),
+            (5, "注文番号"),
+        ]);
+        hdr.push((6, "型番".into()));
+        o.labels.insert(1, hdr);
+        o.occupied_cols.insert(6);
+        assert!(
+            matches!(verify_structure(&C, &book(o)), Verdict::Broken(m) if m.contains("more than once")),
+            "duplicate header must outrank the rename Confirm"
         );
     }
 
