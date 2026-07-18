@@ -34,7 +34,7 @@ cargo run -- inspect fixtures/rich.xlsx
 cargo run -- rmw fixtures/rich.xlsx umya   # → out/rich-after-umya.xlsx
 cargo run -- rmw fixtures/rich.xlsx zip    # → out/rich-after-zip.xlsx
 
-# 保持/欠落を表で出す。許可された差分（calcPr のみ）以外があれば非ゼロ終了する
+# 保持/欠落を表で出す。許可された差分（対象セル D2 と calcPr の2変更）以外があれば非ゼロ終了する
 cargo run -- diff fixtures/rich.xlsx out/rich-after-zip.xlsx   # → PASS / exit 0
 cargo run -- diff fixtures/rich.xlsx out/rich-after-umya.xlsx  # → FAIL / exit 1
 
