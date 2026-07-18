@@ -269,17 +269,22 @@ BOM の小計・合計で起きれば**誤発注に直結**する。原因はソ
 
 #### zip 直編集を採用する理由
 
-**触ったのは `xl/worksheets/sheet1.xml` と `xl/workbook.xml` の2パートだけ。残り17パートは
+**書き換えたのは `xl/worksheets/sheet1.xml` と `xl/workbook.xml` の2パートだけ。残り18パートは
 バイト単位でコピー**（`raw_copy_file`）。**触っていないものは原理的に壊れない。**
 
 ```
--- package parts: 20 -> 19 --
-   [LOST] xl/calcChain.xml            ← 意図的に削除（Excel が再構築する）
+-- package parts: 20 -> 20 --   [ ok ] no part lost
 -- workbook.xml --
           before: <calcPr calcId="191029"/>
           after : <calcPr calcId="191029" fullCalcOnLoad="1"/>
 -- xl/worksheets/sheet1.xml --   [ ok ] all markers unchanged
+-- verdict --   [PASS] (exit 0)
 ```
+
+**`calcChain.xml` は保持する。** 当初は削除していたが、それだと `[Content_Types].xml` の Override と
+`xl/_rels/workbook.xml.rels` の Relationship が**存在しないパートを指す不整合パッケージ**になる
+（PR #20 レビュー指摘）。calcChain は数式の**計算順序**であって値ではなく、値セルの更新で順序は
+変わらないため保持して問題ない。`fullCalcOnLoad="1"` で再計算は保証される。
 
 実 Excel での確認（`RepairedRecords: 0`）:
 

@@ -34,13 +34,20 @@ cargo run -- inspect fixtures/rich.xlsx
 cargo run -- rmw fixtures/rich.xlsx umya   # → out/rich-after-umya.xlsx
 cargo run -- rmw fixtures/rich.xlsx zip    # → out/rich-after-zip.xlsx
 
-# 保持/欠落を表で出す
-cargo run -- diff fixtures/rich.xlsx out/rich-after-umya.xlsx
-cargo run -- diff fixtures/rich.xlsx out/rich-after-zip.xlsx
+# 保持/欠落を表で出す。許可された差分（calcPr のみ）以外があれば非ゼロ終了する
+cargo run -- diff fixtures/rich.xlsx out/rich-after-zip.xlsx   # → PASS / exit 0
+cargo run -- diff fixtures/rich.xlsx out/rich-after-umya.xlsx  # → FAIL / exit 1
 ```
 
 `D2`（アプリ所有列 `EC単価` 相当）に `1234` を書く。**`J2` の配列数式は意図的に遠い位置**に置いてあり、
 「書き込み位置から離れたセルが壊れないか」を見る。
+
+`diff` は**許可リスト方式**で、`calcPr` の変化（`fullCalcOnLoad` を意図的に設定）だけを許し、
+それ以外の**パート欠落・ワークシート欠落・数式欠落・`fullCalcOnLoad` 不在**があれば**非ゼロ終了**する。
+これで go/no-go 判定を機械的に回帰確認できる。
+
+**依存は固定**: umya は `=3.0.1`、`zip` は `Cargo.lock`（コミット済み）で実測時のバージョンに固定。
+クリーンチェックアウトで同じ結果が再現する。
 
 ## 既知の結果（2026-07-17 実測 / Excel 16.0 / umya-spreadsheet 3.0.1）
 
@@ -94,8 +101,8 @@ BOM の小計・合計でこれが起きれば**誤発注に直結**する。
 ### zip 直編集の結果
 
 ```
--- package parts: 20 -> 19 --
-   [LOST] xl/calcChain.xml            ← 意図的に削除（Excel が再構築する）
+-- package parts: 20 -> 20 --
+   [ ok ] no part lost
 -- workbook.xml --
    [DIFF] calcPr
           before: <calcPr calcId="191029"/>
@@ -105,7 +112,15 @@ BOM の小計・合計でこれが起きれば**誤発注に直結**する。
 -- xl/worksheets/sheet1.xml --   [ ok ] all markers unchanged
 -- xl/worksheets/sheet2.xml --   [ ok ] all markers unchanged
 -- xl/worksheets/sheet3.xml --   [ ok ] all markers unchanged
+-- verdict --
+   [PASS] no disallowed change (only calcPr may differ)   (exit 0)
 ```
+
+**`calcChain.xml` は保持する。** 当初は削除していたが、それだと `[Content_Types].xml` の Override と
+`xl/_rels/workbook.xml.rels` の Relationship が**存在しないパートを指す不整合パッケージ**になる
+（Excel 16.0 は黙って直すが、他バージョン・LibreOffice・他ライブラリでの整合は保証されない）。
+calcChain は数式の**計算順序**であって値ではなく、値セルの更新で順序は変わらないため保持して問題ない。
+`fullCalcOnLoad="1"` により再計算は保証される。
 
 実 Excel での確認:
 
@@ -119,8 +134,8 @@ Shapes=2 Charts=1 Tables=1 Merged=True ColWidthB=22 Orientation=2 CondFmt=1
 PrintArea=$A$1:$F$8  PrintTitleRows=$1:$1
 ```
 
-**触ったのは `xl/worksheets/sheet1.xml` と `xl/workbook.xml` の2パートだけ。残り17パートはバイト単位でコピー**
-（`raw_copy_file`）。触っていないものは原理的に壊れない。
+**書き換えたのは `xl/worksheets/sheet1.xml` と `xl/workbook.xml` の2パートだけ。残り18パートは
+バイト単位でコピー**（`raw_copy_file`、calcChain.xml を含む）。触っていないものは原理的に壊れない。
 
 ### この PoC が**証明していない**こと
 

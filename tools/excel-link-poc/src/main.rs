@@ -99,7 +99,8 @@ struct Profile {
 impl Profile {
     fn read(path: &Path) -> R<Profile> {
         let f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut zip = zip::ZipArchive::new(f).map_err(|e| format!("{}: not a zip: {e}", path.display()))?;
+        let mut zip =
+            zip::ZipArchive::new(f).map_err(|e| format!("{}: not a zip: {e}", path.display()))?;
         let mut entries = Vec::new();
         let mut sheets = BTreeMap::new();
         let mut formulas = BTreeMap::new();
@@ -125,7 +126,12 @@ impl Profile {
             }
         }
         entries.sort();
-        Ok(Profile { entries, sheets, formulas, workbook_xml })
+        Ok(Profile {
+            entries,
+            sheets,
+            formulas,
+            workbook_xml,
+        })
     }
 
     fn calc_pr(&self) -> String {
@@ -163,7 +169,9 @@ fn extract_formulas(xml: &str) -> Vec<String> {
             continue;
         }
         let after = &rest[gt + 1..];
-        let Some(close) = after.find("</f>") else { break };
+        let Some(close) = after.find("</f>") else {
+            break;
+        };
         let text = after[..close].trim();
         if !text.is_empty() {
             out.push(text.to_string());
@@ -222,14 +230,21 @@ fn cmd_rmw_umya(path: &Path) -> R<()> {
     println!("   in : {}", path.display());
     println!("   out: {}", out.display());
 
-    let mut book = umya_spreadsheet::reader::xlsx::read(path).map_err(|e| format!("read failed: {e:?}"))?;
+    let mut book =
+        umya_spreadsheet::reader::xlsx::read(path).map_err(|e| format!("read failed: {e:?}"))?;
 
     // (2) Can we identify formula cells? This underpins the whole calc-state model (§4.4).
     println!("\n-- formula identification (plan §7 step1 item 2) --");
     let mut seen = 0usize;
-    let names: Vec<String> = book.sheet_collection().iter().map(|s| s.name().to_string()).collect();
+    let names: Vec<String> = book
+        .sheet_collection()
+        .iter()
+        .map(|s| s.name().to_string())
+        .collect();
     for name in names {
-        let sheet = book.sheet_by_name(&name).map_err(|e| format!("{name}: {e:?}"))?;
+        let sheet = book
+            .sheet_by_name(&name)
+            .map_err(|e| format!("{name}: {e:?}"))?;
         for cell in sheet.cells_sorted() {
             if cell.is_formula() {
                 seen += 1;
@@ -259,8 +274,12 @@ fn cmd_rmw_umya(path: &Path) -> R<()> {
     println!("\n-- calcPr / fullCalcOnLoad (plan §7 step1 item 4) --");
     println!("   umya exposes no setter; `diff` will show what actually lands in workbook.xml.");
 
-    umya_spreadsheet::writer::xlsx::write(&book, &out).map_err(|e| format!("write failed: {e:?}"))?;
-    println!("\n   wrote {} bytes", std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0));
+    umya_spreadsheet::writer::xlsx::write(&book, &out)
+        .map_err(|e| format!("write failed: {e:?}"))?;
+    println!(
+        "\n   wrote {} bytes",
+        std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0)
+    );
     Ok(())
 }
 
@@ -355,18 +374,16 @@ fn cmd_rmw_zip(path: &Path) -> R<()> {
 
     let mut copied = 0usize;
     let mut rewritten: Vec<String> = Vec::new();
-    let mut dropped: Vec<String> = Vec::new();
 
+    // calcChain.xml records the *order* in which formulas are computed (the dependency chain),
+    // not their values. Changing a value cell does not change that order, so calcChain stays
+    // valid and we keep it. Dropping it would leave dangling references in
+    // [Content_Types].xml (Override) and xl/_rels/workbook.xml.rels (Relationship) unless those
+    // are also edited — an inconsistent OPC package. Keeping it avoids that entirely, and
+    // fullCalcOnLoad="1" (set below) still forces a full recalc on open.
     for i in 0..zin.len() {
         let mut e = zin.by_index(i).map_err(|e| e.to_string())?;
         let name = e.name().to_string();
-
-        // calcChain maps formulas to a computation order. After changing a value it is stale;
-        // Excel rebuilds it. Keeping a stale one is riskier than dropping it.
-        if name == "xl/calcChain.xml" {
-            dropped.push(name);
-            continue;
-        }
 
         if name == part || name == "xl/workbook.xml" {
             let mut s = String::new();
@@ -389,11 +406,13 @@ fn cmd_rmw_zip(path: &Path) -> R<()> {
     zout.finish().map_err(|e| e.to_string())?;
 
     println!("   rewritten: {rewritten:?}");
-    println!("   dropped  : {dropped:?}  (Excel rebuilds calcChain)");
-    println!("   copied verbatim: {copied} parts");
+    println!("   copied verbatim: {copied} parts (incl. calcChain.xml — kept for OPC consistency)");
     println!("\n   set {TARGET_SHEET}!{TARGET_CELL} = {TARGET_VALUE}");
     println!("   set calcPr fullCalcOnLoad=\"1\"");
-    println!("\n   wrote {} bytes", std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0));
+    println!(
+        "\n   wrote {} bytes",
+        std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0)
+    );
     Ok(())
 }
 
@@ -405,15 +424,35 @@ fn cmd_diff(before: &Path, after: &Path) -> R<()> {
     println!("   before: {}", before.display());
     println!("   after : {}", after.display());
 
+    // Violations are anything the surgical edit must NOT do. The only tolerated change is calcPr
+    // (we deliberately set fullCalcOnLoad). Everything else — a lost part, a lost worksheet, a
+    // lost formula, a numeric cell turned into text, or fullCalcOnLoad missing — is a failure.
+    // Collected here so the command can exit non-zero (reviewer #3): a green diff becomes a
+    // machine-checkable go/no-go, not just a wall of text.
+    let mut violations: Vec<String> = Vec::new();
+
     // 1. package parts
-    let lost: Vec<_> = a.entries.iter().filter(|e| !b.entries.contains(e)).collect();
-    let added: Vec<_> = b.entries.iter().filter(|e| !a.entries.contains(e)).collect();
-    println!("\n-- package parts: {} -> {} --", a.entries.len(), b.entries.len());
+    let lost: Vec<_> = a
+        .entries
+        .iter()
+        .filter(|e| !b.entries.contains(e))
+        .collect();
+    let added: Vec<_> = b
+        .entries
+        .iter()
+        .filter(|e| !a.entries.contains(e))
+        .collect();
+    println!(
+        "\n-- package parts: {} -> {} --",
+        a.entries.len(),
+        b.entries.len()
+    );
     if lost.is_empty() {
         println!("   [ ok ] no part lost");
     } else {
         for e in &lost {
             println!("   [LOST] {e}");
+            violations.push(format!("part lost: {e}"));
         }
     }
     for e in &added {
@@ -422,19 +461,26 @@ fn cmd_diff(before: &Path, after: &Path) -> R<()> {
 
     // 2. workbook-level
     println!("\n-- workbook.xml --");
-    verdict("calcPr", &a.calc_pr(), &b.calc_pr());
+    verdict("calcPr", &a.calc_pr(), &b.calc_pr()); // allowed to differ (fullCalcOnLoad)
     let has_fco = b.calc_pr().contains("fullCalcOnLoad");
     println!(
         "   {} fullCalcOnLoad present in output: {}",
         if has_fco { "[ ok ]" } else { "[FAIL]" },
         has_fco
     );
+    if !has_fco {
+        violations.push("fullCalcOnLoad not set in output".into());
+    }
     num("definedName", a.defined_names(), b.defined_names());
+    if b.defined_names() < a.defined_names() {
+        violations.push("definedName count dropped".into());
+    }
 
     // 3. per sheet
     for (name, ma) in &a.sheets {
         let Some(mb) = b.sheets.get(name) else {
             println!("\n-- {name} --\n   [LOST] worksheet part missing in output");
+            violations.push(format!("worksheet lost: {name}"));
             continue;
         };
         println!("\n-- {name} --");
@@ -444,20 +490,33 @@ fn cmd_diff(before: &Path, after: &Path) -> R<()> {
         for ((label, na), (_, nb)) in ma.rows().into_iter().zip(mb.rows()) {
             if na != nb {
                 num(label, na, nb);
+                if nb < na {
+                    violations.push(format!("{name}: {} dropped ({na} -> {nb})", label.trim()));
+                }
             }
         }
         let fa = a.formulas.get(name).cloned().unwrap_or_default();
         let fb = b.formulas.get(name).cloned().unwrap_or_default();
-        let gone: Vec<_> = fa.iter().filter(|f| !fb.contains(f)).collect();
-        let new: Vec<_> = fb.iter().filter(|f| !fa.contains(f)).collect();
-        for f in gone {
+        for f in fa.iter().filter(|f| !fb.contains(f)) {
             println!("   [LOST] formula: {f}");
+            violations.push(format!("{name}: formula lost: {f}"));
         }
-        for f in new {
+        for f in fb.iter().filter(|f| !fa.contains(f)) {
             println!("   [ +  ] formula: {f}");
         }
     }
-    Ok(())
+
+    println!("\n-- verdict --");
+    if violations.is_empty() {
+        println!("   [PASS] no disallowed change (only calcPr may differ)");
+        Ok(())
+    } else {
+        println!("   [FAIL] {} violation(s):", violations.len());
+        for v in &violations {
+            println!("      - {v}");
+        }
+        Err(format!("{} violation(s) — see above", violations.len()))
+    }
 }
 
 fn num(label: &str, a: usize, b: usize) {

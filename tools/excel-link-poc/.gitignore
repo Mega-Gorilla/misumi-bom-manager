@@ -2,5 +2,5 @@
 fixtures/
 out/
 target/
-Cargo.lock
 *.log
+# Cargo.lock IS committed (investigation binary) so the pinned versions reproduce.
