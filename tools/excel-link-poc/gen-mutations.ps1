@@ -111,6 +111,35 @@ New-Mutant 'broken-del-sheet' {
 New-Mutant 'broken-formula-in-app-col' { param($wb, $s) $s.Range('D3').Formula = '=C3*100' }
 New-Mutant 'broken-rename-app-col' { param($wb, $s) $s.Range('D1').Value2 = '単価' }
 
+# ---- compound mutations (PR #22 review finding 1): Broken must outrank Confirm ----
+New-Mutant 'broken-combo-movedhdr-formula' {
+    param($wb, $s)
+    $s.Rows(1).Insert(-4121) | Out-Null           # header row moves down (Confirm on its own)
+    $s.Range('A1').Value2 = 'メモ: 部品表'
+    $s.Range('D4').Formula = '=C4*100'            # AND a formula in the app-owned column (Broken)
+}
+New-Mutant 'broken-combo-rename-delapp' {
+    param($wb, $s)
+    $s.Range('C1').Value2 = '数'                  # user header renamed (Confirm on its own)
+    $s.Columns('D').Delete() | Out-Null           # AND the app-owned column deleted (Broken)
+}
+
+# ---- sheet reorder (PR #22 review finding 2): order-based part lookup reads the WRONG sheet ----
+New-Mutant 'safe-reorder-sheets' {
+    param($wb, $s)
+    # A new sheet BEFORE 'BOM': workbook.xml order changes but sheetN.xml names do not, so only
+    # relationship-based resolution still finds the right XML. Verdict must stay Safe.
+    $other = $wb.Worksheets.Add($wb.Worksheets.Item(1))
+    $other.Name = 'Cover'
+    $other.Range('A1').Value2 = '表紙'
+}
+
+# ---- headerless data column (PR #22 review finding 4) ----
+New-Mutant 'warn-headerless-col' {
+    param($wb, $s)
+    $s.Range('G3').Value2 = 999                   # data in G, no header in G1
+}
+
 $xl.Quit()
 [System.Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
 Write-Output 'done'

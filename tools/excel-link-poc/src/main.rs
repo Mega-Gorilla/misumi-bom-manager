@@ -483,39 +483,64 @@ fn patch_calc_pr(xml: &str) -> String {
     }
 }
 
-/// Map "BOM" to its sheetN.xml part, via workbook.xml order (sheet order == sheetN order for
-/// files Excel writes; a real implementation must follow the r:id relationships instead).
-fn sheet_part_for(zip: &mut zip::ZipArchive<File>, sheet_name: &str) -> R<String> {
+/// Every (sheet name, worksheet part path), resolved the OOXML-correct way:
+/// workbook.xml <sheet r:id="rIdN"> → xl/_rels/workbook.xml.rels → Target. Sheet ORDER in
+/// workbook.xml does NOT determine sheetN.xml numbering (PR #22 review finding 2) — after a
+/// sheet insert/reorder in Excel the two diverge, and an order-based lookup reads the wrong XML.
+fn sheet_parts(zip: &mut zip::ZipArchive<File>) -> R<Vec<(String, String)>> {
     let mut wb = String::new();
     zip.by_name("xl/workbook.xml")
         .map_err(|e| e.to_string())?
         .read_to_string(&mut wb)
         .map_err(|e| e.to_string())?;
-    let idx = wb
-        .match_indices("<sheet ")
-        .position(|(i, _)| {
-            let tag_end = wb[i..].find("/>").map(|j| i + j).unwrap_or(wb.len());
-            wb[i..tag_end].contains(&format!("name=\"{sheet_name}\""))
-        })
-        .ok_or_else(|| format!("sheet {sheet_name} not in workbook.xml"))?;
-    Ok(format!("xl/worksheets/sheet{}.xml", idx + 1))
-}
+    let mut rels = String::new();
+    zip.by_name("xl/_rels/workbook.xml.rels")
+        .map_err(|e| e.to_string())?
+        .read_to_string(&mut rels)
+        .map_err(|e| e.to_string())?;
 
-/// Sheet names in workbook order (same sheet-order assumption as `sheet_part_for`).
-fn sheet_names(zip: &mut zip::ZipArchive<File>) -> R<Vec<String>> {
-    let mut wb = String::new();
-    zip.by_name("xl/workbook.xml")
-        .map_err(|e| e.to_string())?
-        .read_to_string(&mut wb)
-        .map_err(|e| e.to_string())?;
-    let mut names = Vec::new();
-    for (i, _) in wb.match_indices("<sheet ") {
-        let tag_end = wb[i..].find("/>").map(|j| i + j).unwrap_or(wb.len());
-        if let Some(n) = slice_between(&wb[i..tag_end], "name=\"", "\"") {
-            names.push(n.to_string());
+    // rId -> Target map from the rels part.
+    let mut targets: BTreeMap<String, String> = BTreeMap::new();
+    for (i, _) in rels.match_indices("<Relationship ") {
+        let end = rels[i..].find("/>").map(|j| i + j).unwrap_or(rels.len());
+        let tag = &rels[i..end];
+        if let (Some(id), Some(target)) = (
+            slice_between(tag, "Id=\"", "\""),
+            slice_between(tag, "Target=\"", "\""),
+        ) {
+            targets.insert(id.to_string(), target.trim_start_matches('/').to_string());
         }
     }
-    Ok(names)
+
+    let mut out = Vec::new();
+    for (i, _) in wb.match_indices("<sheet ") {
+        let end = wb[i..].find("/>").map(|j| i + j).unwrap_or(wb.len());
+        let tag = &wb[i..end];
+        let name = slice_between(tag, "name=\"", "\"");
+        // The attribute is `r:id="rIdN"` — match on `r:id="` to not confuse it with sheetId=.
+        let rid = slice_between(tag, "r:id=\"", "\"");
+        if let (Some(name), Some(rid)) = (name, rid) {
+            let target = targets
+                .get(rid)
+                .ok_or_else(|| format!("relationship {rid} for sheet '{name}' not found"))?;
+            let part = if target.starts_with("xl/") {
+                target.clone()
+            } else {
+                format!("xl/{target}")
+            };
+            out.push((name.to_string(), part));
+        }
+    }
+    Ok(out)
+}
+
+/// Worksheet part for one sheet name (relationship-resolved).
+fn sheet_part_for(zip: &mut zip::ZipArchive<File>, sheet_name: &str) -> R<String> {
+    sheet_parts(zip)?
+        .into_iter()
+        .find(|(n, _)| n == sheet_name)
+        .map(|(_, p)| p)
+        .ok_or_else(|| format!("sheet {sheet_name} not in workbook.xml"))
 }
 
 // ---- structure verdict (plan §4.9, step 3) -----------------------------------------------
@@ -542,24 +567,26 @@ fn observe_workbook(path: &Path) -> R<Vec<(String, structure::SheetObs)>> {
     let ss = stale_scan::shared_strings(path);
     let f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut zip = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
-    let names = sheet_names(&mut zip)?;
+    let parts = sheet_parts(&mut zip)?; // relationship-resolved (review finding 2)
 
     let mut out = Vec::new();
-    for (i, name) in names.iter().enumerate() {
-        let part = format!("xl/worksheets/sheet{}.xml", i + 1);
+    for (name, part) in parts {
         let mut xml = String::new();
         match zip.by_name(&part) {
             Ok(mut e) => e.read_to_string(&mut xml).map_err(|e| e.to_string())?,
             Err(_) => 0, // sheet part absent — leave the observation empty
         };
         let mut obs = structure::SheetObs::default();
-        for (cell_ref, has_formula, ss_idx) in stale_scan::cells(&xml) {
+        for (cell_ref, has_formula, has_content, ss_idx) in stale_scan::cells(&xml) {
             let Some((row0, col0)) = state::parse_cell(&cell_ref) else {
                 continue;
             };
             let row = row0 + 1; // SheetObs rows are 1-based like the contract's header_row
             if has_formula {
                 obs.formulas.push((row, col0));
+            }
+            if has_content {
+                obs.occupied_cols.insert(col0);
             }
             if let Some(label) = ss_idx.and_then(|i| ss.get(i)) {
                 obs.labels
@@ -568,7 +595,7 @@ fn observe_workbook(path: &Path) -> R<Vec<(String, structure::SheetObs)>> {
                     .push((col0, label.clone()));
             }
         }
-        out.push((name.clone(), obs));
+        out.push((name, obs));
     }
     Ok(out)
 }

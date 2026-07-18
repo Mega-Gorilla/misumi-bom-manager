@@ -61,7 +61,8 @@ AssertEq 'junction resolves to the same real path' $viaJunc $realResolved
 $sym = Join-Path $envRoot 'sym'
 $symOk = $true
 try {
-    cmd /c "mklink /D `"$sym`" `"$(Join-Path $envRoot 'real')`"" 2>&1 | Out-Null
+    # New-Item works for non-admins when developer mode is on; mklink always demands admin.
+    New-Item -ItemType SymbolicLink -Path $sym -Target (Join-Path $envRoot 'real') -ErrorAction Stop | Out-Null
     if (-not (Test-Path (Join-Path $sym 'bom.xlsx'))) { throw 'symlink not usable' }
 } catch { $symOk = $false }
 if ($symOk) {

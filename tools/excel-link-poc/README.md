@@ -274,6 +274,10 @@ zip 直編集は**方式**として成立するが、本実装には未対応の
 [ ok ] broken-del-sheet           Broken("target sheet 'BOM' deleted")
 [ ok ] broken-formula-in-app-col  Broken("formula found in app-owned column 'EC単価' data area")
 [ ok ] broken-rename-app-col      Broken("app-owned column 'EC単価' missing or renamed")
+[ ok ] broken-combo-movedhdr-formula  Broken("formula found in app-owned ...")  ← 複合: 移動+数式
+[ ok ] broken-combo-rename-delapp     Broken("app-owned column 'EC単価' ...")   ← 複合: 改名+削除
+[ ok ] safe-reorder-sheets            Safe（r:id 経由でないと別シートを読み誤判定）
+[ ok ] warn-headerless-col            Confirm("column G has data but no usable header")
 [PASS] every mutation judged as its file name expects   (exit 0)
 ```
 
@@ -318,11 +322,19 @@ H:\マイドライブ.lnk → C:\GoogleDrive_hahahadesu（NTFS）→ Allow ← �
 **ドライブ文字のハードコードなし**に、入口（仮想 FS）と実体（NTFS）を判別できた。Drive へは
 **読み取りのみ**（書き込み・ファイル作成は一切していない）。
 
+**3b は部分完了**: junction / `.lnk` は成立、**symlink は本環境で作成権限がなく未検証**
+（`New-Item -ItemType SymbolicLink` も管理者権限を要求 = 開発者モード無効。junction と同じ
+`canonicalize` 経路なので同挙動の見込みだが、実測は開発者モード環境が用意でき次第）。
+
 ### この PoC が**証明していない**こと
 
-- 変異体は**合成**。3判定の**判定器が仕様どおり動くこと**の証明であり、実運用の多様な編集
-  （複合変異・部分編集）を網羅したものではない
-- 契約は Rust 定数（PoC）。本実装は §4.7 の構造契約（DB）から供給する
+- 変異体は**合成**。3判定の**判定器が仕様どおり動くこと**の証明であり、実運用の多様な編集を
+  網羅したものではない（複合は**2要素×2種**のみ検証。3要素以上・全組合せは未検証）
+- **契約は PoC 版**（`(label, ownership)` の連続列前提）。本実装の構造契約（§4.7・DB）は
+  **そのままでは移設できない**: 安定キー `ColumnDef.key`・`role`（partNo/source/orderNo1-3）・
+  supplier 列の `link.field`・読み飛ばし列・任意の Excel 列位置を持ち、**ヘッダ名は列の恒久的な
+  識別子ではなく「最後に確認した表示名」**として扱う必要がある。移設できるのは**判定の骨格**
+  （異常収集・Broken>Confirm>Safe・fail closed）
 - ヘッダ検出は**共有文字列のみ**（inlineStr のヘッダは未対応。Excel 保存ファイルでは通常 sharedStrings）
 - **symlink 経由は未検証**（権限）。junction/.lnk と同じ `canonicalize` 経路なので同挙動の見込みだが実測なし
 - 準実 BOM は TestBom（4行）ベース。大規模 BOM・実務ファイルそのものは未検証
