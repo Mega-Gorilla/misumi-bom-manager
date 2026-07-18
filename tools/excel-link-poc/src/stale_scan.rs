@@ -64,7 +64,7 @@ fn read_parts(path: &Path) -> R<(String, String)> {
 }
 
 /// Column letters from an A1 ref ("D2" → "D", "AA10" → "AA").
-fn col_letters(cell_ref: &str) -> String {
+pub(crate) fn col_letters(cell_ref: &str) -> String {
     cell_ref
         .chars()
         .take_while(|c| c.is_ascii_uppercase())
@@ -72,7 +72,7 @@ fn col_letters(cell_ref: &str) -> String {
 }
 
 /// Row number from an A1 ref ("D2" → 2).
-fn row_num(cell_ref: &str) -> Option<u32> {
+pub(crate) fn row_num(cell_ref: &str) -> Option<u32> {
     cell_ref
         .chars()
         .skip_while(|c| c.is_ascii_uppercase())
@@ -81,9 +81,10 @@ fn row_num(cell_ref: &str) -> Option<u32> {
         .ok()
 }
 
-/// Every `<c r="REF" ...>...</c>` as (ref, has_formula, shared_string_index?). Inline enough for
-/// the PoC; the shared-string index lets us resolve header text.
-fn cells(sheet_xml: &str) -> Vec<(String, bool, Option<usize>)> {
+/// Every `<c r="REF" ...>...</c>` as (ref, has_formula, has_content, shared_string_index?).
+/// `has_content` is true when the cell carries a value or formula — style-only cells (e.g. the
+/// blank remainder of a merge) do NOT count, so "occupied column" detection is not fooled.
+pub(crate) fn cells(sheet_xml: &str) -> Vec<(String, bool, bool, Option<usize>)> {
     let mut out = Vec::new();
     let mut rest = sheet_xml;
     while let Some(i) = rest.find("<c ") {
@@ -105,13 +106,15 @@ fn cells(sheet_xml: &str) -> Vec<(String, bool, Option<usize>)> {
         };
         let body = &rest[gt + 1..body_end.saturating_sub(4).max(gt + 1)];
         let has_formula = !self_closing && body.contains("<f");
+        let has_content =
+            !self_closing && (has_formula || body.contains("<v>") || body.contains("<is>"));
         let ss_idx = if is_str {
             super::slice_between_pub(body, "<v>", "</v>").and_then(|v| v.parse().ok())
         } else {
             None
         };
         if !r.is_empty() {
-            out.push((r, has_formula, ss_idx));
+            out.push((r, has_formula, has_content, ss_idx));
         }
         rest = &rest[body_end..];
     }
@@ -119,7 +122,7 @@ fn cells(sheet_xml: &str) -> Vec<(String, bool, Option<usize>)> {
 }
 
 /// Resolve shared strings (index → text) from xl/sharedStrings.xml.
-fn shared_strings(path: &Path) -> Vec<String> {
+pub(crate) fn shared_strings(path: &Path) -> Vec<String> {
     let Ok(f) = File::open(path) else {
         return Vec::new();
     };
@@ -163,13 +166,13 @@ fn classify(sheet_xml: &str, ss: &[String]) -> (u32, usize, usize, Vec<(String, 
     // Header row = the lowest row number present. BOM fixtures use row 1.
     let header_row = cells
         .iter()
-        .filter_map(|(r, _, _)| row_num(r))
+        .filter_map(|(r, _, _, _)| row_num(r))
         .min()
         .unwrap_or(1);
 
     // Map column letters → business role, by matching the header cell text.
     let mut col_role: BTreeMap<String, (String, String)> = BTreeMap::new(); // col -> (label, role)
-    for (r, _, ss_idx) in &cells {
+    for (r, _, _, ss_idx) in &cells {
         if row_num(r) != Some(header_row) {
             continue;
         }
@@ -189,7 +192,7 @@ fn classify(sheet_xml: &str, ss: &[String]) -> (u32, usize, usize, Vec<(String, 
     // not data the business logic consumes.
     let mut formula_cells = 0usize;
     let mut biz: BTreeMap<String, (String, String, usize)> = BTreeMap::new(); // col -> (label,role,count)
-    for (r, has_formula, _) in &cells {
+    for (r, has_formula, _, _) in &cells {
         if !has_formula {
             continue;
         }
