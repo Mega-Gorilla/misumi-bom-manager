@@ -147,6 +147,28 @@ pub fn write_blocked(targets: &[&str], spill_ranges: &[&str], unresolved: bool) 
     false
 }
 
+// ---- link-time environment decision (§4.10, step 3b) -------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkDecision {
+    /// Real path resolved onto a local NTFS volume: link + write-back allowed.
+    Allow,
+    /// Anything else — unresolved path, virtual/streaming FS (e.g. the FAT32-reporting Drive
+    /// entry drive), unknown FS: warn, and MVP forbids write-back (read-only link or refusal).
+    WarnNoWriteBack,
+}
+
+/// §4.10 as a pure function: never hardcode drive letters; judge by the RESOLVED location's
+/// file system. `resolved=false` means canonicalize failed or the .lnk chain could not be
+/// followed — fail closed.
+pub fn link_allowed(fs_name: &str, resolved: bool) -> LinkDecision {
+    if resolved && fs_name.eq_ignore_ascii_case("NTFS") {
+        LinkDecision::Allow
+    } else {
+        LinkDecision::WarnNoWriteBack
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +291,23 @@ mod tests {
     fn block_when_range_unparseable() {
         // A spill range we cannot parse (e.g. cross-sheet) must not be assumed safe.
         assert!(write_blocked(&["D2"], &["Sheet2!A1:A3"], false));
+    }
+
+    // ---- link_allowed (§4.10) ----
+
+    #[test]
+    fn ntfs_resolved_is_allowed() {
+        assert_eq!(link_allowed("NTFS", true), LinkDecision::Allow);
+        assert_eq!(link_allowed("ntfs", true), LinkDecision::Allow); // case-insensitive
+    }
+
+    #[test]
+    fn everything_else_fails_closed() {
+        // The Drive entry drive reports FAT32 (§3.6) — that is a virtual doorway, not a place
+        // to write a master BOM.
+        assert_eq!(link_allowed("FAT32", true), LinkDecision::WarnNoWriteBack);
+        assert_eq!(link_allowed("NTFS", false), LinkDecision::WarnNoWriteBack);
+        assert_eq!(link_allowed("", true), LinkDecision::WarnNoWriteBack);
+        assert_eq!(link_allowed("ReFS", true), LinkDecision::WarnNoWriteBack);
     }
 }

@@ -45,6 +45,15 @@ cargo run -- check-write fixtures/scenario-B.xlsx B2  # 数式セルへの書き
 cargo run -- check-write fixtures/rich.xlsx J6        # スピル範囲との交差 → BLOCK
 cargo run -- rmw fixtures/rich.xlsx zip-nofco      # 対照: fullCalcOnLoad なしの書き込み
 pwsh -File lifecycle.ps1                            # 対照実験つき stale→trusted 実 Excel ループ
+
+# --- ステップ3＋3b: 構造変更 PoC / 保持テスト / 環境判定 ---
+pwsh -File gen-mutations.ps1                        # base + 変異体14本（Excel 必要）
+cargo run -- verify-structure fixtures/mutations    # 期待(ファイル名) vs 判定 → 全PASS / exit 0
+python dump-testbom.py                              # TestBom → TSV（SELECT のみ・gitignore 領域）
+pwsh -File gen-testbom.ps1                          # 準実 BOM 生成
+cargo run -- rmw fixtures/testbom.xlsx zip H2       # EC単価列へ書き込み（セル引数化）
+cargo run -- diff fixtures/testbom.xlsx out/testbom-after-zip.xlsx H2   # PASS / exit 0
+pwsh -File check-env.ps1                            # junction/.lnk/Drive入口の環境判定（読み取りのみ）
 ```
 
 `D2`（アプリ所有列 `EC単価` 相当）に `1234` を書く。**`J2` の配列数式は意図的に遠い位置**に置いてあり、
@@ -240,6 +249,85 @@ zip 直編集は**方式**として成立するが、本実装には未対応の
   第三者ツールが再計算せず保存した場合を区別できない）。実用上の妥協として受け入れる
 - lifecycle の対照実験は **Excel 16.0・自動計算モードでの結果**。他バージョンの「開くだけで
   再計算しない」挙動が同一かは未確認（`fullCalcOnLoad` を立てる限り実害はない）
+
+## ステップ3＋3b の結果（2026-07-19 実測 / Excel 16.0）
+
+構造変更の3判定（§4.9）・実ファイル保持テスト・環境判定（§4.10）。判定器は純関数として
+`src/structure.rs` に実装し、**Excel 不要の回帰テスト14本**で固定。実測は COM fixture で機械照合。
+
+### (A) 構造変更の3判定 — 変異体 15/15 が期待どおり
+
+`gen-mutations.ps1` が base＋14変異体を実 Excel で生成（**ファイル名プレフィクスが期待判定**）。
+`verify-structure fixtures/mutations` が判定と照合し、**不一致があれば非ゼロ終了**する。
+
+```
+[ ok ] base                       Safe { new_user_columns: [] }
+[ ok ] safe-add-row / safe-del-row / safe-reorder-rows    Safe（行編集はヘッダに影響しない）
+[ ok ] safe-new-user-col          Safe { new_user_columns: ["備考"] }
+[ ok ] warn-move-col              Confirm("app-owned column moved (with: 数量, EC単価, 小計)")
+[ ok ] warn-rename-header         Confirm("header renamed? '数量' -> '数'")
+[ ok ] warn-rename-sheet          Confirm("target sheet renamed to 'BOM2'")
+[ ok ] warn-move-header-row       Confirm("header row moved: row 1 -> row 2")
+[ ok ] warn-move-app-col          Confirm("app-owned column moved ...")
+[ ok ] broken-del-required-col    Broken("required column '型番' missing")
+[ ok ] broken-dup-header          Broken("header '型番' appears more than once")
+[ ok ] broken-del-sheet           Broken("target sheet 'BOM' deleted")
+[ ok ] broken-formula-in-app-col  Broken("formula found in app-owned column 'EC単価' data area")
+[ ok ] broken-rename-app-col      Broken("app-owned column 'EC単価' missing or renamed")
+[PASS] every mutation judged as its file name expects   (exit 0)
+```
+
+行の増減・並べ替えは判定に**関与しない**（ヘッダが Safe なら現在行から再構築 — §4.5/§4.9 どおり）。
+ユーザー列の数式（小計）は許容され、**アプリ所有列の数式だけが Broken** になることも確認。
+
+### (B) 実ファイル保持テスト — 準実 BOM（TestBom 実データ＋リッチ要素）
+
+`dump-testbom.py`（**SELECT のみ**）が DB から TestBom（実 MISUMI 型番・4行）を TSV へ、
+`gen-testbom.ps1` が COM でリッチ要素（数式・別シート VLOOKUP・スピル・テーブル・条件付き書式・
+結合セル・図形・グラフ・印刷設定）を重ねて生成。**完全な実務ファイルではない**（TestBom データ＋合成）。
+
+`rmw zip H2`（EC単価列）→ `diff H2` → **PASS / exit 0（18パートがバイト一致）**。実 Excel で全 assert:
+
+```
+RepairedRecords=0  H2=1234  I2(=C2*H2)=1234  I7(=SUM)=2434  K2(VLOOKUP)=webview
+UNIQUE spill=3  Shapes=2 Charts=1 Merged=True CondFmt=1 Ref table=1
+```
+
+書き込みガードも準実 BOM で機能: `H2`（値セル）→許可、`I2`（小計の数式）→**BLOCK**。
+
+> 教訓（fixture 生成で2件のバグを踏んだ）: ① PS のパイプラインは配列を**フラット化**する
+> （`ForEach-Object { $_ -split ... }` → 単項カンマ `,()` で防ぐ）。② TSV の数値を文字列のまま
+> セルに入れると数式が **#VALUE!** で保存される。**生成後に before 側を assert で検証**してから
+> 保持テストへ進む手順にした（壊れた before では保持テストが無意味なため）。
+
+### (C) 環境判定（§4.10）— 実体解決とfail closed の判定
+
+`resolve`（`canonicalize`）＋ `decide`（判定の権威は Rust の `link_allowed`）＋ `check-env.ps1`（実測）:
+
+```
+junction 経由      → 同一実体パスへ解決 [ok]
+.lnk 経由          → 同一実体パスへ解決 [ok]
+symlink            → [untested]（開発者モード/管理者が必要なため。失敗ではなく未検証と記録）
+ローカル NTFS 実体  → Allow
+未解決パス          → WarnNoWriteBack（fail closed）
+FAT32              → WarnNoWriteBack
+Google Drive 入口 H:\（FS=FAT32 を報告） → WarnNoWriteBack   ← 仮想入口は拒否
+H:\マイドライブ.lnk → C:\GoogleDrive_hahahadesu（NTFS）→ Allow ← 実体は許可
+```
+
+**ドライブ文字のハードコードなし**に、入口（仮想 FS）と実体（NTFS）を判別できた。Drive へは
+**読み取りのみ**（書き込み・ファイル作成は一切していない）。
+
+### この PoC が**証明していない**こと
+
+- 変異体は**合成**。3判定の**判定器が仕様どおり動くこと**の証明であり、実運用の多様な編集
+  （複合変異・部分編集）を網羅したものではない
+- 契約は Rust 定数（PoC）。本実装は §4.7 の構造契約（DB）から供給する
+- ヘッダ検出は**共有文字列のみ**（inlineStr のヘッダは未対応。Excel 保存ファイルでは通常 sharedStrings）
+- **symlink 経由は未検証**（権限）。junction/.lnk と同じ `canonicalize` 経路なので同挙動の見込みだが実測なし
+- 準実 BOM は TestBom（4行）ベース。大規模 BOM・実務ファイルそのものは未検証
+  （実務 BOM「YUBI Glove Assy_BOM」が DB にあり、同じコマンドで検証可能 — 実行は別途判断）
+- §7.2 の「定義名・テーブルの追跡手段」「backup 別ボリューム挙動」は未実測（オプション扱い）
 
 ## 注意
 

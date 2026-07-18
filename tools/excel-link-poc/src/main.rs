@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 mod stale_scan;
 mod state;
+mod structure;
 
 type R<T> = Result<T, String>;
 
@@ -500,10 +501,167 @@ fn sheet_part_for(zip: &mut zip::ZipArchive<File>, sheet_name: &str) -> R<String
     Ok(format!("xl/worksheets/sheet{}.xml", idx + 1))
 }
 
+/// Sheet names in workbook order (same sheet-order assumption as `sheet_part_for`).
+fn sheet_names(zip: &mut zip::ZipArchive<File>) -> R<Vec<String>> {
+    let mut wb = String::new();
+    zip.by_name("xl/workbook.xml")
+        .map_err(|e| e.to_string())?
+        .read_to_string(&mut wb)
+        .map_err(|e| e.to_string())?;
+    let mut names = Vec::new();
+    for (i, _) in wb.match_indices("<sheet ") {
+        let tag_end = wb[i..].find("/>").map(|j| i + j).unwrap_or(wb.len());
+        if let Some(n) = slice_between(&wb[i..tag_end], "name=\"", "\"") {
+            names.push(n.to_string());
+        }
+    }
+    Ok(names)
+}
+
+// ---- structure verdict (plan §4.9, step 3) -----------------------------------------------
+
+/// The contract for the gen-mutations.ps1 base workbook. PoC-only: the real implementation
+/// stores this per linked BOM in the DB (§4.7).
+const POC_CONTRACT: structure::Contract = structure::Contract {
+    sheet: "BOM",
+    header_row: 1,
+    columns: &[
+        ("No", structure::Ownership::User),
+        ("型番", structure::Ownership::User),
+        ("数量", structure::Ownership::User),
+        ("EC単価", structure::Ownership::App),
+        ("小計", structure::Ownership::User),
+        ("注文番号", structure::Ownership::User),
+    ],
+    required: &["型番", "数量"],
+};
+
+/// Build the observation for every worksheet: string-cell labels per row plus formula positions.
+/// Reuses the stale_scan XML walkers so the structure checker sees exactly what the scanner sees.
+fn observe_workbook(path: &Path) -> R<Vec<(String, structure::SheetObs)>> {
+    let ss = stale_scan::shared_strings(path);
+    let f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
+    let names = sheet_names(&mut zip)?;
+
+    let mut out = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let part = format!("xl/worksheets/sheet{}.xml", i + 1);
+        let mut xml = String::new();
+        match zip.by_name(&part) {
+            Ok(mut e) => e.read_to_string(&mut xml).map_err(|e| e.to_string())?,
+            Err(_) => 0, // sheet part absent — leave the observation empty
+        };
+        let mut obs = structure::SheetObs::default();
+        for (cell_ref, has_formula, ss_idx) in stale_scan::cells(&xml) {
+            let Some((row0, col0)) = state::parse_cell(&cell_ref) else {
+                continue;
+            };
+            let row = row0 + 1; // SheetObs rows are 1-based like the contract's header_row
+            if has_formula {
+                obs.formulas.push((row, col0));
+            }
+            if let Some(label) = ss_idx.and_then(|i| ss.get(i)) {
+                obs.labels
+                    .entry(row)
+                    .or_default()
+                    .push((col0, label.clone()));
+            }
+        }
+        out.push((name.clone(), obs));
+    }
+    Ok(out)
+}
+
+fn verdict_of(path: &Path) -> R<structure::Verdict> {
+    let sheets = observe_workbook(path)?;
+    Ok(structure::verify_structure(&POC_CONTRACT, &sheets))
+}
+
+/// verify-structure <xlsx|dir>. For a directory, every *.xlsx is judged against the expectation
+/// encoded in its file name prefix (safe- / warn- / broken-); any mismatch exits non-zero, so
+/// the fixture sweep is a machine check, not a wall of text to eyeball.
+fn cmd_verify_structure(path: &Path) -> R<()> {
+    if path.is_file() {
+        let v = verdict_of(path)?;
+        println!("== verify-structure {} ==\n   {v:?}", path.display());
+        return Ok(());
+    }
+
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "xlsx"))
+        .collect();
+    entries.sort();
+    if entries.is_empty() {
+        return Err(format!("no .xlsx under {}", path.display()));
+    }
+
+    println!("== verify-structure sweep: {} ==", path.display());
+    let mut failures = 0usize;
+    for p in &entries {
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let expected = if stem.starts_with("safe-") || stem == "base" {
+            "Safe"
+        } else if stem.starts_with("warn-") {
+            "Confirm"
+        } else if stem.starts_with("broken-") {
+            "Broken"
+        } else {
+            println!("   [skip] {stem} (no expectation prefix)");
+            continue;
+        };
+        let v = verdict_of(p)?;
+        let actual = match &v {
+            structure::Verdict::Safe { .. } => "Safe",
+            structure::Verdict::Confirm(_) => "Confirm",
+            structure::Verdict::Broken(_) => "Broken",
+        };
+        let ok = actual == expected;
+        if !ok {
+            failures += 1;
+        }
+        println!(
+            "   [{}] {stem:28} expected={expected:7} actual={actual:7}  {v:?}",
+            if ok { " ok " } else { "FAIL" }
+        );
+    }
+    println!("\n-- verdict --");
+    if failures == 0 {
+        println!("   [PASS] every mutation judged as its file name expects");
+        Ok(())
+    } else {
+        Err(format!(
+            "{failures} mutation(s) judged differently than expected"
+        ))
+    }
+}
+
+/// resolve <path>: canonicalize so junctions/symlinks collapse to the real location. The .lnk
+/// hop and the volume's file-system name are handled by check-env.ps1, which feeds both into
+/// state::link_allowed for the final decision.
+fn cmd_resolve(path: &Path) -> R<()> {
+    println!("== resolve {} ==", path.display());
+    match std::fs::canonicalize(path) {
+        Ok(real) => {
+            let changed = real != path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+                || real.to_string_lossy() != path.to_string_lossy();
+            println!("   real   : {}", real.display());
+            println!("   changed: {changed}");
+            Ok(())
+        }
+        Err(e) => {
+            println!("   real   : (unresolvable: {e})");
+            Err("path cannot be resolved — link must be refused (fail closed)".into())
+        }
+    }
+}
+
 /// `set_fco=false` is the CONTROL for the lifecycle experiment (PR #21 review finding 2): an
 /// identical write minus fullCalcOnLoad, to prove that opening in Excel recalculates because of
 /// OUR flag, not as a side effect of merely opening.
-fn cmd_rmw_zip(path: &Path, set_fco: bool) -> R<()> {
+fn cmd_rmw_zip(path: &Path, set_fco: bool, cell: &str) -> R<()> {
     let out = out_path(path, if set_fco { "zip" } else { "zip-nofco" })?;
     println!("== read-modify-write via surgical zip edit (fullCalcOnLoad={set_fco}) ==");
     println!("   in : {}", path.display());
@@ -537,8 +695,8 @@ fn cmd_rmw_zip(path: &Path, set_fco: bool) -> R<()> {
             let mut s = String::new();
             e.read_to_string(&mut s).map_err(|e| e.to_string())?;
             let patched = if name == part {
-                patch_cell(&s, TARGET_CELL, TARGET_VALUE)
-                    .ok_or_else(|| format!("cell {TARGET_CELL} not found in {part}"))?
+                patch_cell(&s, cell, TARGET_VALUE)
+                    .ok_or_else(|| format!("cell {cell} not found in {part}"))?
             } else {
                 patch_calc_pr(&s)
             };
@@ -555,7 +713,7 @@ fn cmd_rmw_zip(path: &Path, set_fco: bool) -> R<()> {
 
     println!("   rewritten: {rewritten:?}");
     println!("   copied verbatim: {copied} parts (incl. calcChain.xml — kept for OPC consistency)");
-    println!("\n   set {TARGET_SHEET}!{TARGET_CELL} = {TARGET_VALUE}");
+    println!("\n   set {TARGET_SHEET}!{cell} = {TARGET_VALUE}");
     if set_fco {
         println!("   set calcPr fullCalcOnLoad=\"1\"");
     } else {
@@ -584,6 +742,7 @@ fn evaluate(
     a: &BTreeMap<String, Vec<u8>>,
     b: &BTreeMap<String, Vec<u8>>,
     target_part: &str,
+    cell: &str,
     log: &mut Vec<String>,
 ) -> Vec<String> {
     let mut violations: Vec<String> = Vec::new();
@@ -627,10 +786,10 @@ fn evaluate(
         let before_xml = String::from_utf8_lossy(before_bytes).into_owned();
         let after_xml = String::from_utf8_lossy(after_bytes);
         let expected = if allowed_target {
-            match patch_cell(&before_xml, TARGET_CELL, TARGET_VALUE) {
+            match patch_cell(&before_xml, cell, TARGET_VALUE) {
                 Some(x) => x,
                 None => {
-                    violations.push(format!("{TARGET_CELL} not found in {name}"));
+                    violations.push(format!("{cell} not found in {name}"));
                     continue;
                 }
             }
@@ -639,7 +798,7 @@ fn evaluate(
         };
         if after_xml == expected {
             let what = if allowed_target {
-                format!("{TARGET_CELL}={TARGET_VALUE}")
+                format!("{cell}={TARGET_VALUE}")
             } else {
                 "fullCalcOnLoad=\"1\"".into()
             };
@@ -662,7 +821,7 @@ fn evaluate(
     violations
 }
 
-fn cmd_diff(before: &Path, after: &Path) -> R<()> {
+fn cmd_diff(before: &Path, after: &Path, cell: &str) -> R<()> {
     let a = read_all_bytes(before)?;
     let b = read_all_bytes(after)?;
     let target_part = {
@@ -677,7 +836,7 @@ fn cmd_diff(before: &Path, after: &Path) -> R<()> {
     println!("   target: {target_part}  (only this + xl/workbook.xml may differ)");
 
     let mut log = Vec::new();
-    let violations = evaluate(&a, &b, &target_part, &mut log);
+    let violations = evaluate(&a, &b, &target_part, cell, &mut log);
     for line in &log {
         println!("{line}");
     }
@@ -685,7 +844,7 @@ fn cmd_diff(before: &Path, after: &Path) -> R<()> {
     println!("\n-- verdict --");
     if violations.is_empty() {
         println!(
-            "   [PASS] only the 2 intended edits occurred ({TARGET_CELL}={TARGET_VALUE} + fullCalcOnLoad); \
+            "   [PASS] only the 2 intended edits occurred ({cell}={TARGET_VALUE} + fullCalcOnLoad); \
              all other {} parts byte-identical",
             a.len() - 2
         );
@@ -705,9 +864,28 @@ fn main() {
         [c, p] if c == "inspect" => cmd_inspect(Path::new(p)),
         [c, p] if c == "rmw" => cmd_rmw_umya(Path::new(p)),
         [c, p, b] if c == "rmw" && b == "umya" => cmd_rmw_umya(Path::new(p)),
-        [c, p, b] if c == "rmw" && b == "zip" => cmd_rmw_zip(Path::new(p), true),
-        [c, p, b] if c == "rmw" && b == "zip-nofco" => cmd_rmw_zip(Path::new(p), false),
-        [c, a, b] if c == "diff" => cmd_diff(Path::new(a), Path::new(b)),
+        [c, p, b] if c == "rmw" && b == "zip" => cmd_rmw_zip(Path::new(p), true, TARGET_CELL),
+        [c, p, b, cell] if c == "rmw" && b == "zip" => cmd_rmw_zip(Path::new(p), true, cell),
+        [c, p, b] if c == "rmw" && b == "zip-nofco" => {
+            cmd_rmw_zip(Path::new(p), false, TARGET_CELL)
+        }
+        [c, p, b, cell] if c == "rmw" && b == "zip-nofco" => cmd_rmw_zip(Path::new(p), false, cell),
+        [c, a, b] if c == "diff" => cmd_diff(Path::new(a), Path::new(b), TARGET_CELL),
+        [c, a, b, cell] if c == "diff" => cmd_diff(Path::new(a), Path::new(b), cell),
+        [c, p] if c == "verify-structure" => cmd_verify_structure(Path::new(p)),
+        [c, p] if c == "resolve" => cmd_resolve(Path::new(p)),
+        // decide <fs_name> <resolved:true|false>  → §4.10 link decision (authority lives here,
+        // not in the PowerShell that gathered the facts)
+        [c, fs, resolved] if c == "decide" => {
+            let d = state::link_allowed(fs, resolved == "true");
+            println!("{d:?}");
+            match d {
+                state::LinkDecision::Allow => Ok(()),
+                state::LinkDecision::WarnNoWriteBack => {
+                    Err("link refused or write-back disabled (fail closed)".into())
+                }
+            }
+        }
         [c, p] if c == "stale-scan" => stale_scan::report(Path::new(p)),
         // Print the SHA-256 fingerprint (§4.6.1). Used by lifecycle.ps1 to prove the restore rule.
         [c, p] if c == "fingerprint" => fingerprint(Path::new(p)).map(|fp| {
@@ -723,7 +901,7 @@ fn main() {
         _ => {
             eprintln!(
                 "usage:\n  inspect <xlsx>\n  rmw <xlsx> [umya|zip]\n  diff <before> <after>\n  \
-                 stale-scan <xlsx>\n  fingerprint <xlsx>\n  restore <xlsx> <last-hex|none> <true|false>\n  \
+                 stale-scan <xlsx>  |  verify-structure <xlsx|dir>  |  resolve <path>\n  fingerprint <xlsx>\n  restore <xlsx> <last-hex|none> <true|false>\n  \
                  check-write <xlsx> <cell>"
             );
             std::process::exit(2);
@@ -778,7 +956,7 @@ mod tests {
 
     fn eval(a: &BTreeMap<String, Vec<u8>>, b: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
         let mut log = Vec::new();
-        evaluate(a, b, TARGET, &mut log)
+        evaluate(a, b, TARGET, TARGET_CELL, &mut log)
     }
 
     #[test]

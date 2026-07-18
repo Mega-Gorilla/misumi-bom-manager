@@ -64,7 +64,7 @@ fn read_parts(path: &Path) -> R<(String, String)> {
 }
 
 /// Column letters from an A1 ref ("D2" → "D", "AA10" → "AA").
-fn col_letters(cell_ref: &str) -> String {
+pub(crate) fn col_letters(cell_ref: &str) -> String {
     cell_ref
         .chars()
         .take_while(|c| c.is_ascii_uppercase())
@@ -72,7 +72,7 @@ fn col_letters(cell_ref: &str) -> String {
 }
 
 /// Row number from an A1 ref ("D2" → 2).
-fn row_num(cell_ref: &str) -> Option<u32> {
+pub(crate) fn row_num(cell_ref: &str) -> Option<u32> {
     cell_ref
         .chars()
         .skip_while(|c| c.is_ascii_uppercase())
@@ -83,7 +83,7 @@ fn row_num(cell_ref: &str) -> Option<u32> {
 
 /// Every `<c r="REF" ...>...</c>` as (ref, has_formula, shared_string_index?). Inline enough for
 /// the PoC; the shared-string index lets us resolve header text.
-fn cells(sheet_xml: &str) -> Vec<(String, bool, Option<usize>)> {
+pub(crate) fn cells(sheet_xml: &str) -> Vec<(String, bool, Option<usize>)> {
     let mut out = Vec::new();
     let mut rest = sheet_xml;
     while let Some(i) = rest.find("<c ") {
@@ -119,7 +119,7 @@ fn cells(sheet_xml: &str) -> Vec<(String, bool, Option<usize>)> {
 }
 
 /// Resolve shared strings (index → text) from xl/sharedStrings.xml.
-fn shared_strings(path: &Path) -> Vec<String> {
+pub(crate) fn shared_strings(path: &Path) -> Vec<String> {
     let Ok(f) = File::open(path) else {
         return Vec::new();
     };
