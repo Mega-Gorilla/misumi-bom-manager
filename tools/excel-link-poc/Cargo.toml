@@ -12,3 +12,4 @@ description = "Go/no-go probe for read-modify-write of existing .xlsx (docs/plan
 [dependencies]
 umya-spreadsheet = "=3.0.1"
 zip = "2"
+sha2 = "0.10"
