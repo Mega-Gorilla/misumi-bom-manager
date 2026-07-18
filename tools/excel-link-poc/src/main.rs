@@ -25,7 +25,49 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+mod stale_scan;
+mod state;
+
 type R<T> = Result<T, String>;
+
+/// SHA-256 over the whole file (plan.md §4.6.1). The one content fingerprint used everywhere.
+fn fingerprint(path: &Path) -> R<state::Fingerprint> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    Ok(h.finalize().into())
+}
+
+fn parse_fp(hex: &str) -> R<state::Fingerprint> {
+    let bytes: Result<Vec<u8>, _> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or(""), 16))
+        .collect();
+    let v = bytes.map_err(|_| "bad hex fingerprint".to_string())?;
+    v.try_into()
+        .map_err(|_| "fingerprint must be 32 bytes".to_string())
+}
+
+/// Apply the §4.4.2 restore rule to a live file, driven by the persisted values. This is the same
+/// pure logic `state::restore` unit-tests, exposed so lifecycle.ps1 can prove it against real
+/// fingerprints (Stale stays sticky when unchanged; Trusted only after a recalc-requested change).
+fn cmd_restore(current: &Path, last_write_hex: &str, recalc_requested: bool) -> R<()> {
+    let current_fp = fingerprint(current)?;
+    let last_app_write = if last_write_hex == "none" {
+        None
+    } else {
+        Some(parse_fp(last_write_hex)?)
+    };
+    let p = state::Persisted {
+        last_app_write,
+        recalc_requested,
+        value_readable: true,
+    };
+    let st = state::restore(&current_fp, &p);
+    println!("{st:?} usable={}", st.is_usable());
+    Ok(())
+}
 
 // ---- profile: what we can observe in the raw package -------------------------------------
 
@@ -174,6 +216,11 @@ fn slice_between<'a>(hay: &'a str, start: &str, end: &str) -> Option<&'a str> {
     Some(&hay[i..j])
 }
 
+/// Same as `slice_between`, exposed for the submodules.
+pub(crate) fn slice_between_pub<'a>(hay: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    slice_between(hay, start, end)
+}
+
 /// Pull the text of every `<f ...>text</f>`. Self-closing `<f/>` (shared-formula followers)
 /// carry no text and are skipped — they are counted by Marks::formulas instead.
 fn extract_formulas(xml: &str) -> Vec<String> {
@@ -198,6 +245,56 @@ fn extract_formulas(xml: &str) -> Vec<String> {
     }
     out.sort();
     out
+}
+
+/// Collect array/spill ranges from a sheet: the `ref` of every `<f t="array" ref="...">` (and
+/// shared-formula anchors). `unresolved` becomes true if a formula declares a type that implies a
+/// range but we cannot read a `ref` — so the caller fails closed (§4.4.2).
+fn spill_ranges(sheet_xml: &str) -> (Vec<String>, bool) {
+    let mut ranges = Vec::new();
+    let mut unresolved = false;
+    let mut rest = sheet_xml;
+    while let Some(i) = rest.find("<f") {
+        let open_start = i;
+        let Some(gt) = rest[open_start..].find('>') else {
+            break;
+        };
+        let open = &rest[open_start..open_start + gt];
+        let is_array = open.contains("t=\"array\"") || open.contains("t=\"dataTable\"");
+        if is_array {
+            match slice_between(open, "ref=\"", "\"") {
+                Some(r) => ranges.push(r.to_string()),
+                None => unresolved = true, // array formula with no readable ref → cannot prove safe
+            }
+        }
+        rest = &rest[open_start + gt + 1..];
+    }
+    (ranges, unresolved)
+}
+
+/// check-write <xlsx> <targetCell>  → is writing that cell blocked by an array/spill range?
+fn cmd_check_write(path: &Path, target: &str) -> R<()> {
+    let f = File::open(path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
+    let mut sheet = String::new();
+    zip.by_name("xl/worksheets/sheet1.xml")
+        .map_err(|e| e.to_string())?
+        .read_to_string(&mut sheet)
+        .map_err(|e| e.to_string())?;
+    let (ranges, unresolved) = spill_ranges(&sheet);
+    let range_refs: Vec<&str> = ranges.iter().map(|s| s.as_str()).collect();
+    let blocked = state::write_blocked(&[target], &range_refs, unresolved);
+
+    println!("== check-write {} @ {target} ==", path.display());
+    println!("   array/spill ranges: {ranges:?}  unresolved={unresolved}");
+    if blocked {
+        println!(
+            "   [BLOCK] writing {target} is refused (intersects a spill range or range unresolved)"
+        );
+    } else {
+        println!("   [ ok ] writing {target} is clear of every array/spill range");
+    }
+    Ok(())
 }
 
 // ---- commands ----------------------------------------------------------------------------
@@ -573,8 +670,24 @@ fn main() {
         [c, p, b] if c == "rmw" && b == "umya" => cmd_rmw_umya(Path::new(p)),
         [c, p, b] if c == "rmw" && b == "zip" => cmd_rmw_zip(Path::new(p)),
         [c, a, b] if c == "diff" => cmd_diff(Path::new(a), Path::new(b)),
+        [c, p] if c == "stale-scan" => stale_scan::report(Path::new(p)),
+        // Print the SHA-256 fingerprint (§4.6.1). Used by lifecycle.ps1 to prove the restore rule.
+        [c, p] if c == "fingerprint" => fingerprint(Path::new(p)).map(|fp| {
+            println!(
+                "{}",
+                fp.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            );
+        }),
+        // restore <file> <last-app-write-hex|none> <true|false>  → prints CalcState + usable
+        [c, p, last, recalc] if c == "restore" => cmd_restore(Path::new(p), last, recalc == "true"),
+        // check-write <xlsx> <cell>  → is writing that cell blocked by an array/spill range?
+        [c, p, cell] if c == "check-write" => cmd_check_write(Path::new(p), cell),
         _ => {
-            eprintln!("usage:\n  inspect <xlsx>\n  rmw <xlsx> [umya|zip]\n  diff <before> <after>");
+            eprintln!(
+                "usage:\n  inspect <xlsx>\n  rmw <xlsx> [umya|zip]\n  diff <before> <after>\n  \
+                 stale-scan <xlsx>\n  fingerprint <xlsx>\n  restore <xlsx> <last-hex|none> <true|false>\n  \
+                 check-write <xlsx> <cell>"
+            );
             std::process::exit(2);
         }
     };

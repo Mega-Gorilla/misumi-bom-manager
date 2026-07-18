@@ -410,6 +410,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 name = "excel-link-poc"
 version = "0.1.0"
 dependencies = [
+ "sha2 0.10.9",
  "umya-spreadsheet",
  "zip 2.4.2",
 ]
@@ -961,6 +962,17 @@ dependencies = [
 
 [[package]]
 name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
@@ -1092,7 +1104,7 @@ dependencies = [
  "quick-xml",
  "rand",
  "rgb",
- "sha2",
+ "sha2 0.11.0",
  "thousands",
  "zip 8.6.0",
 ]
