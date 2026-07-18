@@ -39,10 +39,12 @@ cargo run -- diff fixtures/rich.xlsx out/rich-after-zip.xlsx   # → PASS / exit
 cargo run -- diff fixtures/rich.xlsx out/rich-after-umya.xlsx  # → FAIL / exit 1
 
 # --- ステップ2: 数式 PoC ---
-pwsh -File gen-scenarios.ps1                      # 4パターンの BOM を生成（Excel 必要）
-cargo run -- stale-scan fixtures/scenario-A.xlsx # 全数式 stale 方針の「重さ」を測る
-cargo run -- check-write fixtures/rich.xlsx J6   # スピル範囲との交差で書き込み可否を判定
-pwsh -File lifecycle.ps1                          # stale→(Excel再計算)→trusted の実 Excel ループ
+pwsh -File gen-scenarios.ps1                        # 4パターンの BOM を生成（Excel 必要）
+cargo run -- stale-scan fixtures/scenario-A.xlsx   # 全数式 stale 方針の影響を分類
+cargo run -- check-write fixtures/scenario-B.xlsx B2  # 数式セルへの書き込み → BLOCK
+cargo run -- check-write fixtures/rich.xlsx J6        # スピル範囲との交差 → BLOCK
+cargo run -- rmw fixtures/rich.xlsx zip-nofco      # 対照: fullCalcOnLoad なしの書き込み
+pwsh -File lifecycle.ps1                            # 対照実験つき stale→trusted 実 Excel ループ
 ```
 
 `D2`（アプリ所有列 `EC単価` 相当）に `1234` を書く。**`J2` の配列数式は意図的に遠い位置**に置いてあり、
@@ -156,54 +158,65 @@ PrintArea=$A$1:$F$8  PrintTitleRows=$1:$1
 
 ## ステップ2の結果（2026-07-18 実測 / Excel 16.0）
 
-数式の `stale` 運用が成立するかと、MVP 境界を決める測定。状態機械は純関数として `src/state.rs` に
-実装し、**Excel 不要の回帰テスト13本**（`cargo test`）で固定。実 Excel との一致は `lifecycle.ps1` で確認。
+数式の `stale` 運用が成立するかの検証と、**影響分類**（どこに数式があると重いか）。状態機械は
+純関数として `src/state.rs` に実装し、**Excel 不要の回帰テスト**（`cargo test`）で固定。
+実 Excel との一致は `lifecycle.ps1` で確認。
 
-### (A) `stale` ライフサイクルは実 Excel で成立する
+### (A) `stale` ライフサイクルは実 Excel で成立し、`fullCalcOnLoad` が再計算の原因である
 
-`lifecycle.ps1` の実測（`restore` は §4.4.2 の指紋ベース復元規則）:
+`lifecycle.ps1` の実測（全段 assert・**`CalculateFull()` は一切呼ばない**・`restore` は §4.4.2 の
+指紋ベース復元規則）。**対照実験**により `fullCalcOnLoad` の効果を分離証明した:
 
 ```
-1. アプリが EC セルを書く（zip 編集・fullCalcOnLoad 設定）→ F1 記録   → Stale (usable=false)
-2. 誰も保存しない → 指紋 F1 のまま → restore = Stale               ← 再起動しても stale 維持
-3. Excel が開いて再計算+保存+終了 → 指紋 F2 (≠F1)・E2=2468(正)・RepairedRecords:0
-4. アプリ再読込 → 指紋変化 → restore = Trusted (usable=true)
-== LIFECYCLE OK: Stale -> (unchanged) Stale -> (Excel recalc+save) Trusted ==
+CONTROL: fullCalcOnLoad なしで書き込み → Excel で開く → E2 = 800 のまま（古いキャッシュ）
+         → 開くだけでは再計算されない（§4.4.1 の問題そのものを実証）
+1. アプリが EC セルを書く（zip 編集・fullCalcOnLoad 設定）→ 生キャッシュ E2=800 を確認 → Stale
+2. 誰も保存しない → 指紋不変 → restore = Stale             ← 再起動しても stale 維持
+3. Excel が開く「だけ」（CalculateFull なし）→ E2 = 2468 を assert  ← フラグが再計算の原因
+4. 保存 → 指紋変化 → restore = Trusted、保存ファイルの生 <v> キャッシュ = 2468 を assert
+== LIFECYCLE OK: control stayed stale; fullCalcOnLoad alone recalculated; Stale -> Trusted ==
 ```
 
 **復元規則が効いている**（シナリオ5・6）: 未保存なら指紋が変わらず `Stale` を維持し、
 単純な再読込で `Unverified` に戻らない。`Trusted` へ戻る契機は「Excel を閉じたこと」ではなく
 「再計算後に保存されたファイルを再読込したこと」（＝指紋の変化）。
 
-### (B) 交差判定は実スピルで機能する
+### (B) 書き込みガード: 数式セル自体と、スピル範囲との交差の両方を拒否する
 
-`check-write`（`state::write_blocked`）を rich fixture（`=UNIQUE(...)` が `J5:J7` にスピル）で実測:
+`check-write` は2段のガード（両方 fail closed）:
+
+1. **対象セル自身が数式**（通常・shared anchor/follower・array を問わず）→ 拒否
+   （`patch_cell` は `<f>` を値で置換してしまうため。§4.4「数式セルには絶対に書き込まない」）
+2. 対象セルが**配列/動的スピル範囲内**（スピル結果セルは `<f>` を持たない）→ 拒否
 
 ```
-check-write rich.xlsx D2  →  [ ok ]  D2 is clear of every array/spill range
-check-write rich.xlsx J6  →  [BLOCK] J6 intersects a spill range
+check-write scenario-B.xlsx B2 → [BLOCK] B2 is itself a formula cell（型番の数式）
+check-write rich.xlsx J6       → [BLOCK] J6 intersects a spill range (J5:J7)
+check-write rich.xlsx D2       → [ ok ]  plain value cell, clear of every spill
 ```
 
-範囲を安全に識別できない場合（`unresolved` / パース不能）も**ブロック（fail closed）**する。
+回帰テスト: 通常数式・shared anchor・shared follower（自己閉鎖 `<f/>`）・スピル結果セルの
+いずれも拒否、値セルは許可（fixture 不要の XML ベース）。
 
-### (C) MVP 境界の測定 — `stale-scan` で「全数式 stale」の重さを定量化
+### (C) 影響分類 — 「全数式 stale」の重さは業務列の位置で決まる
 
-代表4パターン（`gen-scenarios.ps1`）で、EC 取得のたびに業務利用不可になる**業務列の数式セル数**:
+**これは影響の分類と scanner の動作確認であって、発生頻度の測定ではない**（合成 fixture の
+数式配置は作成時に決めたもの。**実 BOM でどの程度発生するかは未測定**で、実 BOM を入手したら
+`stale-scan <実BOM>` で同じ指標を出せる）。
 
-| パターン | 業務列の数式 | 業務列 stale セル |
-|---|---|---|
-| A: 小計・合計が数式 | 小計 | **4** |
-| B: 型番・数量が数式 | 型番・数量・小計 | **9**（最重） |
-| C: 注文番号が数式 | 小計・注文番号 | **6** |
-| D: 業務列は手入力 | なし | **0**（影響なし） |
+代表4パターン（`gen-scenarios.ps1`）での分類結果:
 
-**含意**: 「全数式 stale」の重さは**業務列が数式かどうか**で決まる。小計・合計だけが数式なら
-影響は限定的（EC 取得後に小計が一時的に未確定になるだけ、Excel を開けば戻る）。しかし
-**型番・数量が数式のケース（B）は EC 取得の入力自体が止まる**ため重い。
+| パターン | 全数式セル | うち業務列 | 影響 |
+|---|---|---|---|
+| A: 小計・合計が数式 | 4 | 4（小計） | 限定的（EC取得後に小計が一時未確定。Excel を開けば戻る） |
+| B: 型番・数量が数式 | 9 | 9（型番・数量・小計） | **重い（EC 取得の入力自体が止まる）** |
+| C: 注文番号が数式 | 6 | 6（小計・注文番号） | 中（注文処理へ影響） |
+| D: 業務列は手入力 | 1（装飾 =TODAY()） | 0 | 実質なし |
 
-→ **MVP 境界の判断**（§5 に反映）: 全数式 stale を基本方針とするが、**型番・数量・注文番号の
-業務列に数式がある場合はリンク時に警告する**（§5 選択肢1を限定的に採用）。`stale-scan` の分類が
-そのまま検出ロジックになる。小計・合計の数式は許容（影響が一時的で軽い）。
+→ **MVP 境界の判断**（§5 に反映）: 全数式 stale を基本方針とし、**型番・数量・注文番号の業務列に
+数式がある場合はリンク時に警告する**。これは**頻度測定に基づく決定ではなく、影響分類に基づく
+安全側の製品判断**として採用する（型番・数量が止まると EC 取得自体が成立しないため、頻度に
+かかわらず警告する価値がある）。`stale-scan` の分類がそのまま検出ロジックになる。
 
 ### この PoC が**証明していない**こと
 
@@ -220,9 +233,13 @@ zip 直編集は**方式**として成立するが、本実装には未対応の
 
 - `stale-scan` の業務列判定は**ヘッダ文字列マッチ**（`型番`/`数量`/`小計`… の部分一致）。
   実 BOM の多様なヘッダには**列 role 割り当て**（本実装の構造契約 §4.7）で対応する
-- 測定は**合成 fixture**。実 BOM を入手したら `stale-scan <実BOM>` で同じ指標を出せる
+- **実 BOM での発生頻度は未測定**。今回できたのは合成 fixture による**影響分類**まで。
+  実 BOM を入手したら `stale-scan <実BOM>` で同じ指標を出す（MVP 境界の警告方針は
+  頻度ではなく影響に基づく安全判断なので、頻度測定の結果で覆る性質のものではない）
 - `restore` の「指紋が変わった＝Excel が再計算した」は厳密には証明でない（§4.4.2 の残余リスク。
   第三者ツールが再計算せず保存した場合を区別できない）。実用上の妥協として受け入れる
+- lifecycle の対照実験は **Excel 16.0・自動計算モードでの結果**。他バージョンの「開くだけで
+  再計算しない」挙動が同一かは未確認（`fullCalcOnLoad` を立てる限り実害はない）
 
 ## 注意
 

@@ -155,10 +155,10 @@ fn shared_strings(path: &Path) -> Vec<String> {
     out
 }
 
-pub fn scan(path: &Path) -> R<ScanResult> {
-    let (sheet_xml, wb_xml) = read_parts(path)?;
-    let ss = shared_strings(path);
-    let cells = cells(&sheet_xml);
+/// Pure classification: header detection, business-column mapping, formula counting. Split from
+/// I/O so it can be unit-tested on hand-built XML (PR #21 review finding 4).
+fn classify(sheet_xml: &str, ss: &[String]) -> (u32, usize, usize, Vec<(String, String, usize)>) {
+    let cells = cells(sheet_xml);
 
     // Header row = the lowest row number present. BOM fixtures use row 1.
     let header_row = cells
@@ -183,23 +183,39 @@ pub fn scan(path: &Path) -> R<ScanResult> {
         }
     }
 
-    // Count formulas overall and per business column.
+    // Count formulas. Under the all-stale policy EVERY formula goes stale, header row included,
+    // so formula_cells counts them all (finding 4: a =TODAY() in the header row was missed).
+    // Only the BUSINESS classification skips the header row, because header cells are labels,
+    // not data the business logic consumes.
     let mut formula_cells = 0usize;
     let mut biz: BTreeMap<String, (String, String, usize)> = BTreeMap::new(); // col -> (label,role,count)
     for (r, has_formula, _) in &cells {
         if !has_formula {
             continue;
         }
-        if row_num(r) == Some(header_row) {
-            continue; // header cells are labels, not data formulas
-        }
         formula_cells += 1;
+        if row_num(r) == Some(header_row) {
+            continue; // header formulas count as stale, but are not business data
+        }
         let col = col_letters(r);
         if let Some((label, role)) = col_role.get(&col) {
             let entry = biz.entry(col).or_insert((label.clone(), role.clone(), 0));
             entry.2 += 1;
         }
     }
+
+    (
+        header_row,
+        cells.len(),
+        formula_cells,
+        biz.into_values().collect(),
+    )
+}
+
+pub fn scan(path: &Path) -> R<ScanResult> {
+    let (sheet_xml, wb_xml) = read_parts(path)?;
+    let ss = shared_strings(path);
+    let (header_row, total_cells, formula_cells, business_formulas) = classify(&sheet_xml, &ss);
 
     let calc_mode = super::slice_between_pub(&wb_xml, "calcMode=\"", "\"")
         .unwrap_or("auto (default)")
@@ -208,9 +224,9 @@ pub fn scan(path: &Path) -> R<ScanResult> {
     Ok(ScanResult {
         sheet: "sheet1 (BOM)".into(),
         header_row,
-        total_cells: cells.len(),
+        total_cells,
         formula_cells,
-        business_formulas: biz.into_values().collect(),
+        business_formulas,
         calc_mode,
     })
 }
@@ -241,4 +257,48 @@ pub fn report(path: &Path) -> R<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Row 1 headers (shared strings 0..=2), row 2 data. C1 header carries a =TODAY() formula.
+    /// B2 (型番 column) is a formula; D2 (non-business) is a formula; C2 is a plain value.
+    const SHEET: &str = r#"<worksheet><sheetData>
+        <row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><f>TODAY()</f><v>2</v></c></row>
+        <row r="2"><c r="A2"><v>1</v></c><c r="B2"><f>"CBT3-"&amp;A2</f><v>CBT3-1</v></c><c r="C2"><v>5</v></c><c r="D2"><f>A2*2</f><v>2</v></c></row>
+    </sheetData></worksheet>"#;
+
+    fn ss() -> Vec<String> {
+        vec!["No".into(), "型番".into(), "数量".into()]
+    }
+
+    #[test]
+    fn header_formula_counts_as_stale_but_not_business() {
+        // PR #21 finding 4: a header-row formula (=TODAY() in C1) must be counted in
+        // formula_cells (it DOES go stale under the all-stale policy) …
+        let (header_row, total, formulas, biz) = classify(SHEET, &ss());
+        assert_eq!(header_row, 1);
+        assert_eq!(total, 7);
+        assert_eq!(formulas, 3, "C1 + B2 + D2 — header formula must be counted");
+        // … but must NOT appear in the business classification (labels are not data), while the
+        // 型番 formula in B2 must.
+        assert_eq!(biz.len(), 1);
+        assert_eq!(biz[0].0, "型番");
+        assert_eq!(biz[0].1, "partNo");
+        assert_eq!(biz[0].2, 1);
+    }
+
+    #[test]
+    fn no_formulas_no_business() {
+        let plain = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" t="s"><v>0</v></c></row>
+            <row r="2"><c r="A2"><v>1</v></c></row>
+        </sheetData></worksheet>"#;
+        let (_, total, formulas, biz) = classify(plain, &ss());
+        assert_eq!(total, 2);
+        assert_eq!(formulas, 0);
+        assert!(biz.is_empty());
+    }
 }

@@ -272,7 +272,32 @@ fn spill_ranges(sheet_xml: &str) -> (Vec<String>, bool) {
     (ranges, unresolved)
 }
 
-/// check-write <xlsx> <targetCell>  → is writing that cell blocked by an array/spill range?
+/// Does the target cell itself carry a formula — normal, shared (anchor or `<f/>` follower) or
+/// array alike? plan §4.4: the app must NEVER write into a formula cell; `patch_cell` would
+/// replace the `<f>` with a plain value and silently destroy the user's formula (PR #21 review
+/// finding 1: the spill-range check alone let a plain formula cell through). Unparseable cell
+/// bodies fail closed (treated as formula-bearing).
+fn cell_has_formula(sheet_xml: &str, cell_ref: &str) -> bool {
+    let open = format!("<c r=\"{cell_ref}\"");
+    let Some(start) = sheet_xml.find(&open) else {
+        return false; // cell absent: nothing to destroy (insertion is out of scope anyway)
+    };
+    let rest = &sheet_xml[start..];
+    let Some(gt) = rest.find('>') else {
+        return true; // malformed open tag → fail closed
+    };
+    if rest[..gt].ends_with('/') {
+        return false; // self-closing <c/>: empty cell, no formula
+    }
+    let Some(close) = rest.find("</c>") else {
+        return true; // malformed body → fail closed
+    };
+    rest[gt..close].contains("<f")
+}
+
+/// check-write <xlsx> <targetCell> — may the app write that cell? Refused when the cell itself is
+/// a formula (any kind), when it falls inside an array/spill range, or when a range cannot be
+/// safely identified.
 fn cmd_check_write(path: &Path, target: &str) -> R<()> {
     let f = File::open(path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
@@ -281,18 +306,22 @@ fn cmd_check_write(path: &Path, target: &str) -> R<()> {
         .map_err(|e| e.to_string())?
         .read_to_string(&mut sheet)
         .map_err(|e| e.to_string())?;
+    let has_formula = cell_has_formula(&sheet, target);
     let (ranges, unresolved) = spill_ranges(&sheet);
     let range_refs: Vec<&str> = ranges.iter().map(|s| s.as_str()).collect();
-    let blocked = state::write_blocked(&[target], &range_refs, unresolved);
+    let in_spill = state::write_blocked(&[target], &range_refs, unresolved);
 
     println!("== check-write {} @ {target} ==", path.display());
+    println!("   cell has formula  : {has_formula}");
     println!("   array/spill ranges: {ranges:?}  unresolved={unresolved}");
-    if blocked {
+    if has_formula {
+        println!("   [BLOCK] {target} is itself a formula cell — writing would destroy the user's formula (§4.4)");
+    } else if in_spill {
         println!(
             "   [BLOCK] writing {target} is refused (intersects a spill range or range unresolved)"
         );
     } else {
-        println!("   [ ok ] writing {target} is clear of every array/spill range");
+        println!("   [ ok ] {target} is a plain value cell, clear of every array/spill range");
     }
     Ok(())
 }
@@ -471,9 +500,12 @@ fn sheet_part_for(zip: &mut zip::ZipArchive<File>, sheet_name: &str) -> R<String
     Ok(format!("xl/worksheets/sheet{}.xml", idx + 1))
 }
 
-fn cmd_rmw_zip(path: &Path) -> R<()> {
-    let out = out_path(path, "zip")?;
-    println!("== read-modify-write via surgical zip edit ==");
+/// `set_fco=false` is the CONTROL for the lifecycle experiment (PR #21 review finding 2): an
+/// identical write minus fullCalcOnLoad, to prove that opening in Excel recalculates because of
+/// OUR flag, not as a side effect of merely opening.
+fn cmd_rmw_zip(path: &Path, set_fco: bool) -> R<()> {
+    let out = out_path(path, if set_fco { "zip" } else { "zip-nofco" })?;
+    println!("== read-modify-write via surgical zip edit (fullCalcOnLoad={set_fco}) ==");
     println!("   in : {}", path.display());
     println!("   out: {}", out.display());
 
@@ -500,7 +532,8 @@ fn cmd_rmw_zip(path: &Path) -> R<()> {
         let mut e = zin.by_index(i).map_err(|e| e.to_string())?;
         let name = e.name().to_string();
 
-        if name == part || name == "xl/workbook.xml" {
+        let must_patch = name == part || (name == "xl/workbook.xml" && set_fco);
+        if must_patch {
             let mut s = String::new();
             e.read_to_string(&mut s).map_err(|e| e.to_string())?;
             let patched = if name == part {
@@ -523,7 +556,11 @@ fn cmd_rmw_zip(path: &Path) -> R<()> {
     println!("   rewritten: {rewritten:?}");
     println!("   copied verbatim: {copied} parts (incl. calcChain.xml — kept for OPC consistency)");
     println!("\n   set {TARGET_SHEET}!{TARGET_CELL} = {TARGET_VALUE}");
-    println!("   set calcPr fullCalcOnLoad=\"1\"");
+    if set_fco {
+        println!("   set calcPr fullCalcOnLoad=\"1\"");
+    } else {
+        println!("   calcPr left untouched (CONTROL: no recalc request)");
+    }
     println!(
         "\n   wrote {} bytes",
         std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0)
@@ -668,7 +705,8 @@ fn main() {
         [c, p] if c == "inspect" => cmd_inspect(Path::new(p)),
         [c, p] if c == "rmw" => cmd_rmw_umya(Path::new(p)),
         [c, p, b] if c == "rmw" && b == "umya" => cmd_rmw_umya(Path::new(p)),
-        [c, p, b] if c == "rmw" && b == "zip" => cmd_rmw_zip(Path::new(p)),
+        [c, p, b] if c == "rmw" && b == "zip" => cmd_rmw_zip(Path::new(p), true),
+        [c, p, b] if c == "rmw" && b == "zip-nofco" => cmd_rmw_zip(Path::new(p), false),
         [c, a, b] if c == "diff" => cmd_diff(Path::new(a), Path::new(b)),
         [c, p] if c == "stale-scan" => stale_scan::report(Path::new(p)),
         // Print the SHA-256 fingerprint (§4.6.1). Used by lifecycle.ps1 to prove the restore rule.
@@ -810,6 +848,61 @@ mod tests {
         assert!(
             !eval(&before_map(), &after).is_empty(),
             "a change to a copied part must FAIL"
+        );
+    }
+
+    // ---- write guard: never write into a formula cell (PR #21 review finding 1) ----
+
+    /// One sheet exercising every formula flavour: B2 normal, E2 shared anchor, E3 shared
+    /// follower (self-closing <f/>), J2 array anchor; D2/K5 plain values; J6 has no <f> but sits
+    /// inside the J5:J7 spill of an array formula.
+    const GUARD_SHEET: &str = r#"<worksheet><sheetData>
+        <row r="2"><c r="B2"><f>"CBT3-"&amp;A2</f><v>CBT3-1</v></c><c r="D2" s="3"><v>400</v></c><c r="E2"><f t="shared" ref="E2:E3" si="0">C2*D2</f><v>800</v></c><c r="J2"><f t="array" ref="J5:J7">_xlfn.UNIQUE(A2:A4)</f><v>x</v></c></row>
+        <row r="3"><c r="E3"><f t="shared" si="0"/><v>1350</v></c></row>
+        <row r="5"><c r="K5"><v>7</v></c></row>
+    </sheetData></worksheet>"#;
+
+    fn guard_blocked(cell: &str) -> bool {
+        let has_formula = cell_has_formula(GUARD_SHEET, cell);
+        let (ranges, unresolved) = spill_ranges(GUARD_SHEET);
+        let refs: Vec<&str> = ranges.iter().map(|s| s.as_str()).collect();
+        has_formula || state::write_blocked(&[cell], &refs, unresolved)
+    }
+
+    #[test]
+    fn writing_normal_formula_cell_is_blocked() {
+        assert!(guard_blocked("B2"), "normal formula cell must be refused");
+    }
+
+    #[test]
+    fn writing_shared_anchor_is_blocked() {
+        assert!(guard_blocked("E2"), "shared-formula anchor must be refused");
+    }
+
+    #[test]
+    fn writing_shared_follower_is_blocked() {
+        // Follower carries only a self-closing <f t="shared" si="0"/> — no formula text.
+        assert!(
+            guard_blocked("E3"),
+            "shared-formula follower must be refused"
+        );
+    }
+
+    #[test]
+    fn writing_spill_result_cell_is_blocked() {
+        // J6 has no <c> element at all, but it lies inside the array ref J5:J7.
+        assert!(guard_blocked("J6"), "spill result cell must be refused");
+    }
+
+    #[test]
+    fn writing_plain_value_cell_is_allowed() {
+        assert!(
+            !guard_blocked("D2"),
+            "plain value cell clear of spills must be allowed"
+        );
+        assert!(
+            !guard_blocked("K5"),
+            "plain value cell clear of spills must be allowed"
         );
     }
 }
