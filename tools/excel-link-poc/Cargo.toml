@@ -1,0 +1,14 @@
+[package]
+name = "excel-link-poc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Go/no-go probe for read-modify-write of existing .xlsx (docs/plans/0018-excel-link-mode §7 step 1)"
+
+# The go/no-go verdict is about umya, so umya is pinned exactly to the tested 3.0.1.
+# zip is a plumbing dep (not the subject of the finding); the committed Cargo.lock pins its exact
+# version (2.4.2 as tested) so a clean checkout reproduces, without an exact requirement that would
+# break if that patch gets yanked (2.2.0 already was).
+[dependencies]
+umya-spreadsheet = "=3.0.1"
+zip = "2"

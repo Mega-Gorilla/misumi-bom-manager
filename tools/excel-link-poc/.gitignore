@@ -1,0 +1,6 @@
+# PoC artifacts — regenerate with gen-fixture.ps1 / cargo run. Never commit.
+fixtures/
+out/
+target/
+*.log
+# Cargo.lock IS committed (investigation binary) so the pinned versions reproduce.
