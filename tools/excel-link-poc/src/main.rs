@@ -150,6 +150,24 @@ fn count(hay: &str, needle: &str) -> usize {
     hay.matches(needle).count()
 }
 
+/// Read every zip entry's uncompressed bytes, keyed by name. Used by the exhaustive `diff`:
+/// counting XML markers can miss a value swap or a number→sharedString change, so the real
+/// check is "are the bytes of every non-target part identical".
+fn read_all_bytes(path: &Path) -> R<BTreeMap<String, Vec<u8>>> {
+    let f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut zip =
+        zip::ZipArchive::new(f).map_err(|e| format!("{}: not a zip: {e}", path.display()))?;
+    let mut out = BTreeMap::new();
+    for i in 0..zip.len() {
+        let mut e = zip.by_index(i).map_err(|e| e.to_string())?;
+        let name = e.name().to_string();
+        let mut buf = Vec::new();
+        e.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        out.insert(name, buf);
+    }
+    Ok(out)
+}
+
 fn slice_between<'a>(hay: &'a str, start: &str, end: &str) -> Option<&'a str> {
     let i = hay.find(start)? + start.len();
     let j = hay[i..].find(end)? + i;
@@ -416,99 +434,127 @@ fn cmd_rmw_zip(path: &Path) -> R<()> {
     Ok(())
 }
 
-fn cmd_diff(before: &Path, after: &Path) -> R<()> {
-    let a = Profile::read(before)?;
-    let b = Profile::read(after)?;
-
-    println!("== diff ==");
-    println!("   before: {}", before.display());
-    println!("   after : {}", after.display());
-
-    // Violations are anything the surgical edit must NOT do. The only tolerated change is calcPr
-    // (we deliberately set fullCalcOnLoad). Everything else — a lost part, a lost worksheet, a
-    // lost formula, a numeric cell turned into text, or fullCalcOnLoad missing — is a failure.
-    // Collected here so the command can exit non-zero (reviewer #3): a green diff becomes a
-    // machine-checkable go/no-go, not just a wall of text.
+/// Exhaustive equality check. Counting XML markers (the old approach) has false negatives:
+/// a value swap in another cell, or a number→sharedString change, keeps the counts the same
+/// (reviewer, PR #20). So the real yardstick is: the ONLY changes allowed are the two we
+/// intended. Everything else must be byte-identical to `before`.
+///
+/// Allowed changes are exactly two: the target worksheet part must equal before-with-D2-patched,
+/// and xl/workbook.xml must equal before-with-fullCalcOnLoad-patched. Every other part must match
+/// `before` byte-for-byte, and the entry set must be identical. This proves "only the intended 2
+/// edits happened" rather than merely "nothing shrank".
+/// Pure verdict: given the two packages' parts (name -> bytes) and the target worksheet part,
+/// list every disallowed change. Empty list == PASS. Factored out so it can be unit-tested with
+/// hand-built part maps, without needing Excel to build a fixture (reviewer, PR #20).
+fn evaluate(
+    a: &BTreeMap<String, Vec<u8>>,
+    b: &BTreeMap<String, Vec<u8>>,
+    target_part: &str,
+    log: &mut Vec<String>,
+) -> Vec<String> {
     let mut violations: Vec<String> = Vec::new();
 
-    // 1. package parts
-    let lost: Vec<_> = a
-        .entries
-        .iter()
-        .filter(|e| !b.entries.contains(e))
-        .collect();
-    let added: Vec<_> = b
-        .entries
-        .iter()
-        .filter(|e| !a.entries.contains(e))
-        .collect();
-    println!(
-        "\n-- package parts: {} -> {} --",
-        a.entries.len(),
-        b.entries.len()
-    );
-    if lost.is_empty() {
-        println!("   [ ok ] no part lost");
-    } else {
-        for e in &lost {
-            println!("   [LOST] {e}");
-            violations.push(format!("part lost: {e}"));
-        }
+    // 1. entry set identical
+    let a_names: std::collections::BTreeSet<&String> = a.keys().collect();
+    let b_names: std::collections::BTreeSet<&String> = b.keys().collect();
+    log.push(format!("-- package parts: {} -> {} --", a.len(), b.len()));
+    for e in a_names.difference(&b_names) {
+        log.push(format!("   [LOST] {e}"));
+        violations.push(format!("part lost: {e}"));
     }
-    for e in &added {
-        println!("   [ +  ] {e}");
+    for e in b_names.difference(&a_names) {
+        log.push(format!("   [ +  ] {e}"));
+        violations.push(format!("part added: {e}"));
+    }
+    if a_names == b_names {
+        log.push("   [ ok ] entry set identical".into());
     }
 
-    // 2. workbook-level
-    println!("\n-- workbook.xml --");
-    verdict("calcPr", &a.calc_pr(), &b.calc_pr()); // allowed to differ (fullCalcOnLoad)
-    let has_fco = b.calc_pr().contains("fullCalcOnLoad");
-    println!(
-        "   {} fullCalcOnLoad present in output: {}",
-        if has_fco { "[ ok ]" } else { "[FAIL]" },
-        has_fco
-    );
-    if !has_fco {
-        violations.push("fullCalcOnLoad not set in output".into());
-    }
-    num("definedName", a.defined_names(), b.defined_names());
-    if b.defined_names() < a.defined_names() {
-        violations.push("definedName count dropped".into());
-    }
-
-    // 3. per sheet
-    for (name, ma) in &a.sheets {
-        let Some(mb) = b.sheets.get(name) else {
-            println!("\n-- {name} --\n   [LOST] worksheet part missing in output");
-            violations.push(format!("worksheet lost: {name}"));
-            continue;
+    // 2. every part byte-identical, except the two we deliberately patch — and those two must
+    //    equal exactly before-plus-the-single-intended-edit.
+    log.push("-- per-part bytes --".into());
+    for (name, before_bytes) in a {
+        let Some(after_bytes) = b.get(name) else {
+            continue; // reported above
         };
-        println!("\n-- {name} --");
-        if ma == mb {
-            println!("   [ ok ] all markers unchanged");
+        let allowed_target = name == target_part;
+        let allowed_workbook = name == "xl/workbook.xml";
+
+        if !allowed_target && !allowed_workbook {
+            if before_bytes != after_bytes {
+                log.push(format!(
+                    "   [DIFF] {name}  (must be byte-identical, but changed)"
+                ));
+                violations.push(format!("unexpected change in {name}"));
+            }
+            continue;
         }
-        for ((label, na), (_, nb)) in ma.rows().into_iter().zip(mb.rows()) {
-            if na != nb {
-                num(label, na, nb);
-                if nb < na {
-                    violations.push(format!("{name}: {} dropped ({na} -> {nb})", label.trim()));
+
+        let before_xml = String::from_utf8_lossy(before_bytes).into_owned();
+        let after_xml = String::from_utf8_lossy(after_bytes);
+        let expected = if allowed_target {
+            match patch_cell(&before_xml, TARGET_CELL, TARGET_VALUE) {
+                Some(x) => x,
+                None => {
+                    violations.push(format!("{TARGET_CELL} not found in {name}"));
+                    continue;
                 }
             }
+        } else {
+            patch_calc_pr(&before_xml)
+        };
+        if after_xml == expected {
+            let what = if allowed_target {
+                format!("{TARGET_CELL}={TARGET_VALUE}")
+            } else {
+                "fullCalcOnLoad=\"1\"".into()
+            };
+            log.push(format!("   [ ok ] {name}  == before + ({what})"));
+        } else {
+            log.push(format!(
+                "   [DIFF] {name}  differs beyond the single intended edit"
+            ));
+            violations.push(format!("{name} changed beyond the intended edit"));
         }
-        let fa = a.formulas.get(name).cloned().unwrap_or_default();
-        let fb = b.formulas.get(name).cloned().unwrap_or_default();
-        for f in fa.iter().filter(|f| !fb.contains(f)) {
-            println!("   [LOST] formula: {f}");
-            violations.push(format!("{name}: formula lost: {f}"));
-        }
-        for f in fb.iter().filter(|f| !fa.contains(f)) {
-            println!("   [ +  ] formula: {f}");
-        }
+    }
+
+    // 3. belt-and-braces: the value must be exactly fullCalcOnLoad="1", not merely present.
+    let wb_after = String::from_utf8_lossy(b.get("xl/workbook.xml").map(|v| &v[..]).unwrap_or(&[]));
+    if !wb_after.contains("fullCalcOnLoad=\"1\"") {
+        log.push("   [FAIL] fullCalcOnLoad=\"1\" not found in workbook.xml".into());
+        violations.push("fullCalcOnLoad=\"1\" not set".into());
+    }
+
+    violations
+}
+
+fn cmd_diff(before: &Path, after: &Path) -> R<()> {
+    let a = read_all_bytes(before)?;
+    let b = read_all_bytes(after)?;
+    let target_part = {
+        let f = File::open(before).map_err(|e| e.to_string())?;
+        let mut z = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
+        sheet_part_for(&mut z, TARGET_SHEET)?
+    };
+
+    println!("== diff (exhaustive) ==");
+    println!("   before: {}", before.display());
+    println!("   after : {}", after.display());
+    println!("   target: {target_part}  (only this + xl/workbook.xml may differ)");
+
+    let mut log = Vec::new();
+    let violations = evaluate(&a, &b, &target_part, &mut log);
+    for line in &log {
+        println!("{line}");
     }
 
     println!("\n-- verdict --");
     if violations.is_empty() {
-        println!("   [PASS] no disallowed change (only calcPr may differ)");
+        println!(
+            "   [PASS] only the 2 intended edits occurred ({TARGET_CELL}={TARGET_VALUE} + fullCalcOnLoad); \
+             all other {} parts byte-identical",
+            a.len() - 2
+        );
         Ok(())
     } else {
         println!("   [FAIL] {} violation(s):", violations.len());
@@ -517,24 +563,6 @@ fn cmd_diff(before: &Path, after: &Path) -> R<()> {
         }
         Err(format!("{} violation(s) — see above", violations.len()))
     }
-}
-
-fn num(label: &str, a: usize, b: usize) {
-    let tag = if b < a {
-        "[LOST]"
-    } else if b > a {
-        "[ +  ]"
-    } else {
-        "[ ok ]"
-    };
-    println!("   {tag} {label:34} {a} -> {b}");
-}
-
-fn verdict(label: &str, a: &str, b: &str) {
-    let tag = if a == b { "[ ok ]" } else { "[DIFF]" };
-    println!("   {tag} {label}");
-    println!("          before: {a}");
-    println!("          after : {b}");
 }
 
 fn main() {
@@ -553,5 +581,122 @@ fn main() {
     if let Err(e) = r {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A minimal but realistic package: the target sheet has D2 as a number, plus a formula cell
+    // whose cached <v> we can tamper with; a second part stands in for "everything else".
+    const TARGET: &str = "xl/worksheets/sheet1.xml";
+    fn sheet_before() -> Vec<u8> {
+        br#"<worksheet><sheetData><row r="2"><c r="C2"><v>2</v></c><c r="D2" s="3"><v>400</v></c><c r="E2" s="3"><f>C2*D2</f><v>800</v></c></row></sheetData></worksheet>"#.to_vec()
+    }
+    fn workbook_before() -> Vec<u8> {
+        br#"<workbook><sheets><sheet name="BOM" sheetId="1"/></sheets><calcPr calcId="191029"/></workbook>"#.to_vec()
+    }
+    fn other_part() -> Vec<u8> {
+        br#"<xml>styles etc</xml>"#.to_vec()
+    }
+
+    fn before_map() -> BTreeMap<String, Vec<u8>> {
+        BTreeMap::from([
+            (TARGET.to_string(), sheet_before()),
+            ("xl/workbook.xml".to_string(), workbook_before()),
+            ("xl/styles.xml".to_string(), other_part()),
+        ])
+    }
+
+    /// The good case: exactly the two intended edits (D2 -> 1234, fullCalcOnLoad on workbook).
+    fn after_ok() -> BTreeMap<String, Vec<u8>> {
+        let sheet = patch_cell(
+            &String::from_utf8(sheet_before()).unwrap(),
+            TARGET_CELL,
+            TARGET_VALUE,
+        )
+        .unwrap();
+        let wb = patch_calc_pr(&String::from_utf8(workbook_before()).unwrap());
+        BTreeMap::from([
+            (TARGET.to_string(), sheet.into_bytes()),
+            ("xl/workbook.xml".to_string(), wb.into_bytes()),
+            ("xl/styles.xml".to_string(), other_part()),
+        ])
+    }
+
+    fn eval(a: &BTreeMap<String, Vec<u8>>, b: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+        let mut log = Vec::new();
+        evaluate(a, b, TARGET, &mut log)
+    }
+
+    #[test]
+    fn intended_two_edits_pass() {
+        assert!(eval(&before_map(), &after_ok()).is_empty());
+    }
+
+    // The false negatives the old marker-count diff let through (reviewer, PR #20):
+
+    #[test]
+    fn tampering_another_cells_value_fails() {
+        // E2 cached value 800 -> 999 while keeping D2 correct. Marker counts are unchanged.
+        let mut after = after_ok();
+        let sheet = String::from_utf8(after[TARGET].clone())
+            .unwrap()
+            .replace("<v>800</v>", "<v>999</v>");
+        after.insert(TARGET.to_string(), sheet.into_bytes());
+        assert!(
+            !eval(&before_map(), &after).is_empty(),
+            "a value swap elsewhere must FAIL"
+        );
+    }
+
+    #[test]
+    fn number_to_shared_string_fails() {
+        // D2 turned from number into a shared-string ref: <v> count same, t="s" appears.
+        let mut after = after_ok();
+        let sheet = String::from_utf8(after[TARGET].clone()).unwrap().replace(
+            "<c r=\"D2\" s=\"3\"><v>1234</v></c>",
+            "<c r=\"D2\" s=\"3\" t=\"s\"><v>0</v></c>",
+        );
+        after.insert(TARGET.to_string(), sheet.into_bytes());
+        assert!(
+            !eval(&before_map(), &after).is_empty(),
+            "number->sharedString must FAIL"
+        );
+    }
+
+    #[test]
+    fn full_calc_on_load_zero_fails() {
+        // fullCalcOnLoad="0" — the old check only looked for the attribute name.
+        let mut after = after_ok();
+        let wb = String::from_utf8(after["xl/workbook.xml"].clone())
+            .unwrap()
+            .replace("fullCalcOnLoad=\"1\"", "fullCalcOnLoad=\"0\"");
+        after.insert("xl/workbook.xml".to_string(), wb.into_bytes());
+        assert!(
+            !eval(&before_map(), &after).is_empty(),
+            "fullCalcOnLoad=0 must FAIL"
+        );
+    }
+
+    #[test]
+    fn added_part_fails() {
+        let mut after = after_ok();
+        after.insert("xl/sneaky.xml".to_string(), b"<x/>".to_vec());
+        assert!(
+            !eval(&before_map(), &after).is_empty(),
+            "an added part must FAIL"
+        );
+    }
+
+    #[test]
+    fn untouched_part_change_fails() {
+        let mut after = after_ok();
+        after.insert("xl/styles.xml".to_string(), b"<xml>TAMPERED</xml>".to_vec());
+        assert!(
+            !eval(&before_map(), &after).is_empty(),
+            "a change to a copied part must FAIL"
+        );
     }
 }

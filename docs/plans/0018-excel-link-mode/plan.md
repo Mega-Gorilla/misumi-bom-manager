@@ -1113,7 +1113,7 @@ PoC の一時確認で終わらせず、以下は**単体テストとして残�
 | ファイル | 内容 |
 |---|---|
 | `src-tauri/Cargo.toml` | `rust_xlsxwriter` は**新規作成（従来の書き出し）用に残す**。リンクモードの書き戻しは **`zip` クレートで直編集**（§3.9 で確定。RMW クレートは不採用） |
-| `src-tauri/src/spreadsheet.rs` | **zip 直編集による部分更新**（§3.9。触るパート以外は `raw_copy_file` でバイト単位コピー、`calcChain.xml` は削除）、`worksheet_formula` 併読（**座標系オフセット必須**・§3.4.1）、`calcPr fullCalcOnLoad` 設定、`truncated` ガード、原子的置換 |
+| `src-tauri/src/spreadsheet.rs` | **zip 直編集による部分更新**（§3.9。触るパート以外は `raw_copy_file` でバイト単位コピー。**`calcChain.xml` は保持**する — 削除すると OPC 参照が不整合になる）、`worksheet_formula` 併読（**座標系オフセット必須**・§3.4.1）、`calcPr fullCalcOnLoad` 設定、`truncated` ガード、原子的置換 |
 | `src-tauri/src/db.rs` | 構造契約（V5 マイグレーション） |
 | `src-tauri/src/model.rs` | リンク設定・列所有権・計算状態・指紋・同期状態 |
 | `src-tauri/src/lib.rs` | リンク BOM 用コマンド（読込／構造検証／反映／反映待ち状態） |
