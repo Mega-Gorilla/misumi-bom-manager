@@ -52,6 +52,38 @@ function Read-Session {
     Get-Content $sessionPath -Raw | ConvertFrom-Json
 }
 
+# Re-derive the expected mirror root INDEPENDENTLY of session.json (PR #24 re-review finding 2:
+# the session file is editable state, never the write/delete authority). DryRun roots come from a
+# fixed in-repo path; real roots from -MirrorRoot or a fresh .lnk resolution.
+function Get-ExpectedParent($session) {
+    if ($session.dryRun) { return (Join-Path $dir 'out\syncpoc-dryrun-root') }
+    if ($MirrorRoot) {
+        $entry = $MirrorRoot
+    } else {
+        $lnk = 'H:\マイドライブ.lnk'
+        if (-not (Test-Path $lnk)) { Fail "cannot independently resolve the mirror root ($lnk absent) — pass -MirrorRoot" }
+        $sh = New-Object -ComObject WScript.Shell
+        $entry = $sh.CreateShortcut($lnk).TargetPath
+        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($sh) | Out-Null
+    }
+    $p = RealOf $entry
+    if (-not $p) { Fail "cannot resolve $entry to a real path" }
+    $p
+}
+
+# Common preflight before ANY operation that touches session.root: the independently derived
+# root must agree with the session, and the sync-guard dry check must pass. Returns the
+# independently derived expected parent for use in --delete.
+function Invoke-Preflight($session) {
+    $expected = Get-ExpectedParent $session
+    if ("$expected".ToLower() -ne "$($session.parentRoot)".ToLower()) {
+        Fail "session parentRoot '$($session.parentRoot)' != independently resolved root '$expected' — refusing"
+    }
+    & $bin sync-guard $session.root $expected $session.runId | ForEach-Object { Write-Host "   $_" }
+    if ($LASTEXITCODE -ne 0) { Fail 'preflight guard refused — session root is not a valid PoC tree' }
+    $expected
+}
+
 function Get-CaseDir($session, [string]$c) {
     $hits = @(Get-ChildItem $session.root -Directory -Filter "case-$c-*")
     if ($hits.Count -ne 1) { Fail "case '$c' resolves to $($hits.Count) folders" }
@@ -148,10 +180,16 @@ function Invoke-ReplaceOnly([string]$caseDir) {
     return 'replaced'
 }
 
-# Issue #23 §4 timeout rule for pass/fail cases: only "change arrived then settled" may proceed.
+# Issue #23 §4 timeout rule for pass/fail cases: ONLY exit 0 ("change arrived then settled") may
+# proceed. Anything else — including unexpected codes from a broken invocation — is fail closed
+# (PR #24 re-review finding 1: a crashed watch must not let the case reach a PASS).
 function Assert-WatchArrived([int]$code) {
-    if ($code -eq 2) { Fail 'INCONCLUSIVE: expected remote change never arrived within the timeout — retry per runbook' }
-    if ($code -eq 3) { Fail 'INCONCLUSIVE: file kept changing and did not settle — retry per runbook' }
+    switch ($code) {
+        0 { return }
+        2 { Fail 'INCONCLUSIVE: expected remote change never arrived within the timeout — retry per runbook' }
+        3 { Fail 'INCONCLUSIVE: file kept changing and did not settle — retry per runbook' }
+        default { Fail "INCONCLUSIVE: watch-stable failed unexpectedly (exit $code)" }
+    }
 }
 
 # DRY-RUN ONLY: fake "endpoint B saved R1". Faithful to the real scenario: the remote version
@@ -184,12 +222,19 @@ function Get-TreeInventory($session) {
     @{ pocRoot = $poc; parentTop = $top }
 }
 
+# Files the harness itself creates during a run — excluded from the conflict-copy hunt so the
+# listing stays readable as cases accumulate (PR #24 re-review). A Drive conflict copy always
+# carries a DIFFERENT name (e.g. "bom (1).xlsx"), so filtering exact known names loses nothing.
+$harnessArtifacts = @('bom.xlsx', 'bom.backup.xlsx', 'bom.app-temp.xlsx', 'bom.remote-temp.xlsx',
+    'log.jsonl', 'state.json')
+
 function Show-NewFiles($session) {
     $before = Get-Content $inventoryPath -Raw | ConvertFrom-Json
     $now = Get-TreeInventory $session
-    $newPoc = @($now.pocRoot | Where-Object { $before.pocRoot -notcontains $_ })
+    $newPoc = @($now.pocRoot | Where-Object {
+            $before.pocRoot -notcontains $_ -and $harnessArtifacts -notcontains (Split-Path $_ -Leaf) })
     $newTop = @($now.parentTop | Where-Object { $before.parentTop -notcontains $_ })
-    Write-Output '-- files new since -Init (conflict-copy candidates) --'
+    Write-Output '-- files new since -Init, harness artifacts excluded (conflict-copy candidates) --'
     if ($newPoc.Count -eq 0 -and $newTop.Count -eq 0) { Write-Output '   (none)' }
     $newPoc | ForEach-Object { Write-Output "   [poc ] $_" }
     $newTop | ForEach-Object { Write-Output "   [top ] $_  <- mirror-root top level" }
@@ -256,17 +301,24 @@ if ($Init) {
 
 if ($Cleanup) {
     $session = Read-Session
-    & $bin sync-guard $session.root $session.parentRoot $session.runId --delete
+    $expected = Invoke-Preflight $session
+    & $bin sync-guard $session.root $expected $session.runId --delete
     if ($LASTEXITCODE -ne 0) { Fail 'sync-guard refused deletion' }
     Write-Output '(session file kept as the run record)'
     exit 0
 }
 
-if ($Scan) { $session = Read-Session; Show-NewFiles $session; exit 0 }
+if ($Scan) {
+    $session = Read-Session
+    Invoke-Preflight $session | Out-Null
+    Show-NewFiles $session
+    exit 0
+}
 
 if ($Simulate) {
     if (-not $Case) { Fail '-Simulate needs -Case' }
     $session = Read-Session
+    Invoke-Preflight $session | Out-Null
     Invoke-SimulateRemote $session (Get-CaseDir $session $Case)
     exit 0
 }
@@ -275,6 +327,7 @@ if ($Simulate) {
 
 if (-not $Case -or -not $Step) { Fail 'need -Init, -Case NN -Step N, -Simulate, -Scan or -Cleanup' }
 $session = Read-Session
+Invoke-Preflight $session | Out-Null
 $caseDir = Get-CaseDir $session $Case
 $target = Join-Path $caseDir 'bom.xlsx'
 Write-Output "== case $Case step $Step  ($caseDir) =="
@@ -379,7 +432,9 @@ switch ("$Case-$Step") {
     '06-2' {
         $st = Read-CaseState $caseDir
         $w = Invoke-Watch $session $caseDir $st.postFp
-        if ($w -eq 3) { Fail 'INCONCLUSIVE: file kept changing and did not settle — retry per runbook' }
+        # Here exit 2 (no local change) is an EXPECTED outcome, exit 0 is observational; anything
+        # else — including unknown codes — is fail closed.
+        if ($w -notin 0, 2) { Fail "INCONCLUSIVE: watch-stable did not end cleanly (exit $w) — retry per runbook" }
         $m = (& $bin marker $target)
         Log-Markers $caseDir $target 'after-b-reconnect'
         if ($m -match 'D2=800') { Fail 'A1 was overwritten by the stale offline copy' }

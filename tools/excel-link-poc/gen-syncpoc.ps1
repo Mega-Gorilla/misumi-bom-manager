@@ -37,7 +37,7 @@ $s.Range('G1').Value2 = '備考'
 
 # Unmistakable dummy parts. Numeric cells get explicit [double] casts (COM writes strings
 # otherwise and formulas break with #VALUE! — step 3 lesson).
-$parts = [string[]]@('TEST-PART-001', 'TEST-PART-002', 'TEST-PART-003', 'TEST-PART-003', 'TEST-PART-005')
+$parts = [string[]]@('TEST-PART-001', 'TEST-PART-002', 'TEST-PART-003', 'TEST-PART-004', 'TEST-PART-005')
 for ($i = 0; $i -lt 5; $i++) {
     $r = $i + 2
     $s.Range("A$r").Value2 = [double]($i + 1)
