@@ -957,9 +957,11 @@ fn main() {
         [c, root, rid, tpl] if c == "sync-init" => {
             sync::cmd_sync_init(Path::new(root), rid, Path::new(tpl))
         }
-        [c, d, rid] if c == "sync-guard" => sync::cmd_sync_guard(Path::new(d), rid, false),
-        [c, d, rid, del] if c == "sync-guard" && del == "--delete" => {
-            sync::cmd_sync_guard(Path::new(d), rid, true)
+        [c, d, parent, rid] if c == "sync-guard" => {
+            sync::cmd_sync_guard(Path::new(d), Path::new(parent), rid, false)
+        }
+        [c, d, parent, rid, del] if c == "sync-guard" && del == "--delete" => {
+            sync::cmd_sync_guard(Path::new(d), Path::new(parent), rid, true)
         }
         _ => {
             eprintln!(
@@ -967,7 +969,8 @@ fn main() {
                  stale-scan <xlsx>  |  verify-structure <xlsx|dir>  |  resolve <path>\n  fingerprint <xlsx>\n  restore <xlsx> <last-hex|none> <true|false>\n  \
                  check-write <xlsx> <cell>\n  \
                  marker <xlsx> [ecCell] [userCell]\n  watch-stable <file> [timeoutS] [stableS] [baselineHex]\n  \
-                 sync-init <mirror-root> <run-id> <template>\n  sync-guard <dir> <run-id> [--delete]"
+                 sync-init <mirror-root> <run-id> <template>\n  \
+                 sync-guard <dir> <expected-parent> <run-id> [--delete]"
             );
             std::process::exit(2);
         }

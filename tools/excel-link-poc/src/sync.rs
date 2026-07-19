@@ -163,15 +163,22 @@ impl WatchJudge {
         if self.changed && !is_change && t.saturating_sub(self.last_change_t) >= self.stable_s {
             return (is_change, Some(WatchOutcome::Converged));
         }
+        (is_change, self.deadline(t))
+    }
+
+    /// Time-limit check, INDEPENDENT of whether the file is currently readable (PR #24 review
+    /// finding 2: a file that stays deleted/locked past the timeout must still end the watch
+    /// as INCONCLUSIVE, not hang forever).
+    pub(crate) fn deadline(&self, t: u64) -> Option<WatchOutcome> {
         if t >= self.timeout_s {
-            let out = if self.changed {
+            Some(if self.changed {
                 WatchOutcome::Unstable
             } else {
                 WatchOutcome::NoChange
-            };
-            return (is_change, Some(out));
+            })
+        } else {
+            None
         }
-        (is_change, None)
     }
 }
 
@@ -207,7 +214,17 @@ pub(crate) fn cmd_watch_stable(
                     }
                 }
             }
-            Err(e) => println!("   [t={t:>4}s] unreadable (mid-sync?): {e}"),
+            Err(e) => {
+                println!("   [t={t:>4}s] unreadable (mid-sync?): {e}");
+                if let Some(o) = judge.deadline(t) {
+                    println!("   [t={t:>4}s] result: {o:?} (file unreadable past the deadline)");
+                    match o {
+                        WatchOutcome::Converged => unreachable!(),
+                        WatchOutcome::NoChange => std::process::exit(2),
+                        WatchOutcome::Unstable => std::process::exit(3),
+                    }
+                }
+            }
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
@@ -255,6 +272,10 @@ pub(crate) struct GuardFacts {
     pub canonical_name: String,
     /// UUID= value read from the sentinel file, if present.
     pub sentinel_uuid: Option<String>,
+    /// canonical(dir).parent() == canonical(expected mirror root). Without this binding, any
+    /// look-alike directory with a matching sentinel ANYWHERE on disk would qualify (PR #24
+    /// review finding 3) — the session JSON alone is editable and cannot be the authority.
+    pub under_expected_parent: bool,
 }
 
 /// Issue #23 §5: delete only when ALL conditions hold. Returns every violated condition
@@ -263,6 +284,9 @@ pub(crate) fn cleanup_violations(f: &GuardFacts, run_id: &str) -> Vec<String> {
     let mut v = Vec::new();
     if f.is_reparse || !f.literal_dir {
         v.push("target is (or resolves through) a junction/symlink — refuse".into());
+    }
+    if !f.under_expected_parent {
+        v.push("target is not directly under the expected mirror root — refuse".into());
     }
     let expect = root_name(run_id);
     if f.canonical_name != expect {
@@ -279,7 +303,7 @@ pub(crate) fn cleanup_violations(f: &GuardFacts, run_id: &str) -> Vec<String> {
     v
 }
 
-fn gather_facts(dir: &Path) -> R<GuardFacts> {
+fn gather_facts(dir: &Path, expected_parent: &Path) -> R<GuardFacts> {
     let meta = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let is_reparse = meta.file_type().is_symlink();
     let canon = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
@@ -296,6 +320,12 @@ fn gather_facts(dir: &Path) -> R<GuardFacts> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let under_expected_parent = match (std::fs::canonicalize(expected_parent), canon.parent()) {
+        (Ok(expect), Some(actual)) => {
+            expect.to_string_lossy().to_lowercase() == actual.to_string_lossy().to_lowercase()
+        }
+        _ => false,
+    };
     let sentinel_uuid = std::fs::read_to_string(canon.join(SENTINEL))
         .ok()
         .and_then(|s| {
@@ -307,19 +337,27 @@ fn gather_facts(dir: &Path) -> R<GuardFacts> {
         is_reparse,
         canonical_name,
         sentinel_uuid,
+        under_expected_parent,
     })
 }
 
-/// sync-guard <dir> <run-id> [--delete] — verify the 5 conditions; with --delete, remove the
-/// tree only when all hold. Exit code is the authority (Ok = allowed).
-pub(crate) fn cmd_sync_guard(dir: &Path, run_id: &str, delete: bool) -> R<()> {
-    let facts = gather_facts(dir)?;
+/// sync-guard <dir> <expected-parent> <run-id> [--delete] — verify the conditions; with
+/// --delete, remove the tree only when all hold. Exit code is the authority (Ok = allowed).
+pub(crate) fn cmd_sync_guard(
+    dir: &Path,
+    expected_parent: &Path,
+    run_id: &str,
+    delete: bool,
+) -> R<()> {
+    let facts = gather_facts(dir, expected_parent)?;
     println!("== sync-guard {} ==", dir.display());
     println!("   canonical name: {}", facts.canonical_name);
+    println!("   expected root : {}", expected_parent.display());
     println!(
-        "   literal dir   : {}   reparse: {}   sentinel UUID: {}",
+        "   literal dir   : {}   reparse: {}   under expected root: {}   sentinel UUID: {}",
         facts.literal_dir,
         facts.is_reparse,
+        facts.under_expected_parent,
         facts.sentinel_uuid.as_deref().unwrap_or("(missing)")
     );
     let violations = cleanup_violations(&facts, run_id);
@@ -433,6 +471,7 @@ mod tests {
             is_reparse: false,
             canonical_name: "__mbm_sync_poc_run1".into(),
             sentinel_uuid: Some("run1".into()),
+            under_expected_parent: true,
         }
     }
 
@@ -467,6 +506,30 @@ mod tests {
             1,
             "another run's tree is off-limits"
         );
+    }
+
+    #[test]
+    fn deadline_fires_without_readable_samples() {
+        // PR #24 finding 2: a file that stays unreadable (deleted/locked) must still end the
+        // watch at the timeout — the deadline check is independent of observe().
+        let fresh = WatchJudge::new(30, 10, None);
+        assert_eq!(fresh.deadline(29), None);
+        assert_eq!(fresh.deadline(30), Some(WatchOutcome::NoChange));
+        let mut seen_change = WatchJudge::new(30, 10, None);
+        seen_change.observe(0, fp(0));
+        seen_change.observe(5, fp(1));
+        assert_eq!(seen_change.deadline(30), Some(WatchOutcome::Unstable));
+    }
+
+    #[test]
+    fn look_alike_outside_expected_root_refused() {
+        // PR #24 finding 3: a directory with the right name AND a matching sentinel, but living
+        // somewhere other than the expected mirror root, must be refused.
+        let f = GuardFacts {
+            under_expected_parent: false,
+            ..good_facts()
+        };
+        assert_eq!(cleanup_violations(&f, "run1").len(), 1);
     }
 
     #[test]

@@ -352,10 +352,10 @@ Issue #23 の試験仕様（8ケース＋プレゼンスON 2ケース・GO/条�
 cargo run -- marker <xlsx> [ec] [user]        # 版マーカー機械読取: markers D2=.. G2=.. fp=..
 cargo run -- watch-stable <f> [tOut] [tStab] [baseHex]  # 収束待ち: exit 0=収束/2=無変化/3=未収束
 cargo run -- sync-init <mirrorRoot> <runId> <template>  # 専用フォルダ+sentinel+ケース11本
-cargo run -- sync-guard <dir> <runId> [--delete]        # 削除5条件の検証（exit code が権威）
+cargo run -- sync-guard <dir> <parentRoot> <runId> [--delete]  # 削除条件の検証（exit code が権威）
 
 pwsh -File gen-syncpoc.ps1                    # テンプレート生成（COM）
-pwsh -File run-sync-poc.ps1 -Init [-DryRun]   # barrier はステップ分割コマンド（sleep 不使用）
+pwsh -File run-sync-poc.ps1 -Init [-DryRun] [-MirrorRoot <path>]  # barrier はステップ分割コマンド
 pwsh -File run-sync-poc.ps1 -Case 03 -Step 1  # 手順は sync-poc-runbook.md
 ```
 
@@ -363,16 +363,18 @@ pwsh -File run-sync-poc.ps1 -Case 03 -Step 1  # 手順は sync-poc-runbook.md
 
 ```
 11ケース × 全ステップ  → すべて期待どおり（合否ケースは PASS 判定・exit 0）
-  02: リモート先行を指紋変化で検出し書き込み拒否   03: 最終指紋照合が置換を競合停止
-  06: 無変化タイムアウト(exit 2)を「B0 が A1 を上書きしない」の PASS として判定
+  02: リモート先行を指紋変化で検出し書き込み拒否（置換前の早期検出）
+  03: 最終照合を通過→barrier before-replace→R1 到着→ReplaceFileW 実行→
+      backupFp≠F0 の事後検出で競合（§4.2.2）。backup が R1 を保全（削除しない）
+  06: 端点A無変化＋A1 生存で PASS-local（合否確定には B/Web の A1 マーカー確認が必要）
   08: ReplaceFileW の backup が B0 のまま残存
-sync-guard: 正当な削除は成立 / wrong-run-id・ミラールート直上は 2 違反を列挙して拒否
-cargo test --locked: 56 passed（sync 9本: マーカー抽出・収束状態機械・guard 5条件）
+sync-guard: 正当な削除は成立 / wrong-run-id・ミラールート直上・期待ルート外の同名フォルダは違反列挙で拒否
+cargo test --locked: 58 passed（sync 11本: マーカー抽出・収束状態機械〔読取不能でも期限で終了〕・guard 条件〔期待親ルート束縛含む〕）
 ```
 
 **証明していないこと**: Drive 実環境の挙動すべて（同期反映・競合コピー・Lost & Found・
 ファイルID/共有リンク維持・バージョン履歴・収束時間）。実測は runbook どおり2端末セッションで行い、
-結果は plan.md §3.12 に記録する。ドライランの端点B模擬は「テンプレート由来の別版で上書き」であり、
+結果は plan.md §3.12 に記録する。ドライランの端点B模擬は「Excel 保存済みの R1 版 fixture で上書き」であり、
 実際の Drive クライアントの置換動作と同一とは限らない。
 
 ## 注意

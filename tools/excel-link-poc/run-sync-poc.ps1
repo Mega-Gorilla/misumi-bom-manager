@@ -20,6 +20,7 @@
 param(
     [switch]$Init,
     [switch]$DryRun,
+    [string]$MirrorRoot,   # explicit mirror-root override (else resolved via H:\マイドライブ.lnk)
     [string]$Case,
     [int]$Step,
     [switch]$Simulate,
@@ -89,8 +90,9 @@ function Log-Markers([string]$caseDir, [string]$file, [string]$label) {
     Write-CaseLog $caseDir @{ event = 'markers'; label = $label; markers = "$m" }
 }
 
-# The app write flow with the Issue #23 barrier points. Returns 'replaced' or 'aborted'.
-function Invoke-AppWrite([string]$caseDir, [switch]$StopAfterRead) {
+# The app write flow with the Issue #23 barrier points. Returns 'replaced', 'aborted',
+# 'conflict-detected' (post-replace, backup != F0) or 'stopped' (at a barrier).
+function Invoke-AppWrite([string]$caseDir, [switch]$StopAfterRead, [switch]$StopBeforeReplace) {
     $target = Join-Path $caseDir 'bom.xlsx'
     $f0 = Get-Fp $target
     Write-CaseLog $caseDir @{ event = 'after-read-f0'; f0 = $f0 }
@@ -102,10 +104,10 @@ function Invoke-AppWrite([string]$caseDir, [switch]$StopAfterRead) {
         Write-CaseLog $caseDir @{ event = 'barrier-stop'; barrier = 'after-read-f0' }
         return 'stopped'
     }
-    Complete-AppWrite $caseDir
+    Complete-AppWrite $caseDir -StopBeforeReplace:$StopBeforeReplace
 }
 
-function Complete-AppWrite([string]$caseDir) {
+function Complete-AppWrite([string]$caseDir, [switch]$StopBeforeReplace) {
     $st = Read-CaseState $caseDir
     $target = Join-Path $caseDir 'bom.xlsx'
     $now = Get-Fp $target
@@ -115,27 +117,52 @@ function Complete-AppWrite([string]$caseDir) {
         Remove-Item $st.temp -Force -ErrorAction SilentlyContinue
         return 'aborted'
     }
+    if ($StopBeforeReplace) {
+        # PR #24 finding 1: this barrier sits AFTER a passing final check and BEFORE ReplaceFileW —
+        # the window plan.md §4.2.2 covers with the post-hoc backup/F0 comparison (case 03).
+        Write-CaseLog $caseDir @{ event = 'barrier-stop'; barrier = 'before-replace' }
+        return 'stopped'
+    }
+    Invoke-ReplaceOnly $caseDir
+}
+
+# ReplaceFileW + the §4.2.2 POST-HOC conflict detection: in the clean path the displaced backup
+# is byte-identical to F0; if it differs, a remote version slipped in after the final check.
+# The backup is NEVER auto-deleted — on conflict it is the only copy of the user's version.
+function Invoke-ReplaceOnly([string]$caseDir) {
+    $st = Read-CaseState $caseDir
+    $target = Join-Path $caseDir 'bom.xlsx'
     $backup = Join-Path $caseDir 'bom.backup.xlsx'
-    Write-CaseLog $caseDir @{ event = 'before-replace' }
+    Write-CaseLog $caseDir @{ event = 'before-replace'; f0 = $st.f0 }
     [System.IO.File]::Replace($st.temp, $target, $backup)
     $post = Get-Fp $target
     $backupFp = Get-Fp $backup
     Write-CaseLog $caseDir @{ event = 'after-replace'; target_fp = $post; backup_fp = $backupFp }
     Save-CaseState $caseDir @{ postFp = $post; backupFp = $backupFp }
     Log-Markers $caseDir $target 'post-replace'
+    if ($backupFp -ne $st.f0) {
+        Write-CaseLog $caseDir @{ event = 'post-replace-conflict'; f0 = $st.f0; backup_fp = $backupFp }
+        Log-Markers $caseDir $backup 'displaced-remote-version (preserved in backup)'
+        return 'conflict-detected'
+    }
     return 'replaced'
 }
 
+# Issue #23 §4 timeout rule for pass/fail cases: only "change arrived then settled" may proceed.
+function Assert-WatchArrived([int]$code) {
+    if ($code -eq 2) { Fail 'INCONCLUSIVE: expected remote change never arrived within the timeout — retry per runbook' }
+    if ($code -eq 3) { Fail 'INCONCLUSIVE: file kept changing and did not settle — retry per runbook' }
+}
+
 # DRY-RUN ONLY: fake "endpoint B saved R1". Faithful to the real scenario: the remote version
-# derives from the ORIGINAL template (B0) — B never saw A's change. G2 flips to 1234 (numeric
-# stand-in for the hand-typed "R1"), then the file is overwritten in place like a sync client.
+# is the Excel-saved R1 twin of the ORIGINAL template (B never saw A's change, and the marker
+# is the same G2="R1" string the live session produces — PR #24 recommendation 2).
 function Invoke-SimulateRemote($session, [string]$caseDir) {
     if (-not $session.dryRun) { Fail '-Simulate is dry-run only; on Drive the real endpoint B acts' }
+    $r1 = Join-Path $dir 'fixtures\syncpoc-remote-r1.xlsx'
+    if (-not (Test-Path $r1)) { Fail 'R1 fixture missing — run gen-syncpoc.ps1 first' }
     $target = Join-Path $caseDir 'bom.xlsx'
-    $tempR = Join-Path $caseDir 'bom.remote-temp.xlsx'
-    & $bin rmw $session.template zip G2 $tempR > $null
-    if ($LASTEXITCODE -ne 0) { Fail 'remote temp generation failed' }
-    Move-Item $tempR $target -Force
+    Copy-Item $r1 $target -Force
     Write-CaseLog $caseDir @{ event = 'simulated-remote-overwrite'; target_fp = (Get-Fp $target) }
     Log-Markers $caseDir $target 'simulated-remote'
 }
@@ -173,6 +200,14 @@ function Show-NewFiles($session) {
 
 if ($Init) {
     & cargo build --quiet 2>$null
+    # Refuse to orphan an existing run: a still-existing root must be cleaned up (via the guard)
+    # before a new session may overwrite session.json (PR #24 finding 3).
+    if (Test-Path $sessionPath) {
+        $old = Get-Content $sessionPath -Raw | ConvertFrom-Json
+        if ($old.root -and (Test-Path $old.root)) {
+            Fail "previous session root still exists: $($old.root) — run -Cleanup first"
+        }
+    }
     $template = Join-Path $dir 'fixtures\syncpoc-template.xlsx'
     if (-not (Test-Path $template)) { Fail 'template missing — run gen-syncpoc.ps1 first' }
     New-Item -ItemType Directory -Force -Path (Join-Path $dir 'out') | Out-Null
@@ -182,13 +217,23 @@ if ($Init) {
         New-Item -ItemType Directory -Force -Path $parentRoot | Out-Null
         $watchTimeout = 20; $watchStable = 3
     } else {
-        $lnk = 'H:\マイドライブ.lnk'
-        if (-not (Test-Path $lnk)) { Fail "$lnk not found — Drive for desktop not running?" }
-        $sh = New-Object -ComObject WScript.Shell
-        $lnkTarget = $sh.CreateShortcut($lnk).TargetPath
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($sh) | Out-Null
-        $parentRoot = RealOf $lnkTarget
-        if (-not $parentRoot) { Fail "cannot resolve $lnkTarget to a real path" }
+        if ($MirrorRoot) {
+            $entry = $MirrorRoot
+        } else {
+            $lnk = 'H:\マイドライブ.lnk'
+            if (-not (Test-Path $lnk)) { Fail "$lnk not found — pass -MirrorRoot or start Drive for desktop" }
+            $sh = New-Object -ComObject WScript.Shell
+            $entry = $sh.CreateShortcut($lnk).TargetPath
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($sh) | Out-Null
+        }
+        $parentRoot = RealOf $entry
+        if (-not $parentRoot) { Fail "cannot resolve $entry to a real path" }
+        # §4.10 authority check on the RESOLVED volume before writing anything (3b decision).
+        $letter = ([System.IO.Path]::GetPathRoot(($parentRoot -replace '^\\\\\?\\', '')))[0]
+        $fs = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='${letter}:'").FileSystem
+        & $bin decide $fs 'true' *> $null
+        if ($LASTEXITCODE -ne 0) { Fail "link decision refused for resolved volume FS '$fs' (fail closed)" }
+        Write-Output "mirror root resolved: $parentRoot  (FS: $fs, decision: Allow)"
         $watchTimeout = 300; $watchStable = 10
     }
 
@@ -211,7 +256,7 @@ if ($Init) {
 
 if ($Cleanup) {
     $session = Read-Session
-    & $bin sync-guard $session.root $session.runId --delete
+    & $bin sync-guard $session.root $session.parentRoot $session.runId --delete
     if ($LASTEXITCODE -ne 0) { Fail 'sync-guard refused deletion' }
     Write-Output '(session file kept as the run record)'
     exit 0
@@ -260,7 +305,7 @@ switch ("$Case-$Step") {
     '02-2' {
         $st = Read-CaseState $caseDir
         $w = Invoke-Watch $session $caseDir $st.f0
-        if ($w -eq 2) { Fail 'R1 never arrived — sync delivered nothing (INCONCLUSIVE, retry)' }
+        Assert-WatchArrived $w
         $now = Get-Fp $target
         if ($now -eq $st.f0) { Fail 'fingerprint unchanged after watch reported a change' }
         Write-CaseLog $caseDir @{ event = 'write-refused'; f0 = $st.f0; current_fp = $now }
@@ -269,37 +314,42 @@ switch ("$Case-$Step") {
         exit 0
     }
 
-    # -- 03 before-replace: temp generated, R1 lands in the window -> final check must stop --
+    # -- 03 before-replace: final check PASSES, R1 lands in the check->replace window, the
+    # -- replace goes through, and the §4.2.2 backup/F0 comparison must catch it AFTERWARDS --
     '03-1' {
-        Invoke-AppWrite $caseDir -StopAfterRead | Out-Null
-        Write-Output '[ ok ] barrier after-read-f0. Endpoint B: type R1 into G2 and save (runbook).'
+        $r = Invoke-AppWrite $caseDir -StopBeforeReplace
+        if ($r -ne 'stopped') { Fail "expected barrier stop before replace, got '$r'" }
+        Write-Output '[ ok ] final check passed; barrier before-replace. Endpoint B: type R1 into G2 and save (runbook).'
         exit 0
     }
     '03-2' {
         $st = Read-CaseState $caseDir
         $w = Invoke-Watch $session $caseDir $st.f0
-        if ($w -eq 2) { Fail 'R1 never arrived — sync delivered nothing (INCONCLUSIVE, retry)' }
-        if ((Complete-AppWrite $caseDir) -eq 'aborted') {
-            Log-Markers $caseDir $target 'after-conflict-stop'
-            Write-Output '[PASS] final fingerprint check stopped the replace (backup/F0 mismatch)'
+        Assert-WatchArrived $w
+        # Deliberately NO re-check of F0 here — this case proves the post-hoc detection.
+        $r = Invoke-ReplaceOnly $caseDir
+        if ($r -eq 'conflict-detected') {
+            Write-Output '[PASS] backup != F0 detected the conflict after ReplaceFileW; R1 preserved in bom.backup.xlsx'
             exit 0
         }
-        Fail 'replace went through over a changed file — user change would be lost'
+        Fail "replace saw no conflict (result '$r') — the R1 version would be silently lost"
     }
 
     # -- 04 remote-after-replace (and 92 presence-ON): A1 replaced, then R1 arrives --
     { $_ -in '04-1', '92-1' } {
         if ((Invoke-AppWrite $caseDir) -ne 'replaced') { Fail 'expected clean replace' }
-        Write-Output '[ ok ] A1 replaced. Endpoint B (sync PAUSED beforehand): type R1, save, resume (runbook).'
+        Write-Output '[ ok ] A1 replaced. BEFORE endpoint B acts: confirm on Drive Web that A1 reached the cloud (runbook).'
+        Write-Output '       Then endpoint B (sync PAUSED beforehand): type R1, save, resume.'
         exit 0
     }
     { $_ -in '04-2', '92-2' } {
         $st = Read-CaseState $caseDir
         $w = Invoke-Watch $session $caseDir $st.postFp
+        Assert-WatchArrived $w
         Log-Markers $caseDir $target 'after-remote-arrival'
         Show-NewFiles $session
         Write-CaseLog $caseDir @{ event = 'observed'; watch_exit = $w }
-        Write-Output '[ ok ] observational: record which marker survived + where the loser went (runbook).'
+        Write-Output '[ ok ] change arrived and settled: record which marker survived + where the loser went (runbook).'
         exit 0
     }
 
@@ -322,21 +372,24 @@ switch ("$Case-$Step") {
     # -- 06 offline return: B held B0 offline; A1 must NOT be overwritten by stale B0 --
     '06-1' {
         if ((Invoke-AppWrite $caseDir) -ne 'replaced') { Fail 'expected clean replace' }
-        Write-Output '[ ok ] A1 replaced+syncing. Endpoint B (offline, UNCHANGED B0): reconnect per runbook.'
+        Write-Output '[ ok ] A1 replaced+syncing. Confirm on Drive Web that A1 reached the cloud,'
+        Write-Output '       THEN endpoint B (offline, UNCHANGED B0): reconnect per runbook.'
         exit 0
     }
     '06-2' {
         $st = Read-CaseState $caseDir
         $w = Invoke-Watch $session $caseDir $st.postFp
+        if ($w -eq 3) { Fail 'INCONCLUSIVE: file kept changing and did not settle — retry per runbook' }
         $m = (& $bin marker $target)
         Log-Markers $caseDir $target 'after-b-reconnect'
+        if ($m -match 'D2=800') { Fail 'A1 was overwritten by the stale offline copy' }
         if ($w -eq 2 -and $m -match 'D2=1234') {
-            Write-Output '[PASS] stale B0 did not overwrite A1 (no local change, A1 marker intact)'
+            Write-Output '[PASS-local] endpoint A unchanged, A1 marker intact. The case verdict ALSO'
+            Write-Output '             requires the A1 marker confirmed on endpoint B and Drive Web (runbook).'
             exit 0
         }
-        if ($m -match 'D2=800') { Fail 'A1 was overwritten by the stale offline copy' }
         Write-CaseLog $caseDir @{ event = 'observed'; watch_exit = $w }
-        Write-Output '[ ok ] file changed but A1 survives — record what arrived (runbook).'
+        Write-Output '[ ok ] file changed but A1 survives locally — record what arrived + confirm B/Web markers (runbook).'
         exit 0
     }
 
