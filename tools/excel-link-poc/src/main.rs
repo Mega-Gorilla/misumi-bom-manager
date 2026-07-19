@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 mod stale_scan;
 mod state;
 mod structure;
+mod sync;
 
 type R<T> = Result<T, String>;
 
@@ -38,6 +39,10 @@ fn fingerprint(path: &Path) -> R<state::Fingerprint> {
     let mut h = Sha256::new();
     h.update(&bytes);
     Ok(h.finalize().into())
+}
+
+fn parse_u64(s: &str) -> R<u64> {
+    s.parse().map_err(|_| format!("not a number: {s}"))
 }
 
 fn parse_fp(hex: &str) -> R<state::Fingerprint> {
@@ -688,8 +693,11 @@ fn cmd_resolve(path: &Path) -> R<()> {
 /// `set_fco=false` is the CONTROL for the lifecycle experiment (PR #21 review finding 2): an
 /// identical write minus fullCalcOnLoad, to prove that opening in Excel recalculates because of
 /// OUR flag, not as a side effect of merely opening.
-fn cmd_rmw_zip(path: &Path, set_fco: bool, cell: &str) -> R<()> {
-    let out = out_path(path, if set_fco { "zip" } else { "zip-nofco" })?;
+fn cmd_rmw_zip(path: &Path, set_fco: bool, cell: &str, out_override: Option<&Path>) -> R<()> {
+    let out = match out_override {
+        Some(p) => p.to_path_buf(),
+        None => out_path(path, if set_fco { "zip" } else { "zip-nofco" })?,
+    };
     println!("== read-modify-write via surgical zip edit (fullCalcOnLoad={set_fco}) ==");
     println!("   in : {}", path.display());
     println!("   out: {}", out.display());
@@ -891,12 +899,18 @@ fn main() {
         [c, p] if c == "inspect" => cmd_inspect(Path::new(p)),
         [c, p] if c == "rmw" => cmd_rmw_umya(Path::new(p)),
         [c, p, b] if c == "rmw" && b == "umya" => cmd_rmw_umya(Path::new(p)),
-        [c, p, b] if c == "rmw" && b == "zip" => cmd_rmw_zip(Path::new(p), true, TARGET_CELL),
-        [c, p, b, cell] if c == "rmw" && b == "zip" => cmd_rmw_zip(Path::new(p), true, cell),
-        [c, p, b] if c == "rmw" && b == "zip-nofco" => {
-            cmd_rmw_zip(Path::new(p), false, TARGET_CELL)
+        [c, p, b] if c == "rmw" && b == "zip" => cmd_rmw_zip(Path::new(p), true, TARGET_CELL, None),
+        [c, p, b, cell] if c == "rmw" && b == "zip" => cmd_rmw_zip(Path::new(p), true, cell, None),
+        // rmw <xlsx> zip <cell> <outPath>  — step 3c: place the temp next to the case target
+        [c, p, b, cell, o] if c == "rmw" && b == "zip" => {
+            cmd_rmw_zip(Path::new(p), true, cell, Some(Path::new(o)))
         }
-        [c, p, b, cell] if c == "rmw" && b == "zip-nofco" => cmd_rmw_zip(Path::new(p), false, cell),
+        [c, p, b] if c == "rmw" && b == "zip-nofco" => {
+            cmd_rmw_zip(Path::new(p), false, TARGET_CELL, None)
+        }
+        [c, p, b, cell] if c == "rmw" && b == "zip-nofco" => {
+            cmd_rmw_zip(Path::new(p), false, cell, None)
+        }
         [c, a, b] if c == "diff" => cmd_diff(Path::new(a), Path::new(b), TARGET_CELL),
         [c, a, b, cell] if c == "diff" => cmd_diff(Path::new(a), Path::new(b), cell),
         [c, p] if c == "verify-structure" => cmd_verify_structure(Path::new(p)),
@@ -925,11 +939,38 @@ fn main() {
         [c, p, last, recalc] if c == "restore" => cmd_restore(Path::new(p), last, recalc == "true"),
         // check-write <xlsx> <cell>  → is writing that cell blocked by an array/spill range?
         [c, p, cell] if c == "check-write" => cmd_check_write(Path::new(p), cell),
+        // ---- step 3c: real-sync PoC (Issue #23) ----
+        [c, p] if c == "marker" => sync::cmd_marker(Path::new(p), "D2", "G2"),
+        [c, p, ec, user] if c == "marker" => sync::cmd_marker(Path::new(p), ec, user),
+        [c, p] if c == "watch-stable" => sync::cmd_watch_stable(Path::new(p), 300, 10, None),
+        [c, p, t, s] if c == "watch-stable" => {
+            (|| sync::cmd_watch_stable(Path::new(p), parse_u64(t)?, parse_u64(s)?, None))()
+        }
+        [c, p, t, s, base] if c == "watch-stable" => (|| {
+            sync::cmd_watch_stable(
+                Path::new(p),
+                parse_u64(t)?,
+                parse_u64(s)?,
+                Some(parse_fp(base)?),
+            )
+        })(),
+        [c, root, rid, tpl] if c == "sync-init" => {
+            sync::cmd_sync_init(Path::new(root), rid, Path::new(tpl))
+        }
+        [c, d, parent, rid] if c == "sync-guard" => {
+            sync::cmd_sync_guard(Path::new(d), Path::new(parent), rid, false)
+        }
+        [c, d, parent, rid, del] if c == "sync-guard" && del == "--delete" => {
+            sync::cmd_sync_guard(Path::new(d), Path::new(parent), rid, true)
+        }
         _ => {
             eprintln!(
                 "usage:\n  inspect <xlsx>\n  rmw <xlsx> [umya|zip]\n  diff <before> <after>\n  \
                  stale-scan <xlsx>  |  verify-structure <xlsx|dir>  |  resolve <path>\n  fingerprint <xlsx>\n  restore <xlsx> <last-hex|none> <true|false>\n  \
-                 check-write <xlsx> <cell>"
+                 check-write <xlsx> <cell>\n  \
+                 marker <xlsx> [ecCell] [userCell]\n  watch-stable <file> [timeoutS] [stableS] [baselineHex]\n  \
+                 sync-init <mirror-root> <run-id> <template>\n  \
+                 sync-guard <dir> <expected-parent> <run-id> [--delete]"
             );
             std::process::exit(2);
         }

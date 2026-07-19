@@ -343,6 +343,40 @@ H:\マイドライブ.lnk → C:\GoogleDrive_hahahadesu（NTFS）→ Allow ← �
   （実務 BOM「YUBI Glove Assy_BOM」が DB にあり、同じコマンドで検証可能 — 実行は別途判断）
 - §7.2 の「定義名・テーブルの追跡手段」「backup 別ボリューム挙動」は未実測（オプション扱い）
 
+## ステップ3c ハーネス（2026-07-19 実装・ドライラン検証済み / Drive 実測は未実施）
+
+Issue #23 の試験仕様（8ケース＋プレゼンスON 2ケース・GO/条件付きGO/INCONCLUSIVE/NO-GO）を
+実行するハーネス。**Drive 実測はまだ行っていない** — ここで証明済みなのはハーネスの機構のみ。
+
+```
+cargo run -- marker <xlsx> [ec] [user]        # 版マーカー機械読取: markers D2=.. G2=.. fp=..
+cargo run -- watch-stable <f> [tOut] [tStab] [baseHex]  # 収束待ち: exit 0=収束/2=無変化/3=未収束
+cargo run -- sync-init <mirrorRoot> <runId> <template>  # 専用フォルダ+sentinel+ケース11本
+cargo run -- sync-guard <dir> <parentRoot> <runId> [--delete]  # 削除条件の検証（exit code が権威）
+
+pwsh -File gen-syncpoc.ps1                    # テンプレート生成（COM）
+pwsh -File run-sync-poc.ps1 -Init [-DryRun] [-MirrorRoot <path>]  # barrier はステップ分割コマンド
+pwsh -File run-sync-poc.ps1 -Case 03 -Step 1  # 手順は sync-poc-runbook.md
+```
+
+**ドライラン実測（-DryRun・ローカルルート・端点Bは直接上書きで模擬）**:
+
+```
+11ケース × 全ステップ  → すべて期待どおり（合否ケースは PASS 判定・exit 0）
+  02: リモート先行を指紋変化で検出し書き込み拒否（置換前の早期検出）
+  03: 最終照合を通過→barrier before-replace→R1 到着→ReplaceFileW 実行→
+      backupFp≠F0 の事後検出で競合（§4.2.2）。backup が R1 を保全（削除しない）
+  06: 端点A無変化＋A1 生存で PASS-local（合否確定には B/Web の A1 マーカー確認が必要）
+  08: ReplaceFileW の backup が B0 のまま残存
+sync-guard: 正当な削除は成立 / wrong-run-id・ミラールート直上・期待ルート外の同名フォルダは違反列挙で拒否
+cargo test --locked: 58 passed（sync 11本: マーカー抽出・収束状態機械〔読取不能でも期限で終了〕・guard 条件〔期待親ルート束縛含む〕）
+```
+
+**証明していないこと**: Drive 実環境の挙動すべて（同期反映・競合コピー・Lost & Found・
+ファイルID/共有リンク維持・バージョン履歴・収束時間）。実測は runbook どおり2端末セッションで行い、
+結果は plan.md §3.12 に記録する。ドライランの端点B模擬は「Excel 保存済みの R1 版 fixture で上書き」であり、
+実際の Drive クライアントの置換動作と同一とは限らない。
+
 ## 注意
 
 - **fixture 生成と目視確認には Excel COM が必要**なため、そこは CI では動かない。ただし
@@ -350,5 +384,5 @@ H:\マイドライブ.lnk → C:\GoogleDrive_hahahadesu（NTFS）→ Allow ← �
 - 本ハーネスは**一時的な調査用**。恒久的な回帰テスト（plan §7.1.1）は go 判定後に
   `src-tauri` 側へフィクスチャ同梱で作る
 - 一時ファイルは**このディレクトリ配下に閉じる**（`fixtures/` `out/` `target/` は `.gitignore`）。
-  クラウド同期フォルダには書かない
+  クラウド同期フォルダへの書き込みは**ステップ3c の専用フォルダ `__mbm_sync_poc_<run-id>/` のみ**（Issue #23 で合意。削除は `sync-guard` の5条件検証を通る経路のみ）
 - `src-tauri` には手を付けていない。go/no-go が出るまで本体クレートの依存を汚さないため
