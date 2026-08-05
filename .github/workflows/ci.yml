@@ -7,6 +7,11 @@
 
 name: CI
 
+# CI は読み取りのみで足りる。既定権限がリポジトリ/Org 設定で広がっても
+# workflow token からの書き込みを不能にしておく (最小権限)。
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -19,6 +24,7 @@ concurrency:
 jobs:
   rust:
     runs-on: windows-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: src-tauri
@@ -31,7 +37,8 @@ jobs:
       - name: Show toolchain
         run: rustup show
 
-      - uses: Swatinem/rust-cache@v2
+      # サードパーティ Action は commit SHA で固定 (タグは可変参照のため)。更新時は SHA を差し替える。
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: src-tauri
 
@@ -53,6 +60,7 @@ jobs:
 
   typecheck:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
