@@ -44,7 +44,8 @@ function Get-Fp([string]$file) {
 
 function RealOf([string]$p) {
     $out = & $bin resolve $p 2>$null | Where-Object { $_ -match '^\s*real\s*:' }
-    if ($out) { ($out -split ':', 2)[1].Trim() } else { $null }
+    # Strip the \\?\ long-path prefix: Get-ChildItem -Filter silently matches nothing under it.
+    if ($out) { ($out -split ':', 2)[1].Trim() -replace '^\\\\\?\\', '' } else { $null }
 }
 
 function Read-Session {
