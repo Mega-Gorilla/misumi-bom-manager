@@ -23,7 +23,7 @@ jobs:
       run:
         working-directory: src-tauri
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # rust-toolchain.toml (リポジトリルート) が 1.96.0 + rustfmt/clippy を固定する。
       # rustup が初回の cargo 実行時に自動インストールするため、明示のツールチェイン
@@ -54,8 +54,8 @@ jobs:
   typecheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
