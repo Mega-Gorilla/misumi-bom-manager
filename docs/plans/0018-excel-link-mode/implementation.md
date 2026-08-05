@@ -119,15 +119,25 @@ CREATE TABLE bom_link_state (
 -- 「取得の最適化」に限定し、この BOM が採用した EC 値の正本はここに置く。
 -- これにより ec_generation が指す DB 状態が BOM 境界で閉じる (他 BOM の再取得が共有 cache を
 -- 更新しても、この BOM のスナップショット・世代は変わらない)。reader/writeback はここを参照する。
+-- 採用 payload と直近試行結果を分離して持つ: §0 の決定「失敗行は既存値を残し警告」を
+-- 再起動・再 open 後も再現するため、失敗の事実を永続化する (UI のその場警告だけでは消える)。
 CREATE TABLE bom_link_quote (
   bom_id        TEXT NOT NULL REFERENCES bom_link(bom_id) ON DELETE CASCADE,
   supplier_code TEXT NOT NULL,
   parts_no      TEXT NOT NULL,
-  payload_json  TEXT NOT NULL,     -- 採用時点の SupplierQuote (supplier_cache と同形)
+  payload_json  TEXT,              -- 採用済み SupplierQuote (supplier_cache と同形)。NULL = 成功採用がまだ無い
   currency      TEXT,
-  fetched_at    TEXT NOT NULL,     -- 元データの取得時刻
-  generation    INTEGER NOT NULL,  -- この行を採用した世代 (bom_link_state.ec_generation)
-  PRIMARY KEY (bom_id, supplier_code, parts_no)
+  fetched_at    TEXT,              -- 採用 payload の取得時刻 (payload と対で更新)
+  generation    INTEGER,           -- この行を採用した世代。NULL = 未採用 (初回失敗のみの行)
+  last_attempt_at     TEXT NOT NULL,   -- 直近試行の時刻 (成功・失敗を問わず更新)
+  last_attempt_status TEXT NOT NULL CHECK (last_attempt_status IN ('ok','error')),
+  last_error_code     TEXT,        -- 機械判別コード (error 時のみ)
+  last_error_message  TEXT,        -- 表示用メッセージ
+  PRIMARY KEY (bom_id, supplier_code, parts_no),
+  CHECK ((payload_json IS NULL) = (generation IS NULL)),
+  CHECK ((payload_json IS NULL) = (fetched_at IS NULL)),
+  CHECK (last_attempt_status <> 'error' OR last_error_code IS NOT NULL),
+  CHECK (last_attempt_status <> 'ok' OR (last_error_code IS NULL AND last_error_message IS NULL))
 );
 
 -- 反映待ち (§4.2.1)。latest-wins のため BOM につき最大1行 (UPSERT)。セル値は持たない。
@@ -160,7 +170,8 @@ CREATE TABLE bom_link_backup (
   created_at     TEXT NOT NULL,
   transferred_at TEXT,                 -- app_data への移送完了時刻 (NULL = 元 backup が残置)
   resolved_at    TEXT,                 -- 競合をユーザーが解決した時刻
-  deleted_at     TEXT                  -- 保持ポリシーによるファイル削除時刻 (台帳行は残す)
+  deleted_at     TEXT,                 -- 保持ポリシーによるファイル削除時刻 (台帳行は残す)
+  CHECK (bom_id IS NULL OR bom_id = origin_bom_id)  -- 生存中 FK と不変 ID の取り違え防止
 );
 CREATE INDEX idx_bom_link_backup_bom ON bom_link_backup(origin_bom_id, created_at);
 CREATE INDEX idx_bom_link_backup_open_conflict
@@ -207,11 +218,16 @@ excel_link/
                   writeback パイプライン(§4.2.2 手順1〜9 を一関数に直列化)
   fingerprint.rs  ファイル全体 SHA-256 (§4.6.1)。読取中の共有違反 → 不安定スナップショット扱いで再試行
   calc_state.rs   CalcState 状態機械・restore()・A1 パーサ・write_blocked (PoC state.rs)
-  env.rs          §4.10 環境判定: 実体解決(canonicalize + .lnk 追跡) + FS 名取得 + link_allowed。
-                  canonicalize の前にパス全構成要素(親ディレクトリ含む)の reparse tag を検査し、
-                  IO_REPARSE_TAG_SYMLINK 検出時は no_writeback へ降格(3b 実測完了まで fail closed。
-                  canonicalize 後は「symlink 経由だった」情報が失われるため事前検査が必須)。
-                  junction(IO_REPARSE_TAG_MOUNT_POINT)は 3b 実測済みのため許可 — tag を区別する
+  env.rs          §4.10 環境判定: 実体解決 + FS 名取得 + link_allowed。fail closed を保証する処理順:
+                  (1) ユーザー入力パスの全構成要素(親ディレクトリ含む)の reparse tag を検査
+                  (2) .lnk を解決(循環検出・最大深度制限)
+                  (3) 解決された各 target についても canonicalize 前に全構成要素を再検査
+                      (.lnk が symlink 配下を指すケースを見逃さない)
+                  (4) IO_REPARSE_TAG_SYMLINK → no_writeback(3b 実測完了まで。canonicalize 後は
+                      経由情報が失われるため事前検査が必須)
+                  (5) IO_REPARSE_TAG_MOUNT_POINT(junction)は 3b 実測済みのため許可候補として続行
+                  (6) cloud placeholder 等の**未知・未検証 tag は no_writeback**(fail closed)
+                  (7) 最後に canonicalize して実体 FS を確認(NTFS 以外は拒否・§4.10)
   xlsx.rs         zip 直編集 RMW: raw copy / sheet_parts(r:id) / patch_cell / patch_calc_pr /
                   spill_ranges / cell_has_formula / XML ウォーカー(cells + sharedStrings + inlineStr)
   contract.rs     構造契約型(V5 テーブル ⇔ Rust 型)・verify_structure(key ベース版)・構造 fp 計算
@@ -278,8 +294,16 @@ excel_link/
   **cache hit でも BOM が初採用 or 前回スナップショットと値が変わった場合は新世代**。
   変化ゼロ（全件失敗・全件同値）は世代を進めない。共有 cache のチャンク commit は従来どおりで良い
   （最適化に過ぎず、途中失敗で共有 cache が進んでもこの BOM の世代整合には影響しない）
-- 部分成功は**構造化された部分成功**として返し、失敗行はスナップショット据え置き（＝§0 の
-  「前回値を残し警告」に接続）。Excel へは成功行のみ書く
+- 部分成功は**構造化された部分成功**として返し、**試行状態を永続化**する（§0 の「前回値を残し警告」を
+  再起動・再 open 後も再現するため。UI のその場警告だけでは消える）:
+  - 失敗行: `payload_json`/`generation` は**据え置き**、`last_attempt_status='error'`＋
+    `last_error_code/message`＋`last_attempt_at` のみ更新。**初回失敗**は payload NULL の状態行を作る
+  - 成功行: payload・fetched_at・generation を更新し `last_attempt_status='ok'`（失敗状態をクリア）
+  - **失敗メタデータだけの更新では世代を進めない**。部分成功時は「成功行のスナップショット更新＋
+    世代更新＋**全対象行の試行状態更新**」を同一トランザクションで確定
+  - snapshot が無い初回失敗の型番で Excel 側にアプリ所有列の既存値がある場合、UI は「保持値」として
+    警告表示するが、**DB 正本値・業務計算には採用しない**（§4.3: Excel 上のアプリ所有値は取り込まない）
+  - Excel へは成功行のみ書く（失敗行のセルはスキップ）
 - 戻り値: `QuoteOutcome { results: Vec<SupplierQuote>, generation: Option<i64>, failed: Vec<…> }`。
   現行の `Promise<SupplierQuote[]>`（src/api/bom.ts）と App.tsx の呼び出しも **PR-4 で同時に更新**し、
   従来 BOM 経路は §9-26 の回帰テスト対象に含める
@@ -329,8 +353,8 @@ ACL スコープに事前宣言する前提だが、リンク対象はダイア�
 | **PR-0** | **CI 導入**: GitHub Actions で cargo test/fmt/clippy（src-tauri）＋ tsc --noEmit（フロント）。Windows ランナー。**既存 clippy 警告3件（lib.rs:363 `useless_conversion`・lib.rs:483/502 `needless_borrows_for_generic_args`）のベースライン修正を同梱**し、`rust-toolchain.toml` で検証済み toolchain を固定（`-A` での握り潰しはしない） | — | — |
 | **PR-1** | **V5 マイグレーション**＋`excel_link/store.rs`＋model 追加。スキーマとクエリのみで挙動変更なし。V4→V5 適用テスト・ロールバック不可の確認・**`bom_link_column` の3状態 CHECK の有効/無効組合せテスト**（app/user/suggest/skipped の valid 各形＋NULL 混在の invalid 形が確実に拒否されること — SQLite の CHECK は NULL で通過するため列挙式で担保） | 4 | 26 |
 | **PR-2** | **純ロジック移植**: calc_state.rs / fingerprint.rs / env.rs（PoC テスト 15本＋α を移植） | 4.5 | （12・14 の基盤。単体テストのみ） |
-| **PR-3** | **読み取り専用リンク成立**: xlsx.rs（ウォーカー＋inlineStr）・reader.rs・contract.rs（key ベース3判定・19テスト再構成）→ `probe/create/open/unlink`（unlink は §1.3 の1トランザクション規則）。§7.1.1 **読み取り系・座標系4項目**の恒久回帰テスト同梱 | 5 | 1, 2, 8, 11, **14**（junction/.lnk/直接パスの実装＋**未検証経路〔symlink 含む〕の fail closed まで** — canonicalize 前の reparse tag 検査で symlink を no_writeback へ降格〔§2.1 env.rs〕。symlink の実測は §6 の別ゲート）, 19, 20, 21 |
-| **PR-4** | **書き戻し**: writeback.rs・backup.rs（6段階移送・§0 の削除述語・保持順位は `origin_bom_id` で計算）→ `apply`。**`quote` の `bom_id` 拡張＋採用スナップショット（`bom_link_quote`）＋世代確定規則（§2.3。スナップショット UPSERT と世代 +1 を同一トランザクション）**。フロント `quote` 呼び出し（src/api/bom.ts・App.tsx）の戻り値型更新と従来 BOM 経路の回帰テスト。patch_cell の穴埋め（セル挿入・文字列値・属性順耐性）。§7.1.1 **競合検出6項目**の恒久回帰テスト＋同型番複数行・部分失敗・cache hit 初採用・他 BOM 取得非干渉の世代テスト同梱 | 6 | 4, **12**（再起動後の stale 維持 = 書き込み後の復元規則）, 13, 15, 16, 18, 22, 23, 24 |
+| **PR-3** | **読み取り専用リンク成立**: xlsx.rs（ウォーカー＋inlineStr）・reader.rs・contract.rs（key ベース3判定・19テスト再構成）→ `probe/create/open/unlink`（unlink は §1.3 の1トランザクション規則）。§7.1.1 **読み取り系・座標系4項目**の恒久回帰テスト同梱 | 5 | 1, 2, 8, 11, **14**（junction/.lnk/直接パスの実装＋**未検証経路の fail closed まで** — §2.1 env.rs の7段階処理順。テスト: 直接 symlink・親 symlink・`.lnk`→symlink 配下・junction・未知 tag を模した判定入力・`.lnk` 循環/深度超過。symlink の実測は §6 の別ゲート）, 19, 20, 21 |
+| **PR-4** | **書き戻し**: writeback.rs・backup.rs（6段階移送・§0 の削除述語・保持順位は `origin_bom_id` で計算）→ `apply`。**`quote` の `bom_id` 拡張＋採用スナップショット（`bom_link_quote`）＋世代確定規則（§2.3。スナップショット UPSERT と世代 +1 を同一トランザクション）**。フロント `quote` 呼び出し（src/api/bom.ts・App.tsx）の戻り値型更新と従来 BOM 経路の回帰テスト。patch_cell の穴埋め（セル挿入・文字列値・属性順耐性）。§7.1.1 **競合検出6項目**の恒久回帰テスト＋世代・試行状態テスト同梱（同型番複数行/部分失敗/cache hit 初採用/他 BOM 取得非干渉/**成功→失敗→再起動後も旧 payload に警告が付く**/**初回失敗が再起動後も残る**/失敗行の書き戻し skip/後続成功で警告クリア＋世代前進/初回失敗＋Excel 既存値は「保持値」警告で DB 不採用） | 6 | 4, **12**（再起動後の stale 維持 = 書き込み後の復元規則）, 13, 15, 16, 18, 22, 23, 24 |
 | **PR-5** | **反映待ち・外部変更検知**: pending（latest-wins）→ `status/confirm/resolve_conflict`。**§9-5 は手動経路まで**（Excel を閉じた後の**手動**再試行で反映が成立。「閉じたことの自動検知→自動反映」は PR-7 で完成） | 7 | **5（手動経路）**, 17, 25 |
 | **PR-6** | **リンクモード UI**: 読み取り専用化（columns.ts editable・Toolbar 行操作・ColumnManager）・fx/stale/unverified 表示・「Excel で編集」「更新」「Excel へ反映」導線・反映待ち/競合表示・**同時編集非対応警告・版履歴復元導線**（§5 参照）・EC 取得失敗行の警告（§0 決定） | 8 | 3, 6, 9, 10 |
 | **PR-7** | **ファイル監視・自動再読込**: watch.rs → `excel_link_watch`。デバウンス幅を実測決定。`~$` オーナーファイル削除の検知で pending を自動再試行 → **§9-5 の完成** | 9 | 7, **5（自動検知の完成）** |
