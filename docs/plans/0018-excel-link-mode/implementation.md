@@ -13,7 +13,7 @@
 |---|---|---|
 | §6.2.1 EC 取得失敗時のアプリ所有列既存値 | **残して警告**（暫定方針を正式化） | ユーザー決定（2026-08-05）。既存値を残し、アプリ UI で「前回値・手動値の可能性あり」を行単位に警告。古い価格が残るリスクは警告表示で緩和。plan.md §6.2.1 を【決定済み】に更新 |
 | CI | **GitHub Actions を導入**（PR-0） | ユーザー決定（2026-08-05）。恒久回帰テスト（§7.1.1）の価値を PR ごとに自動化 |
-| backup 保持ポリシー（§4.2.2「実装時に決定」） | **通常 backup = 直近5件かつ30日で削除。競合 backup（backupFp≠F0）= ユーザーが解決するまで無期限保持** | 台帳（`bom_link_backup`）で管理。削除はファイルのみで台帳行は残す（監査可能性） |
+| backup 保持ポリシー（§4.2.2「実装時に決定」） | **最新5件は必ず残し、かつ30日以内のものも残す。削除条件 = 同一 BOM 内で新しい順の順位 > 5 **AND** 経過 > 30日** | 台帳（`bom_link_backup`）で管理。**削除対象外**: 未解決競合（`is_conflict=1 AND resolved_at IS NULL`）・`volume_temp`（移送途中）。ファイル削除に**成功したときだけ** `deleted_at` を記録し、失敗時は台帳・ファイルとも残して警告。台帳行は削除後も残す（監査可能性） |
 | デバウンス幅（§4.2.3/§7.2） | **PR-7 実装時に実測で決定**（初期値 500ms から調整） | Excel 保存のイベント発火回数は環境依存のため計画では固定しない |
 
 ## 1. V5 マイグレーション（ステップ4）
@@ -57,20 +57,27 @@ CREATE TABLE bom_link (
 );
 
 -- 列マッピング = 構造契約の本体 (§4.7)。Excel 列位置ごとに1行。読み飛ばし列も記録する。
+-- bom_link(bom_id) を参照: リンク解除 (bom_link 行の DELETE) で契約・状態・pending が
+-- cascade 削除され、孤児化・再リンク時の PK 衝突や古い状態の再利用を構造的に防ぐ。
 -- app_key は bom_column.key の論理参照 (FK は張らない: save_bom の full-replace と衝突するため。
 -- リンク BOM の bom_column は読込時に本契約から再生成される表示キャッシュであり、契約が正)。
 CREATE TABLE bom_link_column (
-  bom_id       TEXT NOT NULL REFERENCES bom(id) ON DELETE CASCADE,
+  bom_id       TEXT NOT NULL REFERENCES bom_link(bom_id) ON DELETE CASCADE,
   excel_col    INTEGER NOT NULL,        -- 0-based 列 index (calamine 座標系。A1 変換は xlsx 層)
   header_label TEXT,                    -- 最後に確認したヘッダ表示名 (§4.7: 恒久識別子にしない)
   app_key      TEXT,                    -- アプリ列キー。NULL = 読み飛ばし列
   ownership    TEXT NOT NULL CHECK (ownership IN ('app','user','skipped')),  -- §4.3 二分 + 読み飛ばし
   required     INTEGER NOT NULL DEFAULT 0,   -- 必須列 (§4.9 破綻判定の入力)
   role         TEXT,                    -- 'partNo'/'source' 等。契約として自己完結させる (§4.7)
-  ec_field     TEXT,                    -- app 所有列のみ: 書き戻す EC 項目 (unitPrice/shipDate/subtotal/…)
+  source_field TEXT,                    -- EC 項目 (unitPrice/shipDate/subtotal/product.name/…)
+  projection   TEXT CHECK (projection IN ('writeback','suggest')),
+                                        -- writeback = Excel へ書き戻す (app 所有列のみ)
+                                        -- suggest   = アプリ内表示のみの提案 (user 所有列。Excel へ書かない)
   PRIMARY KEY (bom_id, excel_col),
-  CHECK (ownership <> 'app' OR ec_field IS NOT NULL),
-  CHECK (ownership <> 'skipped' OR app_key IS NULL)
+  CHECK ((source_field IS NULL) = (projection IS NULL)),
+  CHECK (ownership <> 'app' OR projection = 'writeback'),      -- app 所有列は必ず書き戻し対応を持つ
+  CHECK (projection <> 'writeback' OR ownership = 'app'),      -- 書き戻せるのは app 所有列だけ
+  CHECK (ownership <> 'skipped' OR (app_key IS NULL AND source_field IS NULL))
 );
 CREATE UNIQUE INDEX idx_bom_link_column_key
   ON bom_link_column(bom_id, app_key) WHERE app_key IS NOT NULL;
@@ -78,7 +85,7 @@ CREATE UNIQUE INDEX idx_bom_link_column_key
 -- 揮発状態: 読み書きループが毎回更新する側。契約の書き直し(再マッピング)から独立。
 -- ワークブック単位の粒度で足りる (§4.4.2: MVP は全数式一括 stale)。
 CREATE TABLE bom_link_state (
-  bom_id               TEXT PRIMARY KEY REFERENCES bom(id) ON DELETE CASCADE,
+  bom_id               TEXT PRIMARY KEY REFERENCES bom_link(bom_id) ON DELETE CASCADE,
   sync_status          TEXT NOT NULL DEFAULT 'linked'
                          CHECK (sync_status IN ('linked','needs_review','broken','conflict')),
   sync_error           TEXT,            -- 直近のエラー/停止理由 (人間可読 + 機械判別コード prefix)
@@ -102,7 +109,7 @@ CREATE TABLE bom_link_state (
 
 -- 反映待ち (§4.2.1)。latest-wins のため BOM につき最大1行 (UPSERT)。セル値は持たない。
 CREATE TABLE bom_link_pending (
-  bom_id               TEXT PRIMARY KEY REFERENCES bom(id) ON DELETE CASCADE,
+  bom_id               TEXT PRIMARY KEY REFERENCES bom_link(bom_id) ON DELETE CASCADE,
   requested_generation INTEGER NOT NULL,  -- 要求時点の ec_generation (「EC取得世代と対象BOM」のみ)
   requested_at         TEXT NOT NULL,
   last_attempt_at      TEXT,
@@ -147,13 +154,20 @@ CREATE INDEX idx_bom_link_backup_open_conflict
 - **環境降格（§4.10）は `sync_status` に含めない**: 構造の健全性と直交（読取・EC 取得は継続可）。
   `bom_link.env_verdict='no_writeback'` で永続化 = §6.2 の退避経路（読み取り専用降格）の実装点
 - **「反映待ち」は状態値ではなく `bom_link_pending` 行の存在**で表現（latest-wins の UPSERT 対象を1行に限定）
-- **EC 取得世代**: BOM ごとの単調増加整数 `ec_generation`。EC 取得バッチ完了時に +1、
-  「Excel へ反映」要求時に現在値を `bom_link_pending.requested_generation` へ UPSERT（古い要求は上書き）。
+- **EC 取得世代**: BOM ごとの単調増加整数 `ec_generation`。発行経路は §2.3「quote との接続」を参照
+  （既存 `quote` コマンドの拡張）。「Excel へ反映」要求時に現在値を
+  `bom_link_pending.requested_generation` へ UPSERT（古い要求は上書き = latest-wins）。
   書き込み成功時に基になった世代を `applied_generation` に記録し、`requested <= applied` なら pending 削除
 - **`link_field`/`link_write` の読み替え**（§4.3「fillEmpty/overwrite は継続同期で不成立」の帰結）:
   リンク作成ウィザードで既存の `overwrite` リンク列（実在例 `partsName ← product.name`・§3.3）を
-  「**app 所有列として宣言**（`ownership='app'`＋`ec_field`）」か「**suggest に降格**（アプリ内表示のみ・
-  契約は `user`）」の二択で選ばせ、リンク BOM の `bom_column.link_field/link_write` は NULL に正規化する
+  「**app 所有列として宣言**（`ownership='app', projection='writeback', source_field=…`）」か
+  「**suggest に降格**（`ownership='user', projection='suggest', source_field=…` — アプリ内表示のみ・
+  Excel へは書かない）」の二択で選ばせ、リンク BOM の `bom_column.link_field/link_write` は NULL に
+  正規化する。suggest の対応関係（どの EC 項目を提案するか）は契約の `source_field` が保持する
+- **リンク解除（`excel_link_unlink`）は1トランザクション**で行う:
+  最新の安全なスナップショット（bom_column/bom_row）を確定 → `bom_link` 行を DELETE →
+  契約・状態・pending が FK cascade で消える。backup 台帳（`bom(id)` 参照・SET NULL）だけが履歴として残る。
+  再リンク時は必ず素の状態から開始される（古い指紋・世代・pending を引き継がない）
 
 ## 2. src-tauri モジュール構成と PoC 移植（ステップ4〜9 共通の骨格）
 
@@ -190,7 +204,7 @@ excel_link/
 |---|---|---|
 | state.rs: `CalcState`/`restore`/`Persisted`/`parse_cell`/`parse_range`/`write_blocked`＋15テスト | calc_state.rs | **ほぼ verbatim**。`Persisted` の供給元を `bom_link_state` に接続 |
 | state.rs: `LinkDecision`/`link_allowed` | env.rs | 純関数そのまま。実体解決（canonicalize・.lnk・FS 名取得）を追加 |
-| structure.rs: `Verdict`/`SheetObs`/異常収集/`finalize`（Broken>Confirm>Safe・fail closed）＋19テスト | contract.rs | **`Contract` は key ベースへ再設計**（§3.11: PoC の label 連続列前提は移設不可）。判定骨格とテスト意図は維持し、fixture を key ベースへ書き換え |
+| structure.rs: `Verdict`/`SheetObs`/異常収集/`finalize`（Broken>Confirm>Safe・fail closed）＋19テスト | contract.rs | **`Contract` は key ベースへ再設計**（§3.11: PoC の label 連続列前提は移設不可。`ColumnContract{app_key, excel_col, header_label, ownership, required, role, source_field, projection}`）。判定骨格とテスト意図は維持し、fixture を key ベースへ書き換え |
 | main.rs: `fingerprint()` | fingerprint.rs | ＋共有違反時の再試行（§4.6.1） |
 | main.rs: `read_all_bytes`/`sheet_parts`/`sheet_part_for`/`patch_calc_pr`/raw copy ループ | xlsx.rs | ほぼそのまま（バイト保全は §3.9 実測済み） |
 | main.rs: `patch_cell` | xlsx.rs | **PoC の穴を塞ぐ**: ①対象セル不在時の `<c>` 挿入 ②文字列値の書き込み ③属性順が異なる writer への耐性（対象セル近傍のみ寛容パース。他パートはバイトコピー維持） |
@@ -216,6 +230,22 @@ excel_link/
 | `excel_link_watch(bom_id, enable)` | 監視の開始/停止。検知は `emit("excel-link:changed")` → フロントが `excel_link_open` | `()` |
 
 - 「Excel で編集」はファイル起動のみ（§4.2）→ 既存 `tauri-plugin-opener` をフロント直用、専用コマンドなし
+
+**quote との接続（`ec_generation` の発行経路）** — 現行 `quote` コマンドは `bom_id` を受け取らないため、
+どの BOM の世代を進めるか判断できない。次のとおり拡張する（新コマンドは作らない — 取得フロー・進捗
+イベント・キャッシュ書き込みは従来 BOM と共通のため）:
+
+- `quote` に **省略可能な `bom_id: Option<String>`** を追加（従来 BOM・非リンク呼び出しは None で従来挙動）
+- 世代の確定規則: コマンド完了時、**1件でも取得成功して `supplier_cache` を更新したら**
+  対象 BOM の `ec_generation` を +1（DB 状態が変わった＝新世代）。**全件失敗・コマンド全体失敗では
+  世代を進めない**（反映すべき新しい状態が生まれていないため）。部分失敗の失敗行は §0 の決定どおり
+  既存値を残し警告（Excel へは成功行のみ書く）
+- 戻り値に確定した世代を含める: `QuoteOutcome { …既存…, generation: Option<i64> }`
+- 実装・テストは **PR-4**（`applied_generation` を使う書き戻しと同時。同じ型番が複数行ある BOM で
+  行ごとの数量・小計が正しいこと〔§9-18〕・部分失敗時に世代が進み失敗行が警告接続されることをテスト）。
+  latest-wins（取得→取得→反映で最新世代のみ反映・§9-17）のテストは **PR-5**、
+  失敗行の「前回値・手動値の可能性あり」UI 表示は **PR-6**
+
 - **3判定・反映結果は `Result<T,String>` の Err に落とさず成功系 enum で返す**（Err は I/O・DB 障害のみ）:
 
 ```rust
@@ -255,14 +285,14 @@ ACL スコープに事前宣言する前提だが、リンク対象はダイア�
 
 | PR | 内容 | ステップ | §9 受け入れ条件 |
 |---|---|---|---|
-| **PR-0** | **CI 導入**: GitHub Actions で cargo test/fmt/clippy（src-tauri）＋ tsc --noEmit（フロント）。Windows ランナー | — | — |
+| **PR-0** | **CI 導入**: GitHub Actions で cargo test/fmt/clippy（src-tauri）＋ tsc --noEmit（フロント）。Windows ランナー。**既存 clippy 警告3件（lib.rs:363 `useless_conversion`・lib.rs:483/502 `needless_borrows_for_generic_args`）のベースライン修正を同梱**し、`rust-toolchain.toml` で検証済み toolchain を固定（`-A` での握り潰しはしない） | — | — |
 | **PR-1** | **V5 マイグレーション**＋`excel_link/store.rs`＋model 追加。スキーマとクエリのみで挙動変更なし。V4→V5 適用テスト・ロールバック不可の確認 | 4 | 26 |
 | **PR-2** | **純ロジック移植**: calc_state.rs / fingerprint.rs / env.rs（PoC テスト 15本＋α を移植） | 4.5 | （12・14 の基盤。単体テストのみ） |
-| **PR-3** | **読み取り専用リンク成立**: xlsx.rs（ウォーカー＋inlineStr）・reader.rs・contract.rs（key ベース3判定・19テスト再構成）→ `probe/create/open/unlink`。§7.1.1 **読み取り系・座標系4項目**の恒久回帰テスト同梱 | 5 | 1, 2, 8, 11, **14**（リンク時の環境判定）, 19, 20, 21 |
-| **PR-4** | **書き戻し**: writeback.rs・backup.rs（6段階移送）→ `apply`。patch_cell の穴埋め（セル挿入・文字列値・属性順耐性）。§7.1.1 **競合検出6項目**の恒久回帰テスト同梱 | 6 | 4, **12**（再起動後の stale 維持 = 書き込み後の復元規則）, 13, 15, 16, 18, 22, 23, 24 |
-| **PR-5** | **反映待ち・外部変更検知**: pending（latest-wins）→ `status/confirm/resolve_conflict` | 7 | 5, 17, 25 |
+| **PR-3** | **読み取り専用リンク成立**: xlsx.rs（ウォーカー＋inlineStr）・reader.rs・contract.rs（key ベース3判定・19テスト再構成）→ `probe/create/open/unlink`（unlink は §1.3 の1トランザクション規則）。§7.1.1 **読み取り系・座標系4項目**の恒久回帰テスト同梱 | 5 | 1, 2, 8, 11, **14**（junction/.lnk/直接パスの実装＋**未検証経路〔symlink 含む〕の fail closed まで**。symlink の実測は §6 の別ゲート）, 19, 20, 21 |
+| **PR-4** | **書き戻し**: writeback.rs・backup.rs（6段階移送・§0 の削除述語）→ `apply`。**`quote` の `bom_id` 拡張と世代確定規則（§2.3）**。patch_cell の穴埋め（セル挿入・文字列値・属性順耐性）。§7.1.1 **競合検出6項目**の恒久回帰テスト＋同型番複数行・部分失敗の世代テスト同梱 | 6 | 4, **12**（再起動後の stale 維持 = 書き込み後の復元規則）, 13, 15, 16, 18, 22, 23, 24 |
+| **PR-5** | **反映待ち・外部変更検知**: pending（latest-wins）→ `status/confirm/resolve_conflict`。**§9-5 は手動経路まで**（Excel を閉じた後の**手動**再試行で反映が成立。「閉じたことの自動検知→自動反映」は PR-7 で完成） | 7 | **5（手動経路）**, 17, 25 |
 | **PR-6** | **リンクモード UI**: 読み取り専用化（columns.ts editable・Toolbar 行操作・ColumnManager）・fx/stale/unverified 表示・「Excel で編集」「更新」「Excel へ反映」導線・反映待ち/競合表示・**同時編集非対応警告・版履歴復元導線**（§5 参照）・EC 取得失敗行の警告（§0 決定） | 8 | 3, 6, 9, 10 |
-| **PR-7** | **ファイル監視・自動再読込**: watch.rs → `excel_link_watch`。デバウンス幅を実測決定 | 9 | 7 |
+| **PR-7** | **ファイル監視・自動再読込**: watch.rs → `excel_link_watch`。デバウンス幅を実測決定。`~$` オーナーファイル削除の検知で pending を自動再試行 → **§9-5 の完成** | 9 | 7, **5（自動検知の完成）** |
 
 - 順序: PR-0 → PR-1 → PR-2 → PR-3 → PR-4 → PR-5 → PR-6 → PR-7（直列。PR-0 のみ並行可）
 - **PR-3 マージ時点で「読み取り専用リンク」が製品価値として成立**する（§5 確定ルール11:
@@ -305,7 +335,9 @@ ACL スコープに事前宣言する前提だが、リンク対象はダイア�
 
 ## 6. 実装フェーズに持ち越す残作業（本書のスコープ外）
 
-- 3b の symlink 実測（開発者モード or 管理者権限が用意でき次第。それまで fail closed・§3.11）
+- 3b の symlink 実測（開発者モード or 管理者権限が用意でき次第。それまで fail closed・§3.11）。
+  **§9-14 の symlink 部分はこの実測を完了ゲートとする**（PR-3 では「実装＋未検証経路の fail closed」まで。
+  Windows ランナーで symlink 作成が可能なら CI テスト化も検討）
 - デバウンス幅の実測決定（PR-7 内）
 - `calcMode="manual"` 検出ヒューリスティックの実装可否（§4.4.2 検討事項。PR-3 で調査し、
   不成立でも受け入れ条件には影響しない）
