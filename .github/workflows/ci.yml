@@ -1,0 +1,63 @@
+# CI (implementation.md PR-0)
+# - rust: src-tauri の fmt / clippy(-D warnings) / test を Windows で実行
+#   (製品の実行環境が Windows であり、ReplaceFileW 等の windows 系依存を実環境でビルドするため)
+# - typecheck: フロントの tsc --noEmit (プラットフォーム非依存のため ubuntu で高速に)
+# tools/excel-link-poc は対象外: 一時調査用ハーネスであり、ロジックは PR-2〜4 で
+# src-tauri へ移植され §7.1.1 の恒久回帰テストが引き継ぐ。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml (リポジトリルート) が 1.96.0 + rustfmt/clippy を固定する。
+      # rustup が初回の cargo 実行時に自動インストールするため、明示のツールチェイン
+      # セットアップは不要 — ここでは可視化のためにバージョンを表示するだけ。
+      - name: Show toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # tauri::generate_context! が frontendDist (../dist) の存在を要求するため、
+      # フロントをビルドせずに済むようプレースホルダを置く (CI はフロント成果物に依存しない)。
+      - name: Create frontendDist placeholder
+        run: |
+          New-Item -ItemType Directory -Force ../dist | Out-Null
+          Set-Content ../dist/index.html '<!doctype html><title>ci placeholder</title>'
+
+      - name: cargo fmt
+        run: cargo fmt -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit

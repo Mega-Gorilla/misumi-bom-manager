@@ -1,0 +1,5 @@
+# CI と開発環境の Rust を検証済みバージョンに固定する (implementation.md PR-0)。
+# 更新時はローカルで cargo test / clippy を通してからこのファイルを上げること。
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

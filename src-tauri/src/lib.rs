@@ -360,7 +360,7 @@ async fn quote(
                     db::cache_put(&conn, &supplier, p, q).map_err(|e| e.to_string())?;
                 }
             }
-            for (p, q) in parts.into_iter().zip(quotes.into_iter()) {
+            for (p, q) in parts.into_iter().zip(quotes) {
                 map.insert(p, q);
             }
             done += chunk.len();
@@ -480,7 +480,7 @@ async fn misumi_login(app: AppHandle) -> Result<Value, String> {
             // authenticated api-jp request, which the hook captures.
             let logged_in = v.get("loggedIn").and_then(Value::as_bool).unwrap_or(false);
             if logged_in && !nudged {
-                let _ = webview.eval(&format!("window.location.href={:?};", BRIDGE_URL));
+                let _ = webview.eval(format!("window.location.href={:?};", BRIDGE_URL));
                 nudged = true;
             }
         }
@@ -499,7 +499,7 @@ async fn misumi_open_cart(app: AppHandle) -> Result<(), String> {
         .get_webview_window("bridge")
         .ok_or_else(|| "ブリッジWebViewが見つかりません".to_string())?;
     let _ = webview.set_title("MISUMI カート");
-    let _ = webview.eval(&format!("window.location.href={:?};", CART_URL));
+    let _ = webview.eval(format!("window.location.href={:?};", CART_URL));
     let _ = webview.show();
     let _ = webview.set_focus();
     Ok(())
