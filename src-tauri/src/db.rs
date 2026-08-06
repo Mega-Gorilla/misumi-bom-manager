@@ -258,12 +258,20 @@ CREATE TABLE bom_link_backup (
   fp_algo        TEXT NOT NULL DEFAULT 'sha256-v1',
   backup_fp      TEXT NOT NULL,        -- backup の内容指紋 (移送時 SHA-256 照合にも使用)
   f0_fp          TEXT NOT NULL,        -- 書き込みの基になった内容の指紋 F0 (§4.2.2 手順2)
-  is_conflict    INTEGER NOT NULL DEFAULT 0,  -- backup_fp != f0_fp (§4.2.2 手順8)
+  is_conflict    INTEGER NOT NULL DEFAULT 0 CHECK (is_conflict IN (0, 1)),
+                                       -- backup_fp != f0_fp (§4.2.2 手順8)
   created_at     TEXT NOT NULL,
   transferred_at TEXT,                 -- app_data への移送完了時刻 (NULL = 元 backup が残置)
   resolved_at    TEXT,                 -- 競合をユーザーが解決した時刻
   deleted_at     TEXT,                 -- 保持ポリシーによるファイル削除時刻 (台帳行は残す)
-  CHECK (bom_id IS NULL OR bom_id = origin_bom_id)  -- 生存中 FK と不変 ID の取り違え防止
+  CHECK (bom_id IS NULL OR bom_id = origin_bom_id),  -- 生存中 FK と不変 ID の取り違え防止
+  -- 競合は backup_fp != f0_fp から一意に決まる事実であり入力値を信じない (誤った 0 は
+  -- unresolved_conflicts と retention の競合除外から漏れ、外部版の唯一の退避先を失わせる)。
+  CHECK (is_conflict = (backup_fp <> f0_fp)),
+  -- 所在と移送時刻の整合: volume_temp ⇔ 未移送 / app_data ⇔ 移送完了 (mark_transferred のみが遷移)。
+  -- transferred_at 無しの app_data 行が「移送途中の保護 (location='volume_temp' 除外)」を
+  -- すり抜けて retention 候補になることを構造的に防ぐ。
+  CHECK ((location = 'volume_temp') = (transferred_at IS NULL))
 );
 CREATE INDEX idx_bom_link_backup_bom ON bom_link_backup(origin_bom_id, created_at);
 CREATE INDEX idx_bom_link_backup_open_conflict

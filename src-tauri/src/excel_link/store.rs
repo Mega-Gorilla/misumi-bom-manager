@@ -8,7 +8,7 @@
 // names for PR-3〜5 (reader/writeback/pending/backup) — no speculative queries.
 
 use crate::model::{
-    BackupLocation, CalcState, EnvVerdict, LinkOwnership, LinkProjection, SyncStatus,
+    BackupLocation, CalcState, EnvVerdict, LinkOwnership, LinkProjection, SupplierQuote, SyncStatus,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -368,20 +368,26 @@ pub struct QuoteRecord {
 }
 
 /// Record a successful adoption: payload/generation move forward, failure state clears.
+/// Payload JSON, currency and fetched_at are all derived from the quote in one place
+/// (the cache_put pattern in db.rs) so the DB column and the payload's own fetchedAt
+/// stay in agreement — adopting a cache hit keeps its ORIGINAL fetch time, not the
+/// adoption time (`last_attempt_at` is what records "now").
 pub fn record_quote_ok(
     conn: &Connection,
     bom_id: &str,
     supplier_code: &str,
     parts_no: &str,
-    payload_json: &str,
-    currency: Option<&str>,
+    quote: &SupplierQuote,
     generation: i64,
 ) -> rusqlite::Result<()> {
+    let payload = serde_json::to_string(quote).unwrap_or_else(|_| "{}".into());
+    let currency = quote.quote.as_ref().and_then(|p| p.currency.clone());
+    let fetched = quote.fetched_at.clone();
     conn.execute(
         "INSERT INTO bom_link_quote(bom_id, supplier_code, parts_no, payload_json, currency, \
            fetched_at, generation, last_attempt_at, last_attempt_status, last_error_code, \
            last_error_message) \
-         VALUES(?1, ?2, ?3, ?4, ?5, datetime('now', 'localtime'), ?6, \
+         VALUES(?1, ?2, ?3, ?4, ?5, COALESCE(?6, datetime('now', 'localtime')), ?7, \
            datetime('now', 'localtime'), 'ok', NULL, NULL) \
          ON CONFLICT(bom_id, supplier_code, parts_no) DO UPDATE SET \
            payload_json = excluded.payload_json, currency = excluded.currency, \
@@ -392,8 +398,9 @@ pub fn record_quote_ok(
             bom_id,
             supplier_code,
             parts_no,
-            payload_json,
+            payload,
             currency,
+            fetched,
             generation
         ],
     )?;
@@ -464,8 +471,12 @@ pub struct PendingRecord {
     pub blocked_reason: Option<String>,
 }
 
-/// Latest-wins upsert: a newer request replaces the older one (never queued), and the
-/// retry bookkeeping restarts because it describes the superseded request.
+/// Latest-wins upsert with monotonicity enforced on the DB side: only a STRICTLY newer
+/// generation replaces the stored request (async completions can reach the DB lock out
+/// of order — a late generation-2 arriving after generation-3 must not regress the
+/// pending row). The retry bookkeeping resets only on that real advance, because it
+/// describes the superseded request; an equal-or-older upsert is a no-op, and a manual
+/// retry goes through the apply command + record_pending_attempt, never through here.
 pub fn upsert_pending(conn: &Connection, bom_id: &str, generation: i64) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO bom_link_pending(bom_id, requested_generation, requested_at) \
@@ -473,7 +484,8 @@ pub fn upsert_pending(conn: &Connection, bom_id: &str, generation: i64) -> rusql
          ON CONFLICT(bom_id) DO UPDATE SET \
            requested_generation = excluded.requested_generation, \
            requested_at = excluded.requested_at, \
-           last_attempt_at = NULL, attempt_count = 0, blocked_reason = NULL",
+           last_attempt_at = NULL, attempt_count = 0, blocked_reason = NULL \
+         WHERE excluded.requested_generation > bom_link_pending.requested_generation",
         params![bom_id, generation],
     )?;
     Ok(())
@@ -521,14 +533,16 @@ pub fn clear_pending(conn: &Connection, bom_id: &str) -> rusqlite::Result<()> {
 // ---- backup ledger (bom_link_backup, §4.2.2) ----------------------------------------
 
 /// Input for a new ledger row, written right after a successful ReplaceFileW.
+/// No `location` / `is_conflict` fields on purpose: a fresh backup always starts
+/// beside the workbook (volume_temp; app_data is reachable only via mark_transferred),
+/// and conflict is a fact derived from the fingerprints — both are set by insert_backup
+/// so a caller mistake cannot strip a conflict backup of its deletion protection.
 pub struct NewBackup {
     pub origin_bom_id: String,
     pub workbook_path: String,
     pub backup_path: String,
-    pub location: BackupLocation,
     pub backup_fp: String,
     pub f0_fp: String,
-    pub is_conflict: bool,
 }
 
 /// `bom_link_backup` row as stored.
@@ -549,20 +563,20 @@ pub struct BackupRecord {
     pub deleted_at: Option<String>,
 }
 
-/// Insert a ledger row (bom_id = origin_bom_id while the BOM is alive) and return its id.
+/// Insert a ledger row (bom_id = origin_bom_id while the BOM is alive) and return its
+/// id. Location starts at volume_temp and conflict is derived (see NewBackup); the V5
+/// CHECKs enforce both invariants against any other write path as well.
 pub fn insert_backup(conn: &Connection, b: &NewBackup) -> rusqlite::Result<i64> {
     conn.execute(
         "INSERT INTO bom_link_backup(bom_id, origin_bom_id, workbook_path, backup_path, \
            location, backup_fp, f0_fp, is_conflict, created_at) \
-         VALUES(?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now', 'localtime'))",
+         VALUES(?1, ?1, ?2, ?3, 'volume_temp', ?4, ?5, ?4 <> ?5, datetime('now', 'localtime'))",
         params![
             b.origin_bom_id,
             b.workbook_path,
             b.backup_path,
-            b.location.as_str(),
             b.backup_fp,
             b.f0_fp,
-            b.is_conflict as i64,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -955,6 +969,24 @@ mod tests {
         }
     }
 
+    /// A quote the way the fetch pipeline produces it (fetched_at set at network time).
+    fn mk_quote(price: &str, fetched_at: &str) -> SupplierQuote {
+        SupplierQuote {
+            supplier_code: "MISUMI".into(),
+            status: "ok".into(),
+            product: None,
+            quote: Some(crate::model::SupplierPricing {
+                currency: Some("JPY".into()),
+                unit_price: Some(price.into()),
+                ..Default::default()
+            }),
+            errors: vec![],
+            warnings: vec![],
+            fetched_at: Some(fetched_at.into()),
+            raw: None,
+        }
+    }
+
     #[test]
     fn quote_error_preserves_adopted_payload() {
         let mut conn = mem();
@@ -981,15 +1013,15 @@ mod tests {
             "b1",
             "MISUMI",
             "TEST-PART-001",
-            "{\"v\":1}",
-            Some("JPY"),
+            &mk_quote("115", "2026-07-05 09:10:00"),
             1,
         )
         .unwrap();
         let q = &list_quotes(&conn, "b1").unwrap()[0];
         assert_eq!(q.last_attempt_status, AttemptStatus::Ok);
-        assert_eq!(q.payload_json.as_deref(), Some("{\"v\":1}"));
+        assert!(q.payload_json.as_deref().unwrap().contains("\"115\""));
         assert_eq!(q.generation, Some(1));
+        assert_eq!(q.currency.as_deref(), Some("JPY"));
         assert!(q.last_error_code.is_none());
 
         // A later failure keeps the adopted payload/generation (§6.2.1: keep and warn).
@@ -997,8 +1029,31 @@ mod tests {
         let q = &list_quotes(&conn, "b1").unwrap()[0];
         assert_eq!(q.last_attempt_status, AttemptStatus::Error);
         assert_eq!(q.last_error_code.as_deref(), Some("http_500"));
-        assert_eq!(q.payload_json.as_deref(), Some("{\"v\":1}"));
+        assert!(q.payload_json.as_deref().unwrap().contains("\"115\""));
         assert_eq!(q.generation, Some(1));
+    }
+
+    #[test]
+    fn quote_adoption_keeps_original_fetch_time() {
+        let mut conn = mem();
+        linked(&mut conn, "b1");
+
+        // Adopting a cache hit later must keep the ORIGINAL fetch time: the DB column
+        // and the payload's own fetchedAt agree, and "now" only lands in last_attempt_at.
+        let old = "2026-07-05 09:10:00";
+        record_quote_ok(
+            &conn,
+            "b1",
+            "MISUMI",
+            "TEST-PART-001",
+            &mk_quote("115", old),
+            1,
+        )
+        .unwrap();
+        let q = &list_quotes(&conn, "b1").unwrap()[0];
+        assert_eq!(q.fetched_at.as_deref(), Some(old));
+        assert!(q.payload_json.as_deref().unwrap().contains(old));
+        assert_ne!(q.last_attempt_at, old);
     }
 
     // -- pending: latest-wins --
@@ -1026,12 +1081,29 @@ mod tests {
         assert_eq!(p.attempt_count, 0);
         assert!(p.blocked_reason.is_none());
 
+        // Monotonicity: a late generation-2 completion (async completions can reach the
+        // DB lock out of order) must NOT regress the pending row — and must not reset
+        // the retry bookkeeping either.
+        record_pending_attempt(&conn, "b1", "file_open").unwrap();
+        upsert_pending(&conn, "b1", 2).unwrap();
+        let p = get_pending(&conn, "b1").unwrap().unwrap();
+        assert_eq!(p.requested_generation, 3);
+        assert_eq!(p.attempt_count, 1);
+        assert_eq!(p.blocked_reason.as_deref(), Some("file_open"));
+
+        // Equal generation is a no-op too (reset happens only on a real advance).
+        upsert_pending(&conn, "b1", 3).unwrap();
+        let p = get_pending(&conn, "b1").unwrap().unwrap();
+        assert_eq!(p.attempt_count, 1);
+
         clear_pending(&conn, "b1").unwrap();
         assert!(get_pending(&conn, "b1").unwrap().is_none());
     }
 
     // -- backup ledger --
 
+    /// Fresh ledger row the way writeback will create it (always volume_temp at first;
+    /// conflict derives from the fingerprints).
     fn seed_backup(conn: &Connection, bom_id: &str, conflict: bool) -> i64 {
         insert_backup(
             conn,
@@ -1039,10 +1111,8 @@ mod tests {
                 origin_bom_id: bom_id.into(),
                 workbook_path: "C:\\work\\bom.xlsx".into(),
                 backup_path: format!("C:\\work\\bom.backup.{}.xlsx", conn.last_insert_rowid()),
-                location: BackupLocation::AppData,
-                backup_fp: "aa".into(),
-                f0_fp: if conflict { "bb" } else { "aa" }.into(),
-                is_conflict: conflict,
+                backup_fp: if conflict { "ff" } else { "aa" }.into(),
+                f0_fp: "aa".into(),
             },
         )
         .unwrap()
@@ -1054,7 +1124,12 @@ mod tests {
         linked(&mut conn, "b1");
         let id = seed_backup(&conn, "b1", true);
 
-        // Transfer bookkeeping.
+        // A fresh backup starts beside the workbook and untransferred (API + CHECK).
+        let b = &list_backups(&conn, "b1").unwrap()[0];
+        assert_eq!(b.location, BackupLocation::VolumeTemp);
+        assert!(b.transferred_at.is_none());
+
+        // Transfer bookkeeping (the only path to app_data).
         mark_transferred(&conn, id, "C:\\appdata\\backups\\b1-1.xlsx").unwrap();
         let b = &list_backups(&conn, "b1").unwrap()[0];
         assert_eq!(b.location, BackupLocation::AppData);
@@ -1077,10 +1152,60 @@ mod tests {
             .execute(
                 "INSERT INTO bom_link_backup(bom_id, origin_bom_id, workbook_path, backup_path, \
                    location, backup_fp, f0_fp, created_at) \
-                 VALUES('b2', 'b1', 'w', 'p', 'app_data', 'aa', 'aa', datetime('now'))",
+                 VALUES('b2', 'b1', 'w', 'p', 'volume_temp', 'aa', 'aa', datetime('now'))",
                 [],
             )
             .is_err());
+    }
+
+    #[test]
+    fn backup_conflict_is_derived_and_cannot_be_understated() {
+        let mut conn = mem();
+        linked(&mut conn, "b1");
+
+        // Differing fingerprints → conflict, regardless of what a caller might intend.
+        let id = seed_backup(&conn, "b1", true);
+        let b = &list_backups(&conn, "b1").unwrap()[0];
+        assert!(b.is_conflict);
+        assert_eq!(unresolved_conflicts(&conn).unwrap().len(), 1);
+
+        // The V5 CHECK rejects any write path that understates the derived fact
+        // (is_conflict=0 with differing fingerprints would strip the deletion
+        // protection from the only copy of the displaced external version).
+        assert!(conn
+            .execute(
+                "INSERT INTO bom_link_backup(bom_id, origin_bom_id, workbook_path, backup_path, \
+                   location, backup_fp, f0_fp, is_conflict, created_at) \
+                 VALUES('b1', 'b1', 'w', 'p2', 'volume_temp', 'ff', 'aa', 0, datetime('now'))",
+                [],
+            )
+            .is_err());
+        // Location/transfer integrity: app_data without transferred_at is rejected.
+        assert!(conn
+            .execute(
+                "INSERT INTO bom_link_backup(bom_id, origin_bom_id, workbook_path, backup_path, \
+                   location, backup_fp, f0_fp, created_at) \
+                 VALUES('b1', 'b1', 'w', 'p3', 'app_data', 'aa', 'aa', datetime('now'))",
+                [],
+            )
+            .is_err());
+
+        // An unresolved conflict never becomes a retention candidate, even old + rank>5.
+        mark_transferred(&conn, id, "C:\\appdata\\backups\\b1-c.xlsx").unwrap();
+        conn.execute(
+            "UPDATE bom_link_backup SET created_at = datetime('now', 'localtime', '-90 days') \
+             WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        for _ in 0..6 {
+            let nid = seed_backup(&conn, "b1", false);
+            mark_transferred(&conn, nid, "C:\\appdata\\backups\\x.xlsx").unwrap();
+        }
+        assert_eq!(
+            retention_candidates(&conn, "b1").unwrap(),
+            Vec::<i64>::new()
+        );
     }
 
     #[test]
@@ -1090,10 +1215,16 @@ mod tests {
 
         // 7 backups, ALL older than 30 days (34-40 days): the age test passes for every
         // row, so what protects ids[2..7] is purely the newest-five rank — and what
-        // exposes ids[0] (rank 7) / ids[1] (rank 6) is rank+age minus the exclusions.
+        // exposes ids[0] (rank 7) / ids[1] (rank 6) is rank+age minus the exclusions:
+        //   ids[0] = unresolved conflict (derived from differing fps at seed time),
+        //   ids[1] = never transferred (stays volume_temp — transfer incomplete).
         let mut ids = Vec::new();
-        for _ in 0..7 {
-            ids.push(seed_backup(&conn, "b1", false));
+        for i in 0..7 {
+            let id = seed_backup(&conn, "b1", i == 0);
+            if i != 1 {
+                mark_transferred(&conn, id, &format!("C:\\appdata\\backups\\b1-{i}.xlsx")).unwrap();
+            }
+            ids.push(id);
         }
         // Spread created_at: ids[0] oldest (-40d) ... ids[6] newest (-34d).
         for (i, id) in ids.iter().enumerate() {
@@ -1104,18 +1235,6 @@ mod tests {
             )
             .unwrap();
         }
-        // ids[0] (rank 7, 40 days old): unresolved conflict → excluded.
-        conn.execute(
-            "UPDATE bom_link_backup SET is_conflict = 1 WHERE id = ?1",
-            [ids[0]],
-        )
-        .unwrap();
-        // ids[1] (rank 6, 39 days old): still volume_temp (transfer incomplete) → excluded.
-        conn.execute(
-            "UPDATE bom_link_backup SET location = 'volume_temp' WHERE id = ?1",
-            [ids[1]],
-        )
-        .unwrap();
         // ids[2..7] (ranks 1-5): old, but within the newest five → kept by rank alone.
         assert_eq!(
             retention_candidates(&conn, "b1").unwrap(),
