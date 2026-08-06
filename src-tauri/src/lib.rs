@@ -27,7 +27,11 @@ use tauri::{
 use tokio::sync::oneshot;
 
 mod db;
-mod model;
+// pub: PR-1 時点では store がプロダクションコード未消費のため、私有 mod だと lib ターゲットで
+// dead_code が発火する (CI は clippy -D warnings)。lib クレートの公開 API として宣言する。
+// model も store の公開シグネチャが参照するため pub (private_interfaces 警告の回避)。
+pub mod excel_link;
+pub mod model;
 mod spreadsheet;
 mod supplier;
 

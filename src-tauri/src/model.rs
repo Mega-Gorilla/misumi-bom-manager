@@ -177,3 +177,179 @@ pub struct PriceHistoryEntry {
     /// Immediate-shippable stock at fetch time (recorded from schema V3 on; NULL before).
     pub stock: Option<i64>,
 }
+
+// ---- Excel link mode enums (schema V5) ----------------------------------------------
+//
+// Wire values (serde) and DB CHECK values share the SAME snake_case strings on purpose:
+// a dual mapping (camelCase on the wire, snake_case in SQL) is a standing source of
+// conversion bugs, and the TS side has no literals for these yet (they arrive in PR-6).
+// `as_str`/`from_db` below are the single DB conversion point and MUST stay in sync
+// with the CHECK constraints in db.rs V5.
+
+/// Structural/sync health of a linked BOM (`bom_link_state.sync_status`).
+/// Transitions: plan.md §4.9 (3判定) + §4.2.2 (conflict); see implementation.md §1.3.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncStatus {
+    Linked,
+    NeedsReview,
+    Broken,
+    Conflict,
+}
+
+impl SyncStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Linked => "linked",
+            Self::NeedsReview => "needs_review",
+            Self::Broken => "broken",
+            Self::Conflict => "conflict",
+        }
+    }
+    pub fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "linked" => Some(Self::Linked),
+            "needs_review" => Some(Self::NeedsReview),
+            "broken" => Some(Self::Broken),
+            "conflict" => Some(Self::Conflict),
+            _ => None,
+        }
+    }
+}
+
+/// Formula-cache trust state of the linked workbook (`bom_link_state.calc_state`,
+/// plan.md §4.4). Workbook-level: MVP marks ALL formula cells stale at once (§4.4.2).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum CalcState {
+    Unverified,
+    Trusted,
+    Stale,
+    Missing,
+}
+
+impl CalcState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+            Self::Trusted => "trusted",
+            Self::Stale => "stale",
+            Self::Missing => "missing",
+        }
+    }
+    pub fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "unverified" => Some(Self::Unverified),
+            "trusted" => Some(Self::Trusted),
+            "stale" => Some(Self::Stale),
+            "missing" => Some(Self::Missing),
+            _ => None,
+        }
+    }
+}
+
+/// Link-environment verdict (`bom_link.env_verdict`, plan.md §4.10): writeback is
+/// allowed only for a resolved local NTFS real path; everything else degrades to
+/// read-only linking (fail closed — also the §6.2 fallback switch).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvVerdict {
+    Allow,
+    NoWriteback,
+}
+
+impl EnvVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::NoWriteback => "no_writeback",
+        }
+    }
+    pub fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "allow" => Some(Self::Allow),
+            "no_writeback" => Some(Self::NoWriteback),
+            _ => None,
+        }
+    }
+}
+
+/// Column ownership in the structure contract (`bom_link_column.ownership`,
+/// plan.md §4.3): app-owned (written back), user-owned (never written), or skipped.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkOwnership {
+    App,
+    User,
+    Skipped,
+}
+
+impl LinkOwnership {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::User => "user",
+            Self::Skipped => "skipped",
+        }
+    }
+    pub fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "app" => Some(Self::App),
+            "user" => Some(Self::User),
+            "skipped" => Some(Self::Skipped),
+            _ => None,
+        }
+    }
+}
+
+/// How an EC field projects onto a contract column (`bom_link_column.projection`):
+/// written back into Excel (app columns) or shown in-app only (user columns, §4.3 —
+/// the old fillEmpty/overwrite import semantics do not survive continuous sync).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkProjection {
+    Writeback,
+    Suggest,
+}
+
+impl LinkProjection {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Writeback => "writeback",
+            Self::Suggest => "suggest",
+        }
+    }
+    pub fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "writeback" => Some(Self::Writeback),
+            "suggest" => Some(Self::Suggest),
+            _ => None,
+        }
+    }
+}
+
+/// Where a replace-backup file currently lives (`bom_link_backup.location`,
+/// plan.md §4.2.2 6-step transfer): still beside the workbook (same volume) or
+/// safely moved into app data (outside any cloud-synced folder — §3.12 case-08).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupLocation {
+    VolumeTemp,
+    AppData,
+}
+
+impl BackupLocation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::VolumeTemp => "volume_temp",
+            Self::AppData => "app_data",
+        }
+    }
+    pub fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "volume_temp" => Some(Self::VolumeTemp),
+            "app_data" => Some(Self::AppData),
+            _ => None,
+        }
+    }
+}
