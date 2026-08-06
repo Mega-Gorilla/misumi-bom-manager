@@ -375,6 +375,10 @@ fn bad_input(msg: String) -> rusqlite::Error {
 /// Record a successful adoption: payload/generation move forward, failure state clears.
 /// The snapshot is the linked BOM's system of record, so only a self-consistent quote
 /// is accepted (fail closed — nothing is written on rejection):
+/// - `status` must be "ok" with no errors: the fetch pipeline stamps fetched_at on
+///   error quotes too, and a JSON column cannot enforce this — this function is the
+///   last line of defense against payload status="error" under last_attempt_status='ok'
+///   (which would clear the §6.2.1 warning and adopt a failure as a generation)
 /// - `fetched_at` is REQUIRED: the DB column and the payload's own fetchedAt must
 ///   agree, and an unknown fetch time must not masquerade as "now" (adopting a cache
 ///   hit keeps its ORIGINAL fetch time; `last_attempt_at` is what records "now")
@@ -388,6 +392,15 @@ pub fn record_quote_ok(
     quote: &SupplierQuote,
     generation: i64,
 ) -> rusqlite::Result<()> {
+    if quote.status != "ok" || !quote.errors.is_empty() {
+        return Err(bad_input(format!(
+            "adoption of {parts_no} rejected: quote status is '{}' with {} error(s) — \
+             only a successful quote may become the adopted snapshot (use \
+             record_quote_error for failures)",
+            quote.status,
+            quote.errors.len()
+        )));
+    }
     let Some(fetched) = quote.fetched_at.clone() else {
         return Err(bad_input(format!(
             "adoption of {parts_no} rejected: quote has no fetched_at (unknown fetch time \
@@ -1077,6 +1090,40 @@ mod tests {
         assert!(record_quote_ok(&conn, "b1", "TEST-PART-001", &q, 1).is_err());
         // Nothing was written — not even a failure row (this is caller input error,
         // not a fetch attempt).
+        assert!(list_quotes(&conn, "b1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn quote_adoption_of_non_ok_quote_is_rejected() {
+        let mut conn = mem();
+        linked(&mut conn, "b1");
+
+        // The fetch pipeline stamps fetched_at on error quotes too — such a quote must
+        // never become the adopted snapshot (payload status="error" would sit under
+        // last_attempt_status='ok', clearing the failure warning and adopting a
+        // failure as a generation).
+        let mut q = mk_quote("115", "2026-07-05 09:10:00");
+        q.status = "error".into();
+        q.errors = vec!["型番が見つかりません".into()];
+        assert!(record_quote_ok(&conn, "b1", "TEST-PART-001", &q, 1).is_err());
+        assert!(list_quotes(&conn, "b1").unwrap().is_empty());
+
+        // status="ok" but with leftover errors violates the normalization contract
+        // (ok ⇔ errors empty) — also rejected.
+        let mut q = mk_quote("115", "2026-07-05 09:10:00");
+        q.errors = vec!["stale error".into()];
+        assert!(record_quote_ok(&conn, "b1", "TEST-PART-001", &q, 1).is_err());
+        assert!(list_quotes(&conn, "b1").unwrap().is_empty());
+
+        // Other non-ok statuses (pending/idle/unknown) fail closed the same way.
+        for status in ["pending", "idle", "???"] {
+            let mut q = mk_quote("115", "2026-07-05 09:10:00");
+            q.status = status.into();
+            assert!(
+                record_quote_ok(&conn, "b1", "TEST-PART-001", &q, 1).is_err(),
+                "accepted status: {status}"
+            );
+        }
         assert!(list_quotes(&conn, "b1").unwrap().is_empty());
     }
 
