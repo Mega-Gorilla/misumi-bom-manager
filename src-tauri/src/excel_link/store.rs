@@ -367,27 +367,41 @@ pub struct QuoteRecord {
     pub last_error_message: Option<String>,
 }
 
+/// Map invalid adoption input onto a rusqlite error before anything reaches the DB.
+fn bad_input(msg: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(msg.into())
+}
+
 /// Record a successful adoption: payload/generation move forward, failure state clears.
-/// Payload JSON, currency and fetched_at are all derived from the quote in one place
-/// (the cache_put pattern in db.rs) so the DB column and the payload's own fetchedAt
-/// stay in agreement — adopting a cache hit keeps its ORIGINAL fetch time, not the
-/// adoption time (`last_attempt_at` is what records "now").
+/// The snapshot is the linked BOM's system of record, so only a self-consistent quote
+/// is accepted (fail closed — nothing is written on rejection):
+/// - `fetched_at` is REQUIRED: the DB column and the payload's own fetchedAt must
+///   agree, and an unknown fetch time must not masquerade as "now" (adopting a cache
+///   hit keeps its ORIGINAL fetch time; `last_attempt_at` is what records "now")
+/// - serialization failures propagate instead of storing an unrestorable placeholder
+/// - the row's supplier code is derived from the quote itself (no second input to
+///   disagree with the payload); currency likewise (the cache_put pattern in db.rs)
 pub fn record_quote_ok(
     conn: &Connection,
     bom_id: &str,
-    supplier_code: &str,
     parts_no: &str,
     quote: &SupplierQuote,
     generation: i64,
 ) -> rusqlite::Result<()> {
-    let payload = serde_json::to_string(quote).unwrap_or_else(|_| "{}".into());
+    let Some(fetched) = quote.fetched_at.clone() else {
+        return Err(bad_input(format!(
+            "adoption of {parts_no} rejected: quote has no fetched_at (unknown fetch time \
+             must not be recorded as the adoption time)"
+        )));
+    };
+    let payload = serde_json::to_string(quote)
+        .map_err(|e| bad_input(format!("adoption of {parts_no} rejected: {e}")))?;
     let currency = quote.quote.as_ref().and_then(|p| p.currency.clone());
-    let fetched = quote.fetched_at.clone();
     conn.execute(
         "INSERT INTO bom_link_quote(bom_id, supplier_code, parts_no, payload_json, currency, \
            fetched_at, generation, last_attempt_at, last_attempt_status, last_error_code, \
            last_error_message) \
-         VALUES(?1, ?2, ?3, ?4, ?5, COALESCE(?6, datetime('now', 'localtime')), ?7, \
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, \
            datetime('now', 'localtime'), 'ok', NULL, NULL) \
          ON CONFLICT(bom_id, supplier_code, parts_no) DO UPDATE SET \
            payload_json = excluded.payload_json, currency = excluded.currency, \
@@ -396,7 +410,7 @@ pub fn record_quote_ok(
            last_error_code = NULL, last_error_message = NULL",
         params![
             bom_id,
-            supplier_code,
+            quote.supplier_code,
             parts_no,
             payload,
             currency,
@@ -1011,7 +1025,6 @@ mod tests {
         record_quote_ok(
             &conn,
             "b1",
-            "MISUMI",
             "TEST-PART-001",
             &mk_quote("115", "2026-07-05 09:10:00"),
             1,
@@ -1041,19 +1054,30 @@ mod tests {
         // Adopting a cache hit later must keep the ORIGINAL fetch time: the DB column
         // and the payload's own fetchedAt agree, and "now" only lands in last_attempt_at.
         let old = "2026-07-05 09:10:00";
-        record_quote_ok(
-            &conn,
-            "b1",
-            "MISUMI",
-            "TEST-PART-001",
-            &mk_quote("115", old),
-            1,
-        )
-        .unwrap();
+        record_quote_ok(&conn, "b1", "TEST-PART-001", &mk_quote("115", old), 1).unwrap();
         let q = &list_quotes(&conn, "b1").unwrap()[0];
         assert_eq!(q.fetched_at.as_deref(), Some(old));
         assert!(q.payload_json.as_deref().unwrap().contains(old));
         assert_ne!(q.last_attempt_at, old);
+        // The row's supplier code comes from the quote itself — no second input that
+        // could disagree with the payload.
+        assert_eq!(q.supplier_code, "MISUMI");
+        assert!(q.payload_json.as_deref().unwrap().contains("\"MISUMI\""));
+    }
+
+    #[test]
+    fn quote_adoption_without_fetch_time_is_rejected() {
+        let mut conn = mem();
+        linked(&mut conn, "b1");
+
+        // fetched_at=None must fail closed: recording "now" would present the adoption
+        // time as a fetch time, and DB column vs payload would disagree again.
+        let mut q = mk_quote("115", "unused");
+        q.fetched_at = None;
+        assert!(record_quote_ok(&conn, "b1", "TEST-PART-001", &q, 1).is_err());
+        // Nothing was written — not even a failure row (this is caller input error,
+        // not a fetch attempt).
+        assert!(list_quotes(&conn, "b1").unwrap().is_empty());
     }
 
     // -- pending: latest-wins --
