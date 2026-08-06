@@ -9,7 +9,7 @@
 // Difference from the PoC: `CalcState` itself lives in model.rs (schema V5 / IPC
 // vocabulary, PR-1) — this module adds the behavior on top instead of redefining it.
 
-use crate::excel_link::fingerprint::{parse_hex, Fingerprint};
+use crate::excel_link::fingerprint::{parse_stored, Fingerprint};
 use crate::excel_link::store::LinkState;
 use crate::model::CalcState;
 
@@ -37,14 +37,20 @@ pub struct Persisted {
 
 /// Build `Persisted` from the V5 state row (implementation.md §2.2: the supply side
 /// of the restore rule). `value_readable` comes from the reader (missing `<v>` is a
-/// property of the file just read, not of the DB). A corrupt stored fingerprint is an
-/// error, not a "never wrote" — treating it as None would silently drop Stale.
+/// property of the file just read, not of the DB). Fail closed on anything the stored
+/// fingerprint pair cannot prove:
+/// - a corrupt hex is an error, not a "never wrote" — None would silently drop Stale
+/// - an `fp_algo` this build does not produce is an error — comparing values across
+///   algorithms is meaningless, and a mere value difference would otherwise read as
+///   "Excel recalculated" and fabricate Trusted (§4.6.1: algo+value are a pair)
 pub fn persisted_from_state(s: &LinkState, value_readable: bool) -> Result<Persisted, String> {
     let last_app_write = match s.last_app_write_fp.as_deref() {
         None => None,
-        Some(hex) => Some(parse_hex(hex).ok_or_else(|| {
-            format!("bom_link_state.last_app_write_fp is not a valid fingerprint: {hex:?}")
-        })?),
+        Some(hex) => Some(parse_stored(
+            &s.fp_algo,
+            hex,
+            "bom_link_state.last_app_write_fp",
+        )?),
     };
     Ok(Persisted {
         last_app_write,
@@ -238,7 +244,7 @@ mod tests {
             sync_error: None,
             calc_state: CalcState::Unverified,
             recalc_requested: recalc,
-            fp_algo: "sha256-v1".into(),
+            fp_algo: crate::excel_link::fingerprint::ALGORITHM.into(),
             last_read_fp: None,
             last_read_at: None,
             last_app_write_fp,
@@ -277,6 +283,22 @@ mod tests {
         // to None would drop Stale and break the §4.4.2 restart guarantee.
         let s = state_row(Some("not-hex".into()), true);
         assert!(persisted_from_state(&s, true).is_err());
+    }
+
+    #[test]
+    fn persisted_from_state_rejects_unknown_fp_algo() {
+        // A perfectly well-formed 64-hex value under an algo this build does not
+        // produce must be rejected: values across algorithms are not comparable, and
+        // a mere difference would otherwise read as "Excel recalculated" and fabricate
+        // Trusted (§4.6.1: fingerprints are an algo+value pair).
+        for algo in ["sha256-v2", "blake3-v1", ""] {
+            let mut s = state_row(Some(to_hex(&fp(7))), true);
+            s.fp_algo = algo.into();
+            assert!(
+                persisted_from_state(&s, true).is_err(),
+                "accepted fp_algo: {algo:?}"
+            );
+        }
     }
 
     // ---- cell / range parsing ----

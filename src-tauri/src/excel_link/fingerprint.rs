@@ -14,6 +14,26 @@ use std::time::Duration;
 /// A content fingerprint. SHA-256 over the whole file (§4.6.1). Compared by value.
 pub type Fingerprint = [u8; 32];
 
+/// The one algorithm this build produces and understands (§4.6.1: fingerprints are
+/// stored as an algorithm+value PAIR). Matches the V5 defaults (bom_link_state.fp_algo,
+/// bom_link_backup.fp_algo). Any stored fingerprint whose algo differs must be treated
+/// as uninterpretable — comparing values across algorithms is meaningless and, in the
+/// §4.4.2 restore rule, would fabricate a Trusted transition.
+pub const ALGORITHM: &str = "sha256-v1";
+
+/// Interpret a stored (algo, hex) pair as a Fingerprint. Err on an algo this build
+/// does not produce and on malformed hex — both fail closed at the call site (`what`
+/// names the column for the message).
+pub fn parse_stored(algo: &str, hex: &str, what: &str) -> Result<Fingerprint, String> {
+    if algo != ALGORITHM {
+        return Err(format!(
+            "{what}: stored fingerprint algorithm {algo:?} is not supported by this \
+             build (expected {ALGORITHM:?}) — values are not comparable"
+        ));
+    }
+    parse_hex(hex).ok_or_else(|| format!("{what} is not a valid {ALGORITHM} fingerprint: {hex:?}"))
+}
+
 /// SHA-256 of the whole file, single attempt.
 pub fn file_fingerprint(path: &Path) -> io::Result<Fingerprint> {
     let bytes = std::fs::read(path)?;
@@ -111,6 +131,16 @@ mod tests {
         assert_eq!(parse_hex(&"g".repeat(64)), None); // non-hex
         assert_eq!(parse_hex(&"a".repeat(63)), None); // odd length
         assert_eq!(parse_hex(&"a".repeat(66)), None); // too long
+    }
+
+    #[test]
+    fn parse_stored_requires_matching_algorithm() {
+        let hex = to_hex(&[7u8; 32]);
+        assert!(parse_stored(ALGORITHM, &hex, "test_col").is_ok());
+        // Well-formed hex under a foreign algo is uninterpretable, not comparable.
+        assert!(parse_stored("sha256-v2", &hex, "test_col").is_err());
+        // And a matching algo still rejects malformed hex.
+        assert!(parse_stored(ALGORITHM, "not-hex", "test_col").is_err());
     }
 
     #[test]
