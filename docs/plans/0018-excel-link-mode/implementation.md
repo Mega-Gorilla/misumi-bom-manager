@@ -326,7 +326,9 @@ excel_link/
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum StructureVerdict {
     Safe    { new_columns: Vec<String> },               // 自動取り込み済み (§4.9)
-    Confirm { reasons: Vec<String>, candidates: Vec<LinkResolutionCandidate> },
+    // structure_fp: 候補生成時の構造指紋 (structure-v1)。PR-5 の confirm が echo back し、
+    // 再読込後の指紋一致を検証してから候補を適用する (鮮度ガード — PR-3 で追加)
+    Confirm { reasons: Vec<String>, candidates: Vec<LinkResolutionCandidate>, structure_fp: String },
     Broken  { reasons: Vec<String> },                   // 取り込み・書き込み禁止
 }
 

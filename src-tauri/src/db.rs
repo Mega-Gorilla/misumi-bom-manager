@@ -410,6 +410,20 @@ pub fn save_bom(conn: &mut Connection, doc: &BomDoc) -> rusqlite::Result<String>
         ],
     )?;
 
+    write_columns_rows(&tx, &id, doc)?;
+
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Full-replace of bom_column/bom_row inside the caller's transaction. Shared by
+/// save_bom and the linked-BOM display-cache persistence (excel_link open), which
+/// must run in the same transaction as its state updates.
+pub(crate) fn write_columns_rows(
+    tx: &rusqlite::Transaction,
+    id: &str,
+    doc: &BomDoc,
+) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM bom_column WHERE bom_id = ?1", [&id])?;
     for (i, c) in doc.columns.iter().enumerate() {
         let (lf, lw) = match &c.link {
@@ -436,9 +450,18 @@ pub fn save_bom(conn: &mut Connection, doc: &BomDoc) -> rusqlite::Result<String>
             params![row.id, id, i as i64, row.no, row.parts_name, row.parts_no, row.order, row.qty, row.material, custom_json, supplier_json],
         )?;
     }
+    Ok(())
+}
 
-    tx.commit()?;
-    Ok(id)
+/// Normalize away the one-shot import link semantics on a linked BOM's display
+/// cache (§1.3): fillEmpty/overwrite do not survive continuous sync — the contract's
+/// source_field carries the projection from here on.
+pub(crate) fn clear_column_links(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE bom_column SET link_field = NULL, link_write = NULL WHERE bom_id = ?1",
+        [id],
+    )?;
+    Ok(())
 }
 
 pub fn delete_bom(conn: &Connection, id: &str) -> rusqlite::Result<()> {
