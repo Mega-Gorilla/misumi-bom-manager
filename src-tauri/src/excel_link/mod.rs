@@ -31,9 +31,11 @@ const FP_BACKOFF: Duration = Duration::from_millis(200);
 pub fn probe(path: &str) -> Result<LinkProbe, String> {
     let p = Path::new(path);
     let env = env::check_env(p);
-    let sheets = reader::probe_sheets(p)?;
+    // File IO targets the RESOLVED real path: a .lnk input is not a zip (review R2).
+    let io_path = io_path_of(&env, p);
+    let sheets = reader::probe_sheets(&io_path)?;
     let mut warnings = Vec::new();
-    if let Ok(mut zip) = xlsx::open_zip(p) {
+    if let Ok(mut zip) = xlsx::open_zip(&io_path) {
         if let Ok(wb) = xlsx::read_part(&mut zip, "xl/workbook.xml") {
             if xlsx::calc_mode(&wb).as_deref() == Some("manual") {
                 warnings.push(calc_mode_warning());
@@ -66,6 +68,15 @@ fn workbook_identity(resolved_path: Option<&str>, workbook_path: &str) -> String
         })
         .unwrap_or_else(|| workbook_path.to_string())
         .to_lowercase()
+}
+
+/// The path all file IO must use: the environment check's resolved real target
+/// when available (collapses .lnk / junction doorways), the input otherwise.
+fn io_path_of(env: &env::EnvCheck, input: &Path) -> std::path::PathBuf {
+    env.resolved_path
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| input.to_path_buf())
 }
 
 /// Contract metadata for the frontend (role / EC projection per mapped column).
@@ -196,7 +207,9 @@ pub fn create_link(
     };
     let base_contract =
         Contract::try_from_store(&transient_header, &columns).map_err(|e| e.to_string())?;
-    let path = Path::new(&config.workbook_path);
+    // File IO targets the resolved real path (review R2: a .lnk input is not a zip).
+    let io_path = io_path_of(&env, Path::new(&config.workbook_path));
+    let path = io_path.as_path();
     if !path.exists() {
         return Err(format!(
             "リンク先ファイルが見つかりません: {}",
@@ -311,6 +324,16 @@ fn env_warning(env: &env::EnvCheck) -> String {
 /// FK cascade, the backup ledger stays.
 pub fn unlink(conn: &mut Connection, bom_id: &str) -> Result<(), String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    // §1.3 "freeze as a conventional BOM": before the contract cascades away,
+    // restore the conventional supplier-link semantics onto the frozen cache —
+    // app-owned columns get their source_field back as bom_column.link_field so
+    // cellDisplayValue keeps rendering the EC columns from the frozen
+    // supplier_json (review R2: without this the EC columns go blank).
+    tx.execute(
+        "UPDATE bom_column SET            link_field = (SELECT lc.source_field FROM bom_link_column lc                           WHERE lc.bom_id = bom_column.bom_id                             AND lc.app_key = bom_column.key AND lc.ownership = 'app'),            link_write = 'overwrite'          WHERE bom_id = ?1 AND key IN            (SELECT app_key FROM bom_link_column WHERE bom_id = ?1 AND ownership = 'app')",
+        [bom_id],
+    )
+    .map_err(|e| e.to_string())?;
     let n = tx
         .execute("DELETE FROM bom_link WHERE bom_id = ?1", [bom_id])
         .map_err(|e| e.to_string())?;
@@ -332,12 +355,10 @@ pub fn open_link(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, S
         .ok_or_else(|| "この BOM は Excel にリンクされていません".to_string())?;
     let prev_doc =
         db_load(conn, bom_id)?.ok_or_else(|| format!("BOM が見つかりません: {bom_id}"))?;
-    let env = env::EnvCheck {
-        verdict: rec.header.env_verdict,
-        resolved_path: rec.header.env_resolved_path.clone(),
-        fs_name: rec.header.env_fs_name.clone(),
-        reason: None,
-    };
+    // Re-run the environment check on every open: file IO must target the RESOLVED
+    // real path, and a retargeted shortcut must not silently swap the linked
+    // workbook (review R2 — fail closed below).
+    let env = env::check_env(Path::new(&rec.header.workbook_path));
 
     // Contract invariants + workbook presence: broken (fail closed), not Err —
     // the caller still gets the previous snapshot to display (§1.3).
@@ -347,7 +368,27 @@ pub fn open_link(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, S
             return broken_view(conn, bom_id, rec.state, prev_doc, env, vec![e.to_string()]);
         }
     };
-    let path = Path::new(&rec.header.workbook_path);
+    if rec.header.env_resolved_path.is_some() {
+        let stored = workbook_identity(
+            rec.header.env_resolved_path.as_deref(),
+            &rec.header.workbook_path,
+        );
+        let now = workbook_identity(env.resolved_path.as_deref(), &rec.header.workbook_path);
+        if stored != now {
+            return broken_view(
+                conn,
+                bom_id,
+                rec.state,
+                prev_doc,
+                env,
+                vec![format!(
+                    "E_WORKBOOK_RETARGETED: リンク先の参照先が変更されています                      (登録時: {stored} → 現在: {now})。別のワークブックを自動採用しません"
+                )],
+            );
+        }
+    }
+    let io_path = io_path_of(&env, Path::new(&rec.header.workbook_path));
+    let path = io_path.as_path();
     if !path.exists() {
         return broken_view(
             conn,
@@ -1082,5 +1123,114 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // ---- review round 2 additions ----
+
+    /// §1.3 freeze: after unlink, the frozen cache must still render EC columns —
+    /// the contract's source_field returns to bom_column.link_field before the
+    /// contract cascades away (review R2-1).
+    #[test]
+    fn unlink_restores_supplier_link_fields() {
+        let mut conn = mem();
+        let path = temp_xlsx(
+            "unlinkmeta.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        store::record_quote_ok(&conn, &bom_id, "TEST-PART-001", &mk_quote("115"), 1).unwrap();
+        open_link(&mut conn, &bom_id).unwrap();
+
+        unlink(&mut conn, &bom_id).unwrap();
+
+        // quote採用→open→unlink→bom_load: the EC column keeps its projection
+        // (link_field restored) and the frozen row keeps its supplier payload, so
+        // the conventional cellDisplayValue can still show 115.
+        let frozen = crate::db::load_bom(&conn, &bom_id).unwrap().unwrap();
+        let ec = frozen
+            .columns
+            .iter()
+            .find(|c| c.key == "ecUnitPrice")
+            .expect("EC column survives");
+        let link = ec.link.as_ref().expect("link_field restored on unlink");
+        assert_eq!(link.field, "quote.unitPrice");
+        assert_eq!(
+            frozen.rows[0]
+                .supplier
+                .as_ref()
+                .and_then(|s| s.quote.as_ref())
+                .and_then(|q| q.unit_price.as_deref()),
+            Some("115")
+        );
+        // User columns stay unlinked.
+        assert!(frozen
+            .columns
+            .iter()
+            .filter(|c| c.key != "ecUnitPrice")
+            .all(|c| c.link.is_none()));
+    }
+
+    /// .lnk end-to-end (review R2-2): probe/create/open resolve the shortcut for
+    /// file IO, the direct path cannot be double-linked, and a retargeted shortcut
+    /// is refused instead of silently adopting another workbook.
+    #[cfg(windows)]
+    #[test]
+    fn lnk_probe_create_open_and_retarget_guard() {
+        let mut conn = mem();
+        let dir = std::env::temp_dir().join("mbm-link-tests-lnk");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let make_wb = |name: &str, part: &str| {
+            let mut wb = rust_xlsxwriter::Workbook::new();
+            let ws = wb.add_worksheet();
+            for (c, h) in ["型番", "数量", "EC単価"].iter().enumerate() {
+                ws.write_string(0, c as u16, *h).unwrap();
+            }
+            ws.write_string(1, 0, part).unwrap();
+            ws.write_number(1, 1, 1.0).unwrap();
+            let p = dir.join(name);
+            wb.save(&p).unwrap();
+            p
+        };
+        let real_a = make_wb("a.xlsx", "TEST-PART-001");
+        let real_b = make_wb("b.xlsx", "TEST-PART-002");
+        let lnk = dir.join("bom.lnk");
+        crate::excel_link::env::write_lnk_for_tests(&lnk, &real_a);
+
+        // probe reads the resolved xlsx, not the .lnk bytes.
+        let probe = probe(&lnk.to_string_lossy()).unwrap();
+        assert!(probe.sheets.iter().any(|s| s.name == "Sheet1"));
+        assert!(probe.sheets[0]
+            .preview
+            .first()
+            .map(|r| r.contains(&"型番".to_string()))
+            .unwrap_or(false));
+
+        // create + open through the shortcut work against the target xlsx.
+        let cfg = config(&lnk);
+        let view = create_link(&mut conn, &cfg).unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
+        assert_eq!(view.doc.rows[0].parts_no.as_deref(), Some("TEST-PART-001"));
+        let bom_id = view.doc.id.clone().unwrap();
+
+        // The direct path is the same real workbook → 1 workbook = 1 link.
+        let err = expect_err(create_link(&mut conn, &config(&real_a)));
+        assert!(err.contains("1ワークブック=1リンク"), "{err}");
+
+        // Retarget the shortcut to another xlsx: open must fail closed, not adopt.
+        crate::excel_link::env::write_lnk_for_tests(&lnk, &real_b);
+        let view = open_link(&mut conn, &bom_id).unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Broken);
+        match view.verdict {
+            StructureVerdict::Broken { reasons } => {
+                assert!(reasons[0].contains("E_WORKBOOK_RETARGETED"), "{reasons:?}")
+            }
+            v => panic!("{v:?}"),
+        }
+        // The previous snapshot is still what the user sees.
+        assert_eq!(view.doc.rows[0].parts_no.as_deref(), Some("TEST-PART-001"));
     }
 }

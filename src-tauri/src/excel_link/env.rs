@@ -369,6 +369,50 @@ pub fn check_env(_input: &Path) -> EnvCheck {
     EnvCheck::refused("env:unsupported_os: environment checks are Windows-only".into())
 }
 
+/// Test-only .lnk writer via the same COM family the resolver reads with
+/// (SetPath + IPersistFile::Save on a fresh-apartment thread). Shared with the
+/// orchestration tests in mod.rs (review R2: .lnk end-to-end flows).
+#[cfg(all(test, windows))]
+pub(crate) fn write_lnk_for_tests(lnk: &Path, target: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::Interface;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    let lnk = lnk.to_path_buf();
+    let target = target.to_path_buf();
+    std::thread::spawn(move || unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
+            .ok()
+            .unwrap();
+        struct G;
+        impl Drop for G {
+            fn drop(&mut self) {
+                unsafe { CoUninitialize() }
+            }
+        }
+        let _g = G;
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+        let tw: Vec<u16> = target
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        link.SetPath(windows::core::PCWSTR(tw.as_ptr())).unwrap();
+        let pf: IPersistFile = link.cast().unwrap();
+        let lw: Vec<u16> = lnk
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        pf.Save(windows::core::PCWSTR(lw.as_ptr()), true).unwrap();
+    })
+    .join()
+    .unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,47 +546,7 @@ mod tests {
             dir
         }
 
-        /// Write a real .lnk via the same COM family the resolver reads with.
-        fn write_lnk(lnk: &Path, target: &Path) {
-            use std::os::windows::ffi::OsStrExt;
-            use windows::core::Interface;
-            use windows::Win32::System::Com::{
-                CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile,
-                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
-            };
-            use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
-            let lnk = lnk.to_path_buf();
-            let target = target.to_path_buf();
-            std::thread::spawn(move || unsafe {
-                CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
-                    .ok()
-                    .unwrap();
-                struct G;
-                impl Drop for G {
-                    fn drop(&mut self) {
-                        unsafe { CoUninitialize() }
-                    }
-                }
-                let _g = G;
-                let link: IShellLinkW =
-                    CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
-                let tw: Vec<u16> = target
-                    .as_os_str()
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                link.SetPath(windows::core::PCWSTR(tw.as_ptr())).unwrap();
-                let pf: IPersistFile = link.cast().unwrap();
-                let lw: Vec<u16> = lnk
-                    .as_os_str()
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                pf.Save(windows::core::PCWSTR(lw.as_ptr()), true).unwrap();
-            })
-            .join()
-            .unwrap();
-        }
+        use super::super::write_lnk_for_tests as write_lnk;
 
         #[test]
         fn plain_ntfs_file_is_allowed() {
