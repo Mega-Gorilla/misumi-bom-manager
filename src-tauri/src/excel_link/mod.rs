@@ -368,7 +368,12 @@ pub fn open_link(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, S
             return broken_view(conn, bom_id, rec.state, prev_doc, env, vec![e.to_string()]);
         }
     };
-    if rec.header.env_resolved_path.is_some() {
+    // The retarget guard compares RESOLVED identities and therefore only fires when
+    // the current check also resolved: an unresolvable-now path (file gone, .lnk
+    // broken) is the MISSING/unreadable case below, and its fallback identity (raw
+    // absolute path — possibly an 8.3 short form, as on CI runners) must not fake a
+    // retarget.
+    if rec.header.env_resolved_path.is_some() && env.resolved_path.is_some() {
         let stored = workbook_identity(
             rec.header.env_resolved_path.as_deref(),
             &rec.header.workbook_path,
