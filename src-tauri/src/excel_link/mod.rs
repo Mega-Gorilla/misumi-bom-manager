@@ -1374,6 +1374,19 @@ mod tests {
         let view = open_link(&mut conn, &bom_id).unwrap();
         assert_eq!(view.sync_status, SyncStatus::Linked);
         assert_eq!(view.doc.rows[0].parts_no.as_deref(), Some("TEST-PART-001"));
+
+        // Reviewer-suggested combination pin: a .lnk POINTING UNDER the symlink —
+        // the exact two-path mix behind review R3 — must behave identically
+        // (read via the resolved real file, writeback refused, link works).
+        let lnk = dir.join("via.lnk");
+        crate::excel_link::env::write_lnk_for_tests(&lnk, &via_sym);
+        let probe2 = super::probe(&lnk.to_string_lossy()).unwrap();
+        assert_eq!(probe2.env.verdict, crate::model::EnvVerdict::NoWriteback);
+        assert!(probe2.sheets.iter().any(|s| s.name == "Sheet1"));
+        // Same real workbook → the 1-workbook=1-link guard must catch the alias.
+        let err = expect_err(create_link(&mut conn, &config(&lnk)));
+        assert!(err.contains("1ワークブック=1リンク"), "{err}");
+
         let _ = std::fs::remove_dir(&sym);
     }
 }
