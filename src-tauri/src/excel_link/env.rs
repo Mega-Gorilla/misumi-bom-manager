@@ -32,6 +32,7 @@ pub fn link_allowed(fs_name: &str, resolved: bool) -> EnvVerdict {
 /// - `resolved_path` + `verdict` + `fs_name`: the WRITEBACK verification (reparse
 ///   walk + real FS); `resolved_path` is only Some when verification reached
 ///   canonicalize
+///
 /// `reason` is NOT persisted (no V5 column — display-only, regenerated per check).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
