@@ -432,9 +432,30 @@ pub struct LinkedBomView {
     pub calc_state: CalcState,
     pub sync_status: SyncStatus,
     pub env: crate::excel_link::env::EnvCheck,
+    /// Contract metadata per mapped column (role / EC projection). Deliberately
+    /// SEPARATE from ColumnDef.link: the one-shot import write policies are
+    /// normalized away for linked BOMs (§1.3) and must not be conflated with the
+    /// contract's projection semantics. The UI (PR-6) maps EC display through this.
+    pub columns_meta: Vec<LinkColumnMeta>,
     pub formula_cells: Vec<FormulaCell>,
     pub truncated: bool,
     pub warnings: Vec<String>,
+}
+
+/// One mapped contract column as the frontend needs it (bom_link_column projection).
+#[derive(Serialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkColumnMeta {
+    pub app_key: String,
+    pub excel_col: i64,
+    pub ownership: LinkOwnership,
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<LinkProjection>,
 }
 
 /// Wizard probe (read-only look at a workbook before linking).

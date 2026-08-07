@@ -74,11 +74,12 @@ pub struct LinkRecord {
 }
 
 /// Create a link: contract header + columns + the initial state row (defaults:
-/// linked/unverified/generation 0), in one transaction. The caller has already run
+/// linked/unverified/generation 0). Runs plain statements — the CALLER owns the
+/// transaction (excel_link::create_link commits this atomically together with the
+/// BOM row, the display cache and the state update). The caller has already run
 /// the §4.10 environment check (its verdict is part of the contract input).
-pub fn create_link(conn: &mut Connection, link: &NewLink) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
-    tx.execute(
+pub fn create_link(conn: &Connection, link: &NewLink) -> rusqlite::Result<()> {
+    conn.execute(
         "INSERT INTO bom_link(bom_id, workbook_path, sheet_name, header_row, data_start_row, \
            env_verdict, env_resolved_path, env_fs_name, env_checked_at, created_at, updated_at) \
          VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now', 'localtime'), \
@@ -95,13 +96,13 @@ pub fn create_link(conn: &mut Connection, link: &NewLink) -> rusqlite::Result<()
         ],
     )?;
     for c in &link.columns {
-        insert_column(&tx, &link.bom_id, c)?;
+        insert_column(conn, &link.bom_id, c)?;
     }
-    tx.execute(
+    conn.execute(
         "INSERT INTO bom_link_state(bom_id) VALUES(?1)",
         [&link.bom_id],
     )?;
-    tx.commit()
+    Ok(())
 }
 
 fn insert_column(conn: &Connection, bom_id: &str, c: &LinkColumn) -> rusqlite::Result<()> {
@@ -193,6 +194,17 @@ pub fn get_link(conn: &Connection, bom_id: &str) -> rusqlite::Result<Option<Link
     }))
 }
 
+/// All linked workbook identities: (bom_id, workbook_path, env_resolved_path).
+/// Used by the 1-workbook=1-link guard (a shared workbook would let one BOM's
+/// write-back read as the other's "Excel recalculated" and fabricate Trusted).
+pub fn list_link_paths(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
+    let mut stmt = conn.prepare("SELECT bom_id, workbook_path, env_resolved_path FROM bom_link")?;
+    let it = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    it.collect()
+}
+
 /// Unlink: delete the `bom_link` row; contract columns, state, quotes and pending are
 /// removed by FK cascade. The backup ledger survives on purpose (origin_bom_id).
 /// The snapshot side of implementation.md §1.3 (freezing bom_column/bom_row) is the
@@ -206,20 +218,19 @@ pub fn delete_link(conn: &Connection, bom_id: &str) -> rusqlite::Result<()> {
 /// volatile state row (design principle 2 in implementation.md §1.1). Also bumps
 /// bom_link.updated_at (the contract changed).
 pub fn replace_columns(
-    conn: &mut Connection,
+    conn: &Connection,
     bom_id: &str,
     columns: &[LinkColumn],
 ) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
-    tx.execute("DELETE FROM bom_link_column WHERE bom_id = ?1", [bom_id])?;
+    conn.execute("DELETE FROM bom_link_column WHERE bom_id = ?1", [bom_id])?;
     for c in columns {
-        insert_column(&tx, bom_id, c)?;
+        insert_column(conn, bom_id, c)?;
     }
-    tx.execute(
+    conn.execute(
         "UPDATE bom_link SET updated_at = datetime('now', 'localtime') WHERE bom_id = ?1",
         [bom_id],
     )?;
-    tx.commit()
+    Ok(())
 }
 
 // ---- volatile state (bom_link_state) ------------------------------------------------
@@ -851,7 +862,7 @@ mod tests {
             source_field: None,
             projection: None,
         }];
-        replace_columns(&mut conn, "b1", &remapped).unwrap();
+        replace_columns(&conn, "b1", &remapped).unwrap();
 
         let rec = get_link(&conn, "b1").unwrap().unwrap();
         assert_eq!(rec.columns, remapped);
@@ -950,7 +961,7 @@ mod tests {
         raw_col(&conn, "excel_col, ownership) VALUES('b1', 31, 'skipped')").unwrap();
         // Same app_key on a DIFFERENT linked BOM is fine (index is per bom_id).
         seed_bom(&conn, "b2");
-        create_link(&mut conn, &sample_link("b2")).unwrap();
+        create_link(&conn, &sample_link("b2")).unwrap();
     }
 
     // -- bom_link_quote: paired CHECKs + §6.2.1 keep-and-warn semantics --

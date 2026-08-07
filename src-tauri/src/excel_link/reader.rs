@@ -218,8 +218,8 @@ pub(crate) fn compose(
             },
             editable: !m.app_owned,
             width: None,
-            link: None, // normalized for linked BOMs (§1.3) — source_field lives in the contract
-            role: None, // roles are contract-side; the display cache does not re-declare them
+            link: None, // normalized for linked BOMs (§1.3) — projection lives in columns_meta
+            role: m.role.clone(), // fetch-pipeline role must survive into the view (partNo/source/orderNo)
         })
         .collect();
 

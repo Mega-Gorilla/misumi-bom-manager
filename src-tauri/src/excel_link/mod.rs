@@ -53,7 +53,73 @@ fn calc_mode_warning() -> String {
         .to_string()
 }
 
-/// Create a link: environment check → contract persistence → first open (§2.3).
+/// Case-insensitive identity of a workbook for the 1-workbook=1-link guard: the
+/// canonical resolved path when the environment check produced one (junction/.lnk
+/// aliases collapse there), the absolute input path otherwise.
+fn workbook_identity(resolved_path: Option<&str>, workbook_path: &str) -> String {
+    resolved_path
+        .map(str::to_string)
+        .or_else(|| {
+            std::path::absolute(workbook_path)
+                .ok()
+                .map(|p| env::strip_verbatim(&p))
+        })
+        .unwrap_or_else(|| workbook_path.to_string())
+        .to_lowercase()
+}
+
+/// Contract metadata for the frontend (role / EC projection per mapped column).
+fn columns_meta(c: &Contract) -> Vec<crate::model::LinkColumnMeta> {
+    let mut mapped: Vec<&contract::MappedColumn> = c.mapped.iter().collect();
+    mapped.sort_by_key(|m| m.excel_col);
+    mapped
+        .into_iter()
+        .map(|m| crate::model::LinkColumnMeta {
+            app_key: m.app_key.clone(),
+            excel_col: m.excel_col as i64,
+            ownership: if m.app_owned {
+                crate::model::LinkOwnership::App
+            } else {
+                crate::model::LinkOwnership::User
+            },
+            required: m.required,
+            role: m.role.clone(),
+            source_field: m.source_field.clone(),
+            projection: m.projection,
+        })
+        .collect()
+}
+
+/// Merge cleanly-adopted new user columns (rule 7) into the stored column list.
+fn adopt_new_columns(
+    existing: &[store::LinkColumn],
+    new_cols: &[contract::NewColumn],
+) -> Vec<store::LinkColumn> {
+    let mut columns = existing.to_vec();
+    let mut keys: BTreeSet<String> = columns.iter().filter_map(|c| c.app_key.clone()).collect();
+    for nc in new_cols {
+        let key = fresh_user_key(&keys, nc.excel_col);
+        keys.insert(key.clone());
+        columns.push(store::LinkColumn {
+            excel_col: nc.excel_col as i64,
+            header_label: Some(nc.label.clone()),
+            app_key: Some(key),
+            ownership: crate::model::LinkOwnership::User,
+            required: false,
+            role: None,
+            source_field: None,
+            projection: None,
+        });
+    }
+    columns
+}
+
+/// Create a link (§2.3). ALL file reads and the structure verdict happen BEFORE any
+/// DB write; creation then commits atomically (BOM row + contract + normalization +
+/// display cache + state) — a failing/broken first read leaves the DB exactly as it
+/// was. Creation requires a Safe verdict: a Confirm/Broken outcome right after the
+/// wizard means the mapping is wrong, and the fix is re-mapping, not persisting a
+/// stopped link.
 pub fn create_link(
     conn: &mut Connection,
     config: &LinkCreateConfig,
@@ -63,30 +129,23 @@ pub fn create_link(
     }
     let env = env::check_env(Path::new(&config.workbook_path));
 
-    // BOM row (FK target): reuse or create fresh.
-    let bom_id = match &config.bom_id {
+    // BOM id (no insert yet — everything commits at the end).
+    let (bom_id, meta, fresh_bom) = match &config.bom_id {
         Some(id) => {
-            if db_load(conn, id)?.is_none() {
-                return Err(format!("BOM が見つかりません: {id}"));
-            }
-            id.clone()
+            let doc = db_load(conn, id)?.ok_or_else(|| format!("BOM が見つかりません: {id}"))?;
+            (id.clone(), doc.meta, false)
         }
-        None => {
-            let doc = BomDoc {
-                id: None,
-                version: 1,
-                meta: BomMeta {
-                    name: config.name.clone(),
-                    imported_from: Some(config.workbook_path.clone()),
-                    qty_multiplier: 1.0,
-                    order_no_separator: None,
-                    updated_at: None,
-                },
-                columns: vec![],
-                rows: vec![],
-            };
-            crate::db::save_bom(conn, &doc).map_err(|e| e.to_string())?
-        }
+        None => (
+            crate::db::new_id(),
+            BomMeta {
+                name: config.name.clone(),
+                imported_from: Some(config.workbook_path.clone()),
+                qty_multiplier: 1.0,
+                order_no_separator: None,
+                updated_at: None,
+            },
+            true,
+        ),
     };
     if store::get_link(conn, &bom_id)
         .map_err(|e| e.to_string())?
@@ -94,7 +153,20 @@ pub fn create_link(
     {
         return Err("この BOM は既に Excel にリンクされています".into());
     }
+    // 1 workbook = 1 link: a shared workbook would poison the per-BOM fingerprints
+    // (one BOM's write-back reads as the other's "Excel recalculated" and can
+    // fabricate Trusted). Aliases (case, junction, .lnk) collapse via the resolved
+    // identity.
+    let identity = workbook_identity(env.resolved_path.as_deref(), &config.workbook_path);
+    for (bid, wpath, rpath) in store::list_link_paths(conn).map_err(|e| e.to_string())? {
+        if workbook_identity(rpath.as_deref(), &wpath) == identity {
+            return Err(format!(
+                "このワークブックは既に別の BOM ({bid}) にリンクされています (1ワークブック=1リンク)"
+            ));
+        }
+    }
 
+    // ---- reads + verdict, all before any DB write ----
     let columns: Vec<store::LinkColumn> = config
         .columns
         .iter()
@@ -109,8 +181,64 @@ pub fn create_link(
             projection: c.projection,
         })
         .collect();
+    let transient_header = store::LinkHeader {
+        bom_id: bom_id.clone(),
+        workbook_path: config.workbook_path.clone(),
+        sheet_name: config.sheet_name.clone(),
+        header_row: config.header_row,
+        data_start_row: config.data_start_row,
+        env_verdict: env.verdict,
+        env_resolved_path: env.resolved_path.clone(),
+        env_fs_name: env.fs_name.clone(),
+        env_checked_at: None,
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    let base_contract =
+        Contract::try_from_store(&transient_header, &columns).map_err(|e| e.to_string())?;
+    let path = Path::new(&config.workbook_path);
+    if !path.exists() {
+        return Err(format!(
+            "リンク先ファイルが見つかりません: {}",
+            config.workbook_path
+        ));
+    }
+    let fp = fingerprint::stable_fingerprint(path, FP_RETRIES, FP_BACKOFF)
+        .map_err(|e| format!("指紋の取得に失敗しました: {e}"))?;
+    let outcome = reader::observe(path, &base_contract)?;
+    let verify = contract::verify_structure(&base_contract, &outcome.sheets);
+    if verify.severity() != Severity::Safe {
+        return Err(format!(
+            "リンク作成時の構造検証で問題が見つかりました。マッピングを見直して再実行してください: {}",
+            verify
+                .anomalies
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+
+    // Adopt columns the wizard did not map (clean new user columns, rule 7).
+    let merged = adopt_new_columns(&columns, &verify.new_columns);
+    let merged_contract =
+        Contract::try_from_store(&transient_header, &merged).map_err(|e| e.to_string())?;
+    let doc = reader::compose(&merged_contract, &outcome, &[], meta.clone(), &bom_id);
+    let persisted = calc_state::Persisted {
+        last_app_write: None,
+        recalc_requested: false,
+        value_readable: outcome.value_readable,
+    };
+    let calc = calc_state::restore(&fp, &persisted);
+    let mut warnings = read_warnings(&outcome);
+
+    // ---- one transaction: BOM + contract + normalization + cache + state ----
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    if fresh_bom || config.bom_id.is_some() {
+        crate::db::upsert_bom_meta(&tx, &bom_id, &meta).map_err(|e| e.to_string())?;
+    }
     store::create_link(
-        conn,
+        &tx,
         &store::NewLink {
             bom_id: bom_id.clone(),
             workbook_path: config.workbook_path.clone(),
@@ -120,14 +248,61 @@ pub fn create_link(
             env_verdict: env.verdict,
             env_resolved_path: env.resolved_path.clone(),
             env_fs_name: env.fs_name.clone(),
-            columns,
+            columns: merged,
         },
     )
     .map_err(|e| format!("リンク契約の保存に失敗しました: {e}"))?;
     // §1.3: the one-shot import link semantics do not survive continuous sync.
-    crate::db::clear_column_links(conn, &bom_id).map_err(|e| e.to_string())?;
+    crate::db::clear_column_links(&tx, &bom_id).map_err(|e| e.to_string())?;
+    crate::db::write_columns_rows(&tx, &bom_id, &doc).map_err(|e| e.to_string())?;
+    let mut st = store::get_state(&tx, &bom_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "リンク状態の初期化に失敗しました".to_string())?;
+    st.sync_status = SyncStatus::Linked;
+    st.calc_state = calc;
+    st.last_read_fp = Some(fingerprint::to_hex(&fp));
+    st.structure_fp = Some(verify.structure_fp.clone());
+    st.data_first_row = Some(merged_contract.data_start_row as i64);
+    st.data_last_row = Some(outcome.last_data_row as i64);
+    st.row_count = Some(doc.rows.len() as i64);
+    store::update_state(&tx, &bom_id, &st).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
 
-    open_link(conn, &bom_id)
+    if env.verdict == crate::model::EnvVerdict::NoWriteback {
+        warnings.push(env_warning(&env));
+    }
+    Ok(LinkedBomView {
+        doc,
+        verdict: verify.to_verdict(&merged_contract),
+        calc_state: calc,
+        sync_status: SyncStatus::Linked,
+        columns_meta: columns_meta(&merged_contract),
+        env,
+        formula_cells: outcome.formula_cells,
+        truncated: outcome.truncated,
+        warnings,
+    })
+}
+
+fn read_warnings(outcome: &reader::ReadOutcome) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if outcome.calc_mode.as_deref() == Some("manual") {
+        warnings.push(calc_mode_warning());
+    }
+    if outcome.truncated {
+        warnings.push(format!(
+            "行数が {} 行を超えています。表示は打ち切られ、Excel への書き込みは行われません (§3.2)",
+            reader::MAX_ROWS
+        ));
+    }
+    warnings
+}
+
+fn env_warning(env: &env::EnvCheck) -> String {
+    format!(
+        "この環境では Excel への書き戻しが無効です (読み取り専用リンク): {}",
+        env.reason.as_deref().unwrap_or("環境判定により降格")
+    )
 }
 
 /// Unlink (§1.3): one transaction — the display cache in bom_column/bom_row IS the
@@ -194,48 +369,16 @@ pub fn open_link(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, S
     let outcome = reader::observe(path, &contract)?;
     let verify = contract::verify_structure(&contract, &outcome.sheets);
 
-    let mut warnings = Vec::new();
-    if outcome.calc_mode.as_deref() == Some("manual") {
-        warnings.push(calc_mode_warning());
-    }
-    if outcome.truncated {
-        warnings.push(format!(
-            "行数が {} 行を超えています。表示は打ち切られ、Excel への書き込みは行われません (§3.2)",
-            reader::MAX_ROWS
-        ));
-    }
+    let warnings = read_warnings(&outcome);
 
     match verify.severity() {
         Severity::Safe => {
-            // Auto-adopt clean new user columns into the contract (rule 7).
-            let mut columns = rec.columns.clone();
-            if !verify.new_columns.is_empty() {
-                let mut keys: BTreeSet<String> =
-                    columns.iter().filter_map(|c| c.app_key.clone()).collect();
-                for nc in &verify.new_columns {
-                    let key = fresh_user_key(&keys, nc.excel_col);
-                    keys.insert(key.clone());
-                    columns.push(store::LinkColumn {
-                        excel_col: nc.excel_col as i64,
-                        header_label: Some(nc.label.clone()),
-                        app_key: Some(key),
-                        ownership: crate::model::LinkOwnership::User,
-                        required: false,
-                        role: None,
-                        source_field: None,
-                        projection: None,
-                    });
-                }
-                store::replace_columns(conn, bom_id, &columns).map_err(|e| e.to_string())?;
-            }
-            let contract = {
-                // Re-derive so newly adopted columns join the composed view.
-                let rec2 = store::get_link(conn, bom_id)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "リンクが消失しました".to_string())?;
-                Contract::try_from_store(&rec2.header, &rec2.columns).map_err(|e| e.to_string())?
-            };
-
+            // ALL derivations happen before the transaction; the contract adoption
+            // (rule 7), display cache and state then commit atomically — a failure
+            // in any read leaves contract/cache/state untouched.
+            let merged = adopt_new_columns(&rec.columns, &verify.new_columns);
+            let contract =
+                Contract::try_from_store(&rec.header, &merged).map_err(|e| e.to_string())?;
             let quotes = store::list_quotes(conn, bom_id).map_err(|e| e.to_string())?;
             let doc = reader::compose(&contract, &outcome, &quotes, prev_doc.meta.clone(), bom_id);
 
@@ -256,9 +399,10 @@ pub fn open_link(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, S
             st.data_last_row = Some(outcome.last_data_row as i64);
             st.row_count = Some(doc.rows.len() as i64);
 
-            // Display cache + state in ONE transaction (§1.1: the cache is what
-            // unlink freezes as the latest safe snapshot).
             let tx = conn.transaction().map_err(|e| e.to_string())?;
+            if !verify.new_columns.is_empty() {
+                store::replace_columns(&tx, bom_id, &merged).map_err(|e| e.to_string())?;
+            }
             crate::db::write_columns_rows(&tx, bom_id, &doc).map_err(|e| e.to_string())?;
             store::update_state(&tx, bom_id, &st).map_err(|e| e.to_string())?;
             tx.commit().map_err(|e| e.to_string())?;
@@ -268,6 +412,7 @@ pub fn open_link(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, S
                 verdict: verify.to_verdict(&contract),
                 calc_state: calc,
                 sync_status: SyncStatus::Linked,
+                columns_meta: columns_meta(&contract),
                 env,
                 formula_cells: outcome.formula_cells,
                 truncated: outcome.truncated,
@@ -297,6 +442,7 @@ pub fn open_link(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, S
                 verdict: verify.to_verdict(&contract),
                 calc_state: rec.state.calc_state,
                 sync_status: st.sync_status,
+                columns_meta: columns_meta(&contract),
                 env,
                 formula_cells: outcome.formula_cells,
                 truncated: outcome.truncated,
@@ -323,6 +469,7 @@ fn broken_view(
         verdict: StructureVerdict::Broken { reasons },
         calc_state: state.calc_state,
         sync_status: SyncStatus::Broken,
+        columns_meta: vec![], // contract not interpretable in this state
         env,
         formula_cells: vec![],
         truncated: false,
@@ -702,5 +849,238 @@ mod tests {
         let mut cfg = config(&path);
         cfg.data_start_row = 1;
         assert!(create_link(&mut conn, &cfg).is_err()); // bad row order
+    }
+
+    fn expect_err(r: Result<LinkedBomView, String>) -> String {
+        match r {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    // ---- review round 1 additions ----
+
+    /// Contract metadata (role / source_field / projection) survives into the view:
+    /// roles keep driving the existing partNo/source column lookups, and the EC
+    /// projection is exposed via columns_meta (separate from the normalized
+    /// ColumnDef.link — §1.3).
+    #[test]
+    fn contract_meta_survives_into_view() {
+        let mut conn = mem();
+        let path = temp_xlsx(
+            "meta.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut cfg = config(&path);
+        cfg.columns[0].role = Some("partNo".into());
+        cfg.columns[1].role = Some("orderNo1".into());
+        let view = create_link(&mut conn, &cfg).unwrap();
+
+        // Roles survive into the composed BomDoc columns (fetch pipeline input).
+        let col = |k: &str| {
+            view.doc
+                .columns
+                .iter()
+                .find(|c| c.key == k)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(col("partsNo").role.as_deref(), Some("partNo"));
+        assert_eq!(col("qty").role.as_deref(), Some("orderNo1"));
+        // ColumnDef.link stays normalized (no one-shot import policies).
+        assert!(view.doc.columns.iter().all(|c| c.link.is_none()));
+
+        // The EC projection is available via columns_meta.
+        let ec = view
+            .columns_meta
+            .iter()
+            .find(|m| m.app_key == "ecUnitPrice")
+            .unwrap();
+        assert_eq!(ec.source_field.as_deref(), Some("quote.unitPrice"));
+        assert_eq!(ec.projection, Some(LinkProjection::Writeback));
+        assert_eq!(ec.ownership, LinkOwnership::App);
+        assert_eq!(ec.excel_col, 2);
+
+        // And it round-trips through open (read back from the DB contract).
+        let bom_id = view.doc.id.clone().unwrap();
+        let view = open_link(&mut conn, &bom_id).unwrap();
+        assert_eq!(
+            view.doc
+                .columns
+                .iter()
+                .find(|c| c.key == "partsNo")
+                .unwrap()
+                .role
+                .as_deref(),
+            Some("partNo")
+        );
+        assert!(view
+            .columns_meta
+            .iter()
+            .any(|m| m.source_field.as_deref() == Some("quote.unitPrice")));
+    }
+
+    /// 1 workbook = 1 link: a second BOM linking the same workbook is refused —
+    /// shared fingerprints would let one BOM's write-back fabricate the other's
+    /// Trusted state.
+    #[test]
+    fn same_workbook_cannot_link_twice() {
+        let mut conn = mem();
+        let path = temp_xlsx(
+            "shared.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        create_link(&mut conn, &config(&path)).unwrap();
+        // Identical path.
+        let err = expect_err(create_link(&mut conn, &config(&path)));
+        assert!(err.contains("1ワークブック=1リンク"), "{err}");
+        // Case-different alias of the same file.
+        let mut cfg = config(&path);
+        cfg.workbook_path = cfg.workbook_path.to_uppercase();
+        let err = expect_err(create_link(&mut conn, &cfg));
+        assert!(err.contains("1ワークブック=1リンク"), "{err}");
+    }
+
+    /// Junction alias of the same workbook is also refused (identity is the
+    /// resolved real path, not the doorway).
+    #[cfg(windows)]
+    #[test]
+    fn same_workbook_via_junction_cannot_link_twice() {
+        let mut conn = mem();
+        let dir = std::env::temp_dir().join("mbm-link-tests-junc");
+        let _ = std::fs::remove_dir_all(&dir);
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let mut wb = rust_xlsxwriter::Workbook::new();
+        let ws = wb.add_worksheet();
+        for (c, h) in ["型番", "数量", "EC単価"].iter().enumerate() {
+            ws.write_string(0, c as u16, *h).unwrap();
+        }
+        ws.write_string(1, 0, "TEST-PART-001").unwrap();
+        let path = real.join("bom.xlsx");
+        wb.save(&path).unwrap();
+        let junc = dir.join("junc");
+        let ok = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &junc.to_string_lossy(),
+                &real.to_string_lossy(),
+            ])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "mklink /J failed");
+
+        let mut cfg = config(&path);
+        cfg.columns[0].required = false; // rows may be sparse; not the point here
+        create_link(&mut conn, &cfg).unwrap();
+        let mut cfg2 = config(&junc.join("bom.xlsx"));
+        cfg2.columns[0].required = false;
+        let err = expect_err(create_link(&mut conn, &cfg2));
+        assert!(err.contains("1ワークブック=1リンク"), "{err}");
+        let _ = std::fs::remove_dir(&junc);
+    }
+
+    /// Atomic creation: a failing first read (corrupt xlsx) or a non-Safe verdict
+    /// persists NOTHING — no bom row, no link, no state (retry works cleanly).
+    #[test]
+    fn failed_create_leaves_no_trace() {
+        let mut conn = mem();
+        let dir = std::env::temp_dir().join("mbm-link-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // (a) corrupt file: reads fail after the env check → Err, nothing persisted.
+        let corrupt = dir.join("corrupt.xlsx");
+        std::fs::write(&corrupt, b"this is not a zip").unwrap();
+        assert!(create_link(&mut conn, &config(&corrupt)).is_err());
+
+        // (b) mapping mismatch (required 型番 not present): non-Safe → Err.
+        let wrong = temp_xlsx(
+            "wrong.xlsx",
+            &["品番", "数量", "EC単価"],
+            &[&["x", "1", ""]],
+        );
+        let err = expect_err(create_link(&mut conn, &config(&wrong)));
+        assert!(err.contains("構造検証"), "{err}");
+
+        for table in ["bom", "bom_link", "bom_link_column", "bom_link_state"] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table} must stay empty after failed create");
+        }
+
+        // (c) linking an EXISTING BOM against a corrupt file: the BOM survives
+        // untouched, no link rows appear, and the display cache keeps its links.
+        let doc = crate::model::BomDoc {
+            id: Some("keep".into()),
+            version: 1,
+            meta: Default::default(),
+            columns: vec![crate::model::ColumnDef {
+                key: "partsNo".into(),
+                label: "型番".into(),
+                kind: "core".into(),
+                editable: true,
+                width: None,
+                link: Some(crate::model::ColumnLink {
+                    field: "product.name".into(),
+                    write: "overwrite".into(),
+                }),
+                role: None,
+            }],
+            rows: vec![],
+        };
+        crate::db::save_bom(&mut conn, &doc).unwrap();
+        let mut cfg = config(&corrupt);
+        cfg.bom_id = Some("keep".into());
+        assert!(create_link(&mut conn, &cfg).is_err());
+        let kept = crate::db::load_bom(&conn, "keep").unwrap().unwrap();
+        assert!(
+            kept.columns[0].link.is_some(),
+            "old link must NOT be cleared"
+        );
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bom_link", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Atomic Safe adoption on open: when the read fails, no partial contract
+    /// update leaks (contract, cache and state move together or not at all).
+    #[test]
+    fn failed_open_leaves_contract_cache_state_unchanged() {
+        let mut conn = mem();
+        let path = temp_xlsx(
+            "atomic.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        let before_cols = store::get_link(&conn, &bom_id).unwrap().unwrap().columns;
+        let before_state = store::get_state(&conn, &bom_id).unwrap().unwrap();
+
+        // Corrupt the workbook: observe() fails BEFORE any write.
+        std::fs::write(&path, b"broken zip").unwrap();
+        assert!(open_link(&mut conn, &bom_id).is_err());
+
+        let rec = store::get_link(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(rec.columns, before_cols);
+        assert_eq!(
+            store::get_state(&conn, &bom_id).unwrap().unwrap(),
+            before_state
+        );
+        assert_eq!(
+            crate::db::load_bom(&conn, &bom_id)
+                .unwrap()
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
     }
 }

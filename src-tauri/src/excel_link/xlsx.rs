@@ -186,24 +186,33 @@ pub fn spill_ranges(sheet_xml: &str) -> (Vec<String>, bool) {
 /// Does the target cell itself carry a formula — normal, shared (anchor or `<f/>`
 /// follower) or array alike? plan §4.4: the app must NEVER write into a formula
 /// cell; patch_cell would replace the `<f>` with a plain value and silently destroy
-/// the user's formula. Unparseable cell bodies fail closed (treated as
-/// formula-bearing). Consumed by the PR-4 write guard.
+/// the user's formula. The scan is ATTRIBUTE-ORDER INSENSITIVE (`<c s="1" r="D2">`
+/// is equivalent OOXML — a positional `<c r=` match would miss it and let the PR-4
+/// write guard overwrite a formula cell). Unparseable open tags / bodies fail
+/// closed (treated as formula-bearing).
 pub fn cell_has_formula(sheet_xml: &str, cell_ref: &str) -> bool {
-    let open = format!("<c r=\"{cell_ref}\"");
-    let Some(start) = sheet_xml.find(&open) else {
-        return false; // cell absent: nothing to destroy (insertion is out of scope anyway)
-    };
-    let rest = &sheet_xml[start..];
-    let Some(gt) = rest.find('>') else {
-        return true; // malformed open tag → fail closed
-    };
-    if rest[..gt].ends_with('/') {
-        return false; // self-closing <c/>: empty cell, no formula
+    let mut rest = sheet_xml;
+    while let Some(i) = rest.find("<c ") {
+        rest = &rest[i..];
+        let Some(gt) = rest.find('>') else {
+            // A cell open tag that never closes: if it could be our target we must
+            // not assume it is safe to overwrite.
+            return rest.contains(cell_ref);
+        };
+        let open = &rest[..gt];
+        if slice_between(open, "r=\"", "\"") != Some(cell_ref) {
+            rest = &rest[gt + 1..];
+            continue;
+        }
+        if open.ends_with('/') {
+            return false; // self-closing <c/>: empty cell, no formula
+        }
+        let Some(close) = rest.find("</c>") else {
+            return true; // malformed body → fail closed
+        };
+        return rest[gt..close].contains("<f");
     }
-    let Some(close) = rest.find("</c>") else {
-        return true; // malformed body → fail closed
-    };
-    rest[gt..close].contains("<f")
+    false // cell absent: nothing to destroy (insertion is out of scope anyway)
 }
 
 /// Force Excel to recalculate on open (plan.md §4.4.1). Existing calcPr attributes
@@ -289,6 +298,22 @@ mod tests {
         assert!(!cell_has_formula(SHEET, "Z9")); // absent
                                                  // Malformed body → fail closed.
         assert!(cell_has_formula(r#"<c r="A1"><v>1"#, "A1"));
+    }
+
+    #[test]
+    fn cell_formula_detection_is_attribute_order_insensitive() {
+        // Equivalent OOXML with the style attribute FIRST — a positional
+        // `<c r="D2"` search would miss the formula and let a write through.
+        let xml = r#"<c s="1" r="D2"><f>A1*2</f><v>2</v></c>"#;
+        assert!(cell_has_formula(xml, "D2"));
+        // Same shape, plain value cell → no formula.
+        assert!(!cell_has_formula(r#"<c s="1" r="D2"><v>2</v></c>"#, "D2"));
+        // Self-closing with leading attributes → empty cell.
+        assert!(!cell_has_formula(r#"<c s="1" r="D2"/>"#, "D2"));
+        // D2 must not match D20 (exact attribute value comparison).
+        assert!(!cell_has_formula(r#"<c s="1" r="D20"><f>X</f></c>"#, "D2"));
+        // Broken open tag that may be the target → fail closed.
+        assert!(cell_has_formula(r#"<c s="1" r="D2""#, "D2"));
     }
 
     #[test]

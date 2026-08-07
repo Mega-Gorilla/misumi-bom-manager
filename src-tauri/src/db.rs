@@ -394,6 +394,19 @@ pub fn load_bom(conn: &Connection, id: &str) -> rusqlite::Result<Option<BomDoc>>
 pub fn save_bom(conn: &mut Connection, doc: &BomDoc) -> rusqlite::Result<String> {
     let id = doc.id.clone().unwrap_or_else(new_id);
     let tx = conn.transaction()?;
+    upsert_bom_meta(&tx, &id, &doc.meta)?;
+    write_columns_rows(&tx, &id, doc)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Upsert the `bom` row (meta only) inside the caller's transaction. Shared by
+/// save_bom and the atomic linked-BOM creation (excel_link::create_link).
+pub(crate) fn upsert_bom_meta(
+    tx: &rusqlite::Transaction,
+    id: &str,
+    meta: &BomMeta,
+) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO bom(id, name, qty_multiplier, imported_from, order_no_separator, created_at, updated_at) \
          VALUES(?1, ?2, ?3, ?4, ?5, datetime('now', 'localtime'), datetime('now', 'localtime')) \
@@ -403,17 +416,13 @@ pub fn save_bom(conn: &mut Connection, doc: &BomDoc) -> rusqlite::Result<String>
            updated_at = datetime('now', 'localtime')",
         params![
             id,
-            doc.meta.name,
-            doc.meta.qty_multiplier,
-            doc.meta.imported_from,
-            doc.meta.order_no_separator
+            meta.name,
+            meta.qty_multiplier,
+            meta.imported_from,
+            meta.order_no_separator
         ],
     )?;
-
-    write_columns_rows(&tx, &id, doc)?;
-
-    tx.commit()?;
-    Ok(id)
+    Ok(())
 }
 
 /// Full-replace of bom_column/bom_row inside the caller's transaction. Shared by

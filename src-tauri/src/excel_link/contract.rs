@@ -32,6 +32,12 @@ pub struct MappedColumn {
     pub header_label: String, // last confirmed display name (non-empty, validated)
     pub app_owned: bool,
     pub required: bool,
+    /// Fetch-pipeline role ('partNo'/'source'/'orderNo1..3') — contract-owned so the
+    /// composed view keeps driving the existing partNo/source column lookups.
+    pub role: Option<String>,
+    /// EC projection metadata (§1.3: replaces the one-shot link_field/link_write).
+    pub source_field: Option<String>,
+    pub projection: Option<crate::model::LinkProjection>,
 }
 
 pub struct SkippedColumn {
@@ -120,6 +126,9 @@ impl Contract {
                         header_label: label,
                         app_owned: own == LinkOwnership::App,
                         required: c.required,
+                        role: c.role.clone(),
+                        source_field: c.source_field.clone(),
+                        projection: c.projection,
                     });
                 }
             }
@@ -887,13 +896,19 @@ fn structure_fp(
         .mapped
         .iter()
         .map(|m| {
+            // role/source_field/projection change what the contract MEANS (which
+            // column feeds the fetch pipeline, what gets written back), so they are
+            // part of the equivalence class.
             format!(
-                "m,{},{},{},{},{}",
+                "m,{},{},{},{},{},{},{},{}",
                 m.excel_col,
                 if m.app_owned { "app" } else { "user" },
                 m.app_key,
                 m.header_label,
-                m.required
+                m.required,
+                m.role.as_deref().unwrap_or(""),
+                m.source_field.as_deref().unwrap_or(""),
+                m.projection.map(|p| p.as_str()).unwrap_or("")
             )
         })
         .chain(c.skipped.iter().map(|s| {
@@ -1467,5 +1482,26 @@ mod tests {
             verify_structure(&c2, &sheets(base_obs())).structure_fp,
             base
         );
+    }
+
+    #[test]
+    fn structure_fp_tracks_role_and_projection_changes() {
+        // role/source_field/projection change what the contract MEANS (review R1):
+        // the fp must react so stale Confirm candidates cannot apply across them.
+        let base = run(base_obs()).structure_fp;
+        type Change = Box<dyn Fn(&mut LinkColumn)>;
+        let variants: Vec<Change> = vec![
+            Box::new(|c| c.role = Some("partNo".into())),
+            Box::new(|c| c.source_field = Some("product.name".into())),
+        ];
+        for change in variants {
+            let mut cols = columns();
+            change(&mut cols[1]); // 型番 (user column: source_field alone is a valid shape? use role)
+            if cols[1].source_field.is_some() {
+                cols[1].projection = Some(crate::model::LinkProjection::Suggest);
+            }
+            let c = Contract::try_from_store(&dummy_header(), &cols).unwrap();
+            assert_ne!(verify_structure(&c, &sheets(base_obs())).structure_fp, base);
+        }
     }
 }
