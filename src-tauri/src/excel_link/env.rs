@@ -25,15 +25,23 @@ pub fn link_allowed(fs_name: &str, resolved: bool) -> EnvVerdict {
     }
 }
 
-/// Result of the full environment check. Stored into bom_link (env_verdict /
-/// env_resolved_path / env_fs_name); `reason` is NOT persisted (no V5 column — it
-/// is display-only and regenerated on every re-check).
+/// Result of the full environment check. Two SEPARATE concerns (review R3):
+/// - `read_target`: the file actually read (the .lnk chain followed and
+///   canonicalized, symlinks and all — §4.10 gates WRITEBACK only, reading
+///   continues in a NoWriteback environment)
+/// - `resolved_path` + `verdict` + `fs_name`: the WRITEBACK verification (reparse
+///   walk + real FS); `resolved_path` is only Some when verification reached
+///   canonicalize
+/// `reason` is NOT persisted (no V5 column — display-only, regenerated per check).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvCheck {
     pub verdict: EnvVerdict,
     pub resolved_path: Option<String>,
     pub fs_name: Option<String>,
+    /// Canonical path all file IO must use; None = nothing readable exists
+    /// (missing target, broken/cyclic .lnk).
+    pub read_target: Option<String>,
     /// Always Some("env:<code>: <detail>") when NoWriteback, always None when Allow.
     pub reason: Option<String>,
 }
@@ -44,6 +52,7 @@ impl EnvCheck {
             verdict: EnvVerdict::NoWriteback,
             resolved_path: None,
             fs_name: None,
+            read_target: None,
             reason: Some(reason),
         }
     }
@@ -316,28 +325,47 @@ mod win {
 
 // ---- orchestration ------------------------------------------------------------------
 
-/// The full §4.10 environment check (7 steps). Never panics on bad input; every
-/// failure folds into NoWriteback + reason.
+/// The full §4.10 environment check. Read-side discovery and write-side
+/// verification are separate (review R3): the read target follows the .lnk chain
+/// WITHOUT reparse gating (reading may legitimately cross symlinks — §4.10 gates
+/// writeback only), while the 7-step verification decides the writeback verdict.
+/// Never panics on bad input; every verification failure folds into
+/// NoWriteback + reason, with the read target retained when one exists.
 #[cfg(windows)]
 pub fn check_env(input: &Path) -> EnvCheck {
     let abs = match std::path::absolute(input) {
         Ok(p) => p,
         Err(e) => return EnvCheck::refused(format!("env:bad_path: {e}")),
     };
-    // Steps (1)(2)(3)(4)(5)(6).
+
+    // ---- read-side discovery: what would we actually read? ----
+    let read_target = resolve_lnk_chain(&abs, &win::resolve_lnk_com, &|_| Ok(()))
+        .ok()
+        .and_then(|f| std::fs::canonicalize(f).ok())
+        .map(|p| strip_verbatim(&p));
+
+    // ---- write-side verification: steps (1)..(6) ----
     let resolved = match resolve_lnk_chain(&abs, &win::resolve_lnk_com, &win::walk_check_components)
     {
         Ok(p) => p,
-        Err(reason) => return EnvCheck::refused(reason),
+        Err(reason) => {
+            return EnvCheck {
+                read_target,
+                ..EnvCheck::refused(reason)
+            }
+        }
     };
     // Step (7).
     let real = match std::fs::canonicalize(&resolved) {
         Ok(p) => p,
         Err(e) => {
-            return EnvCheck::refused(format!(
-                "env:canonicalize_failed: {}: {e}",
-                resolved.display()
-            ))
+            return EnvCheck {
+                read_target,
+                ..EnvCheck::refused(format!(
+                    "env:canonicalize_failed: {}: {e}",
+                    resolved.display()
+                ))
+            }
         }
     };
     let display = strip_verbatim(&real);
@@ -348,6 +376,7 @@ pub fn check_env(input: &Path) -> EnvCheck {
                 verdict: EnvVerdict::NoWriteback,
                 resolved_path: Some(display),
                 fs_name: None,
+                read_target,
                 reason: Some(reason),
             }
         }
@@ -361,6 +390,7 @@ pub fn check_env(input: &Path) -> EnvCheck {
             EnvVerdict::NoWriteback => Some(format!("env:fs_not_ntfs: {fs}")),
         },
         fs_name: Some(fs),
+        read_target,
     }
 }
 

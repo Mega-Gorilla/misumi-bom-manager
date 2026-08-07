@@ -31,8 +31,13 @@ const FP_BACKOFF: Duration = Duration::from_millis(200);
 pub fn probe(path: &str) -> Result<LinkProbe, String> {
     let p = Path::new(path);
     let env = env::check_env(p);
-    // File IO targets the RESOLVED real path: a .lnk input is not a zip (review R2).
-    let io_path = io_path_of(&env, p);
+    // File IO targets the READ target: a .lnk input is not a zip (review R2/R3).
+    let Some(io_path) = io_path_of(&env, p) else {
+        return Err(format!(
+            "リンク先を解決できません: {}",
+            env.reason.as_deref().unwrap_or("参照先が見つかりません")
+        ));
+    };
     let sheets = reader::probe_sheets(&io_path)?;
     let mut warnings = Vec::new();
     if let Ok(mut zip) = xlsx::open_zip(&io_path) {
@@ -70,13 +75,31 @@ fn workbook_identity(resolved_path: Option<&str>, workbook_path: &str) -> String
         .to_lowercase()
 }
 
-/// The path all file IO must use: the environment check's resolved real target
-/// when available (collapses .lnk / junction doorways), the input otherwise.
-fn io_path_of(env: &env::EnvCheck, input: &Path) -> std::path::PathBuf {
-    env.resolved_path
+/// The path all file IO must use: the READ target (the .lnk chain followed and
+/// canonicalized — available even in NoWriteback environments, §4.10 gates
+/// writeback only). None = nothing readable: a .lnk whose target is gone must
+/// never be fed to fingerprint/calamine/zip as if it were an xlsx (review R3).
+fn io_path_of(env: &env::EnvCheck, input: &Path) -> Option<std::path::PathBuf> {
+    if let Some(rt) = &env.read_target {
+        return Some(std::path::PathBuf::from(rt));
+    }
+    let is_lnk = input
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("lnk"))
+        .unwrap_or(false);
+    if is_lnk {
+        None // unresolvable shortcut — there is no workbook to read
+    } else {
+        Some(input.to_path_buf()) // plain path: let the exists-check report MISSING
+    }
+}
+
+/// The identity a link stores/compares (1WB=1リンク guard, retarget guard): what the
+/// BOM actually READS. Falls back to the verified path, then the raw input.
+fn env_identity(env: &env::EnvCheck) -> Option<String> {
+    env.read_target
         .clone()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| input.to_path_buf())
+        .or_else(|| env.resolved_path.clone())
 }
 
 /// Contract metadata for the frontend (role / EC projection per mapped column).
@@ -168,7 +191,7 @@ pub fn create_link(
     // (one BOM's write-back reads as the other's "Excel recalculated" and can
     // fabricate Trusted). Aliases (case, junction, .lnk) collapse via the resolved
     // identity.
-    let identity = workbook_identity(env.resolved_path.as_deref(), &config.workbook_path);
+    let identity = workbook_identity(env_identity(&env).as_deref(), &config.workbook_path);
     for (bid, wpath, rpath) in store::list_link_paths(conn).map_err(|e| e.to_string())? {
         if workbook_identity(rpath.as_deref(), &wpath) == identity {
             return Err(format!(
@@ -207,8 +230,13 @@ pub fn create_link(
     };
     let base_contract =
         Contract::try_from_store(&transient_header, &columns).map_err(|e| e.to_string())?;
-    // File IO targets the resolved real path (review R2: a .lnk input is not a zip).
-    let io_path = io_path_of(&env, Path::new(&config.workbook_path));
+    // File IO targets the read target (review R2/R3: a .lnk input is not a zip).
+    let Some(io_path) = io_path_of(&env, Path::new(&config.workbook_path)) else {
+        return Err(format!(
+            "リンク先を解決できません: {}",
+            env.reason.as_deref().unwrap_or("参照先が見つかりません")
+        ));
+    };
     let path = io_path.as_path();
     if !path.exists() {
         return Err(format!(
@@ -259,7 +287,7 @@ pub fn create_link(
             header_row: config.header_row,
             data_start_row: config.data_start_row,
             env_verdict: env.verdict,
-            env_resolved_path: env.resolved_path.clone(),
+            env_resolved_path: env_identity(&env),
             env_fs_name: env.fs_name.clone(),
             columns: merged,
         },
@@ -373,12 +401,12 @@ pub fn open_link(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, S
     // broken) is the MISSING/unreadable case below, and its fallback identity (raw
     // absolute path — possibly an 8.3 short form, as on CI runners) must not fake a
     // retarget.
-    if rec.header.env_resolved_path.is_some() && env.resolved_path.is_some() {
+    if rec.header.env_resolved_path.is_some() && env_identity(&env).is_some() {
         let stored = workbook_identity(
             rec.header.env_resolved_path.as_deref(),
             &rec.header.workbook_path,
         );
-        let now = workbook_identity(env.resolved_path.as_deref(), &rec.header.workbook_path);
+        let now = workbook_identity(env_identity(&env).as_deref(), &rec.header.workbook_path);
         if stored != now {
             return broken_view(
                 conn,
@@ -392,7 +420,22 @@ pub fn open_link(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, S
             );
         }
     }
-    let io_path = io_path_of(&env, Path::new(&rec.header.workbook_path));
+    let Some(io_path) = io_path_of(&env, Path::new(&rec.header.workbook_path)) else {
+        // A previously-resolved shortcut whose target is now gone/broken: fail
+        // closed as Broken with the previous snapshot — never feed the .lnk bytes
+        // to the readers, never surface a plain Err (review R3 case A).
+        return broken_view(
+            conn,
+            bom_id,
+            rec.state,
+            prev_doc,
+            env.clone(),
+            vec![format!(
+                "E_WORKBOOK_UNRESOLVABLE: リンク先を解決できません: {}",
+                env.reason.as_deref().unwrap_or("参照先が見つかりません")
+            )],
+        );
+    };
     let path = io_path.as_path();
     if !path.exists() {
         return broken_view(
@@ -1237,5 +1280,100 @@ mod tests {
         }
         // The previous snapshot is still what the user sees.
         assert_eq!(view.doc.rows[0].parts_no.as_deref(), Some("TEST-PART-001"));
+    }
+
+    // ---- review round 3 additions ----
+
+    /// R3 case A: a linked .lnk whose TARGET disappears must become Broken with the
+    /// previous snapshot — never a plain Err, and the .lnk bytes must never reach
+    /// fingerprint/calamine/zip.
+    #[cfg(windows)]
+    #[test]
+    fn lnk_with_deleted_target_is_broken_not_err() {
+        let mut conn = mem();
+        let dir = std::env::temp_dir().join("mbm-link-tests-lnkgone");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut wb = rust_xlsxwriter::Workbook::new();
+        let ws = wb.add_worksheet();
+        for (c, h) in ["型番", "数量", "EC単価"].iter().enumerate() {
+            ws.write_string(0, c as u16, *h).unwrap();
+        }
+        ws.write_string(1, 0, "TEST-PART-001").unwrap();
+        let real = dir.join("a.xlsx");
+        wb.save(&real).unwrap();
+        let lnk = dir.join("bom.lnk");
+        crate::excel_link::env::write_lnk_for_tests(&lnk, &real);
+
+        let view = create_link(&mut conn, &config(&lnk)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+
+        std::fs::remove_file(&real).unwrap();
+        let view = open_link(&mut conn, &bom_id).unwrap(); // Broken, NOT Err
+        assert_eq!(view.sync_status, SyncStatus::Broken);
+        match view.verdict {
+            StructureVerdict::Broken { reasons } => assert!(
+                reasons[0].contains("E_WORKBOOK_UNRESOLVABLE"),
+                "{reasons:?}"
+            ),
+            v => panic!("{v:?}"),
+        }
+        // Previous snapshot survives, and the state moved to broken.
+        assert_eq!(view.doc.rows[0].parts_no.as_deref(), Some("TEST-PART-001"));
+        let st = store::get_state(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(st.sync_status, SyncStatus::Broken);
+    }
+
+    /// R3 case B: a workbook in a NoWriteback environment (here: reached through a
+    /// symlinked directory) still supports probe/create/open as a READ-ONLY link —
+    /// §4.10 degrades writeback only. Skips (recorded) when symlink creation needs
+    /// privileges this environment does not have.
+    #[cfg(windows)]
+    #[test]
+    fn nowriteback_environment_still_links_read_only() {
+        let dir = std::env::temp_dir().join("mbm-link-tests-symread");
+        let _ = std::fs::remove_dir_all(&dir);
+        let real_dir = dir.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let sym = dir.join("sym");
+        match std::os::windows::fs::symlink_dir(&real_dir, &sym) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                eprintln!("SKIP(symlink): ERROR_PRIVILEGE_NOT_HELD — read-only degradation is covered by env unit tests");
+                return;
+            }
+            Err(e) => panic!("unexpected: {e}"),
+        }
+        let mut wb = rust_xlsxwriter::Workbook::new();
+        let ws = wb.add_worksheet();
+        for (c, h) in ["型番", "数量", "EC単価"].iter().enumerate() {
+            ws.write_string(0, c as u16, *h).unwrap();
+        }
+        ws.write_string(1, 0, "TEST-PART-001").unwrap();
+        wb.save(real_dir.join("bom.xlsx")).unwrap();
+
+        let via_sym = sym.join("bom.xlsx");
+        // probe reads the sheet even though writeback is refused.
+        let probe = probe(&via_sym.to_string_lossy()).unwrap();
+        assert_eq!(probe.env.verdict, crate::model::EnvVerdict::NoWriteback);
+        assert!(probe
+            .env
+            .reason
+            .as_deref()
+            .unwrap()
+            .starts_with("env:symlink"));
+        assert!(probe.sheets.iter().any(|s| s.name == "Sheet1"));
+
+        // create + open succeed as a read-only link.
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&via_sym)).unwrap();
+        assert_eq!(view.env.verdict, crate::model::EnvVerdict::NoWriteback);
+        assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
+        assert!(view.warnings.iter().any(|w| w.contains("書き戻しが無効")));
+        let bom_id = view.doc.id.clone().unwrap();
+        let view = open_link(&mut conn, &bom_id).unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Linked);
+        assert_eq!(view.doc.rows[0].parts_no.as_deref(), Some("TEST-PART-001"));
+        let _ = std::fs::remove_dir(&sym);
     }
 }
