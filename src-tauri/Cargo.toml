@@ -31,5 +31,21 @@ rust_xlsxwriter = "0.79"   # write .xlsx
 csv = "1"                  # read/write CSV
 encoding_rs = "0.8"        # CSV decode (Shift-JIS fallback) / BOM handling
 sha2 = "0.10"              # content fingerprints for Excel link mode (plan §4.6.1)
+zip = "2"                  # xlsx zip walkers for Excel link mode (already in the tree via calamine)
+
+# Excel link mode environment checks (plan §4.10): reparse-tag walk, volume FS name,
+# .lnk resolution. Versions match what the dependency tree already locks.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_SystemServices",
+] }
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_UI_Shell",
+  "Win32_Storage_FileSystem",
+] }
 
 

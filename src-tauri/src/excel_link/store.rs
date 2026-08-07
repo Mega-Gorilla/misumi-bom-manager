@@ -74,10 +74,11 @@ pub struct LinkRecord {
 }
 
 /// Create a link: contract header + columns + the initial state row (defaults:
-/// linked/unverified/generation 0), in one transaction. The caller has already run
-/// the §4.10 environment check (its verdict is part of the contract input).
-pub fn create_link(conn: &mut Connection, link: &NewLink) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
+/// linked/unverified/generation 0). Takes a TRANSACTION by type: the multi-statement
+/// write must never run half-committed (excel_link::create_link commits it together
+/// with the BOM row, the display cache and the state update). The caller has already
+/// run the §4.10 environment check (its verdict is part of the contract input).
+pub fn create_link(tx: &rusqlite::Transaction, link: &NewLink) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO bom_link(bom_id, workbook_path, sheet_name, header_row, data_start_row, \
            env_verdict, env_resolved_path, env_fs_name, env_checked_at, created_at, updated_at) \
@@ -95,13 +96,13 @@ pub fn create_link(conn: &mut Connection, link: &NewLink) -> rusqlite::Result<()
         ],
     )?;
     for c in &link.columns {
-        insert_column(&tx, &link.bom_id, c)?;
+        insert_column(tx, &link.bom_id, c)?;
     }
     tx.execute(
         "INSERT INTO bom_link_state(bom_id) VALUES(?1)",
         [&link.bom_id],
     )?;
-    tx.commit()
+    Ok(())
 }
 
 fn insert_column(conn: &Connection, bom_id: &str, c: &LinkColumn) -> rusqlite::Result<()> {
@@ -193,6 +194,17 @@ pub fn get_link(conn: &Connection, bom_id: &str) -> rusqlite::Result<Option<Link
     }))
 }
 
+/// All linked workbook identities: (bom_id, workbook_path, env_resolved_path).
+/// Used by the 1-workbook=1-link guard (a shared workbook would let one BOM's
+/// write-back read as the other's "Excel recalculated" and fabricate Trusted).
+pub fn list_link_paths(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
+    let mut stmt = conn.prepare("SELECT bom_id, workbook_path, env_resolved_path FROM bom_link")?;
+    let it = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    it.collect()
+}
+
 /// Unlink: delete the `bom_link` row; contract columns, state, quotes and pending are
 /// removed by FK cascade. The backup ledger survives on purpose (origin_bom_id).
 /// The snapshot side of implementation.md §1.3 (freezing bom_column/bom_row) is the
@@ -204,22 +216,24 @@ pub fn delete_link(conn: &Connection, bom_id: &str) -> rusqlite::Result<()> {
 
 /// Replace the contract columns (remapping / confirm resolution) without touching the
 /// volatile state row (design principle 2 in implementation.md §1.1). Also bumps
-/// bom_link.updated_at (the contract changed).
+/// bom_link.updated_at (the contract changed). Takes a TRANSACTION by type: the
+/// DELETE-then-INSERT sequence must never be observable half-done (a plain
+/// Connection caller could otherwise commit an empty/partial contract on a
+/// mid-list constraint violation — review R2).
 pub fn replace_columns(
-    conn: &mut Connection,
+    tx: &rusqlite::Transaction,
     bom_id: &str,
     columns: &[LinkColumn],
 ) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
     tx.execute("DELETE FROM bom_link_column WHERE bom_id = ?1", [bom_id])?;
     for c in columns {
-        insert_column(&tx, bom_id, c)?;
+        insert_column(tx, bom_id, c)?;
     }
     tx.execute(
         "UPDATE bom_link SET updated_at = datetime('now', 'localtime') WHERE bom_id = ?1",
         [bom_id],
     )?;
-    tx.commit()
+    Ok(())
 }
 
 // ---- volatile state (bom_link_state) ------------------------------------------------
@@ -790,7 +804,9 @@ mod tests {
 
     fn linked(conn: &mut Connection, bom_id: &str) {
         seed_bom(conn, bom_id);
-        create_link(conn, &sample_link(bom_id)).unwrap();
+        let tx = conn.transaction().unwrap();
+        create_link(&tx, &sample_link(bom_id)).unwrap();
+        tx.commit().unwrap();
     }
 
     #[test]
@@ -851,13 +867,57 @@ mod tests {
             source_field: None,
             projection: None,
         }];
-        replace_columns(&mut conn, "b1", &remapped).unwrap();
+        let tx = conn.transaction().unwrap();
+        replace_columns(&tx, "b1", &remapped).unwrap();
+        tx.commit().unwrap();
 
         let rec = get_link(&conn, "b1").unwrap().unwrap();
         assert_eq!(rec.columns, remapped);
         // Design principle 2 (implementation.md §1.1): state survives remapping.
         assert_eq!(rec.state.ec_generation, 7);
         assert_eq!(rec.state.calc_state, CalcState::Stale);
+    }
+
+    #[test]
+    fn replace_columns_rolls_back_atomically_on_mid_list_failure() {
+        // The tx-typed API (review R2): a constraint violation in the middle of the
+        // DELETE-then-INSERT sequence must leave header/columns/state untouched
+        // when the transaction is dropped (rolled back).
+        let mut conn = mem();
+        linked(&mut conn, "b1");
+        let before = get_link(&conn, "b1").unwrap().unwrap();
+
+        let dup_pos = vec![
+            LinkColumn {
+                excel_col: 5,
+                header_label: Some("A".into()),
+                app_key: Some("a".into()),
+                ownership: LinkOwnership::User,
+                required: false,
+                role: None,
+                source_field: None,
+                projection: None,
+            },
+            LinkColumn {
+                excel_col: 5, // PK violation on the second insert
+                header_label: Some("B".into()),
+                app_key: Some("b".into()),
+                ownership: LinkOwnership::User,
+                required: false,
+                role: None,
+                source_field: None,
+                projection: None,
+            },
+        ];
+        {
+            let tx = conn.transaction().unwrap();
+            assert!(replace_columns(&tx, "b1", &dup_pos).is_err());
+            // tx dropped here -> rollback
+        }
+        let after = get_link(&conn, "b1").unwrap().unwrap();
+        assert_eq!(after.columns, before.columns);
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.header.updated_at, before.header.updated_at);
     }
 
     // -- bom_link_column CHECK combinations (DoD: enumerated CHECK must reject every
@@ -950,7 +1010,9 @@ mod tests {
         raw_col(&conn, "excel_col, ownership) VALUES('b1', 31, 'skipped')").unwrap();
         // Same app_key on a DIFFERENT linked BOM is fine (index is per bom_id).
         seed_bom(&conn, "b2");
-        create_link(&mut conn, &sample_link("b2")).unwrap();
+        let tx = conn.transaction().unwrap();
+        create_link(&tx, &sample_link("b2")).unwrap();
+        tx.commit().unwrap();
     }
 
     // -- bom_link_quote: paired CHECKs + §6.2.1 keep-and-warn semantics --

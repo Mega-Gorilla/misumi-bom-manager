@@ -240,6 +240,39 @@ fn spreadsheet_write(
     spreadsheet::write_grid(&path, &headers, &rows)
 }
 
+// ---- Excel link mode (read-only link: probe/create/open/unlink — PR-3) ----
+
+/// Wizard probe: sheets preview + environment verdict, read-only (§2.3).
+#[tauri::command]
+fn excel_link_probe(path: String) -> Result<model::LinkProbe, String> {
+    excel_link::probe(&path)
+}
+
+/// Create a link (env check → contract → first open) and return the composed view.
+#[tauri::command]
+fn excel_link_create(
+    db: State<DbState>,
+    config: model::LinkCreateConfig,
+) -> Result<model::LinkedBomView, String> {
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    excel_link::create_link(&mut conn, &config)
+}
+
+/// Read + structure verdict + calc-state restore + compose. Common entry for first
+/// display, the manual "更新" button and (PR-7) auto reload.
+#[tauri::command]
+fn excel_link_open(db: State<DbState>, bom_id: String) -> Result<model::LinkedBomView, String> {
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    excel_link::open_link(&mut conn, &bom_id)
+}
+
+/// Unlink: freeze the display cache as a conventional BOM (§1.3).
+#[tauri::command]
+fn excel_link_unlink(db: State<DbState>, bom_id: String) -> Result<(), String> {
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    excel_link::unlink(&mut conn, &bom_id)
+}
+
 // ---- Supplier quote (cache-first batch fetch via the bridge) ----
 
 /// Evaluate `script` in the bridge webview and await the matching `__id` result.
@@ -591,7 +624,11 @@ pub fn run() {
             cart_add,
             misumi_auth_status,
             misumi_login,
-            misumi_open_cart
+            misumi_open_cart,
+            excel_link_probe,
+            excel_link_create,
+            excel_link_open,
+            excel_link_unlink
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

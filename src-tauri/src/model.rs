@@ -353,3 +353,168 @@ impl BackupLocation {
         }
     }
 }
+
+// ---- Excel link mode IPC views (PR-3: probe/create/open/unlink) ---------------------
+
+/// Structure verdict of a read (§4.9 3判定), returned as a SUCCESS value — Err is
+/// reserved for I/O and DB failures (implementation.md §2.3).
+#[derive(Serialize, Clone, PartialEq, Debug)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum StructureVerdict {
+    /// Auto-adopted; `new_columns` lists newly imported user column labels.
+    Safe { new_columns: Vec<String> },
+    /// Sync stopped; the user must confirm a candidate or remap (PR-5).
+    /// `structure_fp` is the freshness guard the confirm call must echo back.
+    Confirm {
+        reasons: Vec<String>,
+        candidates: Vec<LinkResolutionCandidate>,
+        structure_fp: String,
+    },
+    /// Nothing imported, writing forbidden.
+    Broken { reasons: Vec<String> },
+}
+
+/// One applicable contract update, self-contained: the confirm flow (PR-5) maps an
+/// accepted candidate onto SQL without further judgement (contract.rs is the single
+/// place that decides what is offered).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LinkResolutionCandidate {
+    AdoptSheetRename {
+        new_sheet: String,
+    },
+    AdoptHeaderRowMove {
+        new_header_row: i64,
+        new_data_start_row: i64,
+    },
+    AdoptColumnMove {
+        app_key: String,
+        new_excel_col: i64,
+    },
+    AdoptRename {
+        app_key: String,
+        new_label: String,
+    },
+    DropOptionalColumn {
+        app_key: String,
+    },
+    /// Frontend fills in a fresh app_key when the user picks this.
+    ImportSkippedAsUser {
+        excel_col: i64,
+        label: String,
+    },
+    KeepSkipped {
+        excel_col: i64,
+        new_label: Option<String>,
+    },
+    SkipColumn {
+        excel_col: i64,
+    },
+}
+
+/// A formula-bearing cell (0-based absolute coordinates) for the fx display (§9-8).
+#[derive(Serialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FormulaCell {
+    pub row: i64,
+    pub col: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<String>,
+}
+
+/// The composed state of a linked BOM returned by open/create (§2.3).
+/// On Confirm/Broken, `doc` is the PREVIOUS snapshot (bom_column/bom_row cache).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedBomView {
+    pub doc: BomDoc,
+    pub verdict: StructureVerdict,
+    pub calc_state: CalcState,
+    pub sync_status: SyncStatus,
+    pub env: crate::excel_link::env::EnvCheck,
+    /// Contract metadata per mapped column (role / EC projection). Deliberately
+    /// SEPARATE from ColumnDef.link: the one-shot import write policies are
+    /// normalized away for linked BOMs (§1.3) and must not be conflated with the
+    /// contract's projection semantics. The UI (PR-6) maps EC display through this.
+    pub columns_meta: Vec<LinkColumnMeta>,
+    pub formula_cells: Vec<FormulaCell>,
+    pub truncated: bool,
+    pub warnings: Vec<String>,
+}
+
+/// One mapped contract column as the frontend needs it (bom_link_column projection).
+#[derive(Serialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkColumnMeta {
+    pub app_key: String,
+    pub excel_col: i64,
+    pub ownership: LinkOwnership,
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<LinkProjection>,
+}
+
+/// Wizard probe (read-only look at a workbook before linking).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkProbe {
+    pub env: crate::excel_link::env::EnvCheck,
+    pub sheets: Vec<SheetProbe>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetProbe {
+    pub name: String,
+    /// First rows × columns as display strings (wizard preview).
+    pub preview: Vec<Vec<String>>,
+    /// 1-based heuristic suggestion (row with the most non-empty string cells).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_header_row: Option<i64>,
+    pub truncated: bool,
+}
+
+/// Input of excel_link_create (the wizard's outcome).
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkCreateConfig {
+    /// None = create a fresh BOM for this link.
+    #[serde(default)]
+    pub bom_id: Option<String>,
+    /// BOM display name when creating fresh.
+    #[serde(default)]
+    pub name: Option<String>,
+    pub workbook_path: String,
+    pub sheet_name: String,
+    /// 1-based.
+    pub header_row: i64,
+    /// 1-based; must be > header_row.
+    pub data_start_row: i64,
+    pub columns: Vec<LinkColumnConfig>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkColumnConfig {
+    /// 0-based Excel column index.
+    pub excel_col: i64,
+    #[serde(default)]
+    pub header_label: Option<String>,
+    /// None = skipped column.
+    #[serde(default)]
+    pub app_key: Option<String>,
+    pub ownership: LinkOwnership,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub source_field: Option<String>,
+    #[serde(default)]
+    pub projection: Option<LinkProjection>,
+}
