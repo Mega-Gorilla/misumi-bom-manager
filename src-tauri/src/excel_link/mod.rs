@@ -380,6 +380,15 @@ fn db_load(conn: &Connection, bom_id: &str) -> Result<Option<BomDoc>, String> {
 /// Open/refresh a linked BOM: read → verify → restore → compose (§2.3 — the common
 /// entry for first display, the manual "更新" button and (PR-7) auto reload).
 pub fn open_link(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, String> {
+    // An interrupted write (crash/error between ReplaceFileW and the finalize
+    // commit) is reconciled BEFORE anything reads the state (PR-4 review #3).
+    let recovered = reconcile_write_journal(conn, bom_id);
+    let mut view = open_link_inner(conn, bom_id)?;
+    view.warnings.splice(0..0, recovered);
+    Ok(view)
+}
+
+fn open_link_inner(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, String> {
     let rec = store::get_link(conn, bom_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "この BOM は Excel にリンクされていません".to_string())?;
@@ -712,6 +721,10 @@ pub fn apply_link(
 ) -> Result<crate::model::ApplyOutcome, String> {
     use crate::model::{ApplyOutcome, RefuseReason};
 
+    // Complete any interrupted previous write first: its outcome (fingerprints,
+    // generation, a possible conflict) is the baseline this apply builds on.
+    let recovered = reconcile_write_journal(conn, bom_id);
+
     let rec = store::get_link(conn, bom_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "この BOM は Excel にリンクされていません".to_string())?;
@@ -831,6 +844,7 @@ pub fn apply_link(
     let temp = dir.join(format!(".{stem}.mbm-temp-{nanos}.xlsx"));
     xlsx::write_patched(path, &temp, &sheet_part, &plan.edits, true)?;
     let new_fp = fingerprint::file_fingerprint(&temp).map_err(|e| e.to_string())?;
+    let new_hex = fingerprint::to_hex(&new_fp);
 
     // Step 6 (speed-up only, F0 is NOT re-taken — rule 20).
     match fingerprint::file_fingerprint(path) {
@@ -843,12 +857,33 @@ pub fn apply_link(
         }
     }
 
-    // Step 7: backup-carrying atomic replace.
+    // Step 7: backup-carrying atomic replace. The journal goes to the DB FIRST:
+    // from here to the finalize commit, a crash or error leaves the workbook
+    // already swapped, and fs+SQLite cannot share a transaction (§4.2.1) — the
+    // journal carries everything reconcile_write_journal needs to finish the
+    // bookkeeping later. ReplaceFileW is atomic, so "the backup file exists" is
+    // the exact criterion for "the replace happened" (PR-4 review #3).
     let backup_path = backup::unique_backup_path(dir, &stem);
+    if let Err(e) = store::upsert_write_journal(
+        conn,
+        bom_id,
+        &store::WriteJournal {
+            backup_path: backup_path.to_string_lossy().into_owned(),
+            temp_path: temp.to_string_lossy().into_owned(),
+            f0_fp: f0_hex.clone(),
+            new_fp: new_hex.clone(),
+            generation: plan.generation,
+        },
+    ) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("書き込みジャーナルの記録に失敗しました: {e}"));
+    }
     match writeback::replace_with_backup(path, &temp, &backup_path) {
         Ok(()) => {}
         Err(writeback::ReplaceError::SharingViolation) => {
+            // The replace did NOT happen (atomic) — the journal is void.
             let _ = std::fs::remove_file(&temp);
+            store::delete_write_journal(conn, bom_id).map_err(|e| e.to_string())?;
             store::upsert_pending(conn, bom_id, plan.generation).map_err(|e| e.to_string())?;
             store::record_pending_attempt(conn, bom_id, "file_open").map_err(|e| e.to_string())?;
             return Ok(ApplyOutcome::Pending {
@@ -857,16 +892,20 @@ pub fn apply_link(
         }
         Err(writeback::ReplaceError::Other(e)) => {
             let _ = std::fs::remove_file(&temp);
+            let _ = store::delete_write_journal(conn, bom_id);
             return Err(e);
         }
     }
 
-    // Step 8: post-hoc conflict detection (backup vs F0).
-    let (conflict, backup_fp) = writeback::verify_backup(&backup_path, &f0)?;
+    // Step 8: post-hoc conflict detection (backup vs F0). From here on a failure
+    // KEEPS the journal: the workbook is already swapped, and the next open/apply
+    // reconciles the ledger/state from it.
+    let (conflict, backup_fp) = writeback::verify_backup(&backup_path, &f0).map_err(|e| {
+        format!("{e}。置換は完了しています — 次回リンクを開いた時に台帳へ復旧されます")
+    })?;
 
-    // Step 9 + ledger, in ONE transaction (crash-safe: the ledger row exists from
-    // the moment the backup file exists in the DB's view).
-    let new_hex = fingerprint::to_hex(&new_fp);
+    // Step 9 + ledger, in ONE transaction, which also retires the journal — the
+    // commit atomically flips "interrupted, reconcile me" into "recorded".
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let now = crate::db::now_string(&tx).map_err(|e| e.to_string())?;
     let ledger_id = store::insert_backup(
@@ -901,11 +940,12 @@ pub fn apply_link(
             store::clear_pending(&tx, bom_id).map_err(|e| e.to_string())?;
         }
     }
+    store::delete_write_journal(&tx, bom_id).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
 
     // §4.2.2 transfer (backup must not stay in a cloud-synced folder — case-08) +
     // retention. Failures are warnings: the write itself succeeded.
-    let mut warnings = Vec::new();
+    let mut warnings = recovered;
     if let Err(w) = backup::transfer(conn, ledger_id, &backup_path, backup_dir) {
         warnings.push(w);
     }
@@ -931,6 +971,103 @@ pub fn apply_link(
             warnings,
         })
     }
+}
+
+/// Recover from a write interrupted between ReplaceFileW and the finalize commit
+/// (PR-4 review #3). ReplaceFileW is atomic, so the journal's backup file either
+/// exists (the replace happened — finish the §4.2.2 step 8-9 bookkeeping from the
+/// journal) or does not (it never ran — void the journal, sweep the temp).
+/// Total by design: every failure becomes a warning and the journal stays for the
+/// next attempt; the caller proceeds with a normal open/apply either way.
+fn reconcile_write_journal(conn: &mut Connection, bom_id: &str) -> Vec<String> {
+    let j = match store::get_write_journal(conn, bom_id) {
+        Ok(Some(j)) => j,
+        Ok(None) => return Vec::new(),
+        Err(e) => return vec![format!("書き込みジャーナルの照会に失敗しました: {e}")],
+    };
+    if !Path::new(&j.backup_path).exists() {
+        // The replace never ran: nothing on disk changed. Void the journal and
+        // sweep the temp the interrupted attempt may have left behind.
+        let _ = std::fs::remove_file(&j.temp_path);
+        return match store::delete_write_journal(conn, bom_id) {
+            Ok(()) => Vec::new(),
+            Err(e) => vec![format!("書き込みジャーナルの削除に失敗しました: {e}")],
+        };
+    }
+    match finalize_journal(conn, bom_id, &j) {
+        Ok(conflict) => {
+            let mut w = vec![format!(
+                "中断されていた前回の書き込みを復旧しました。バックアップはワークブックと同じフォルダに残っています: {}",
+                j.backup_path
+            )];
+            if conflict {
+                w.push(
+                    "復旧時に外部変更との競合を検出しました (backup≠F0)。バックアップに外部版が保全されています"
+                        .into(),
+                );
+            }
+            w
+        }
+        Err(e) => vec![format!(
+            "中断された書き込みの復旧に失敗しました: {e}。次回リンクを開いた時に再試行されます"
+        )],
+    }
+}
+
+/// The §4.2.2 step 8-9 bookkeeping an interrupted apply could not commit,
+/// executed from the journal: ledger row (conflict derived from the REAL backup
+/// file), state, pending, journal retirement — one transaction, same shape as
+/// apply's own finalize.
+fn finalize_journal(
+    conn: &mut Connection,
+    bom_id: &str,
+    j: &store::WriteJournal,
+) -> Result<bool, String> {
+    let rec = store::get_link(conn, bom_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "リンクが存在しません".to_string())?;
+    let backup_fp = fingerprint::file_fingerprint(Path::new(&j.backup_path))
+        .map_err(|e| format!("backup の指紋取得に失敗しました: {e}"))?;
+    let backup_hex = fingerprint::to_hex(&backup_fp);
+    let conflict = backup_hex != j.f0_fp;
+
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let now = crate::db::now_string(&tx).map_err(|e| e.to_string())?;
+    store::insert_backup(
+        &tx,
+        &store::NewBackup {
+            origin_bom_id: bom_id.to_string(),
+            workbook_path: rec.header.workbook_path.clone(),
+            backup_path: j.backup_path.clone(),
+            backup_fp: backup_hex,
+            f0_fp: j.f0_fp.clone(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let mut st = rec.state.clone();
+    st.last_app_write_fp = Some(j.new_fp.clone());
+    st.last_app_write_at = Some(now.clone());
+    st.last_read_fp = Some(j.new_fp.clone());
+    st.last_read_at = Some(now);
+    st.calc_state = crate::model::CalcState::Stale;
+    st.recalc_requested = true;
+    st.applied_generation = j.generation;
+    if conflict {
+        st.sync_status = SyncStatus::Conflict;
+        st.sync_error = Some("E_POST_REPLACE_CONFLICT".into());
+    } else {
+        st.sync_status = SyncStatus::Linked;
+        st.sync_error = None;
+    }
+    store::update_state(&tx, bom_id, &st).map_err(|e| e.to_string())?;
+    if let Some(p) = store::get_pending(&tx, bom_id).map_err(|e| e.to_string())? {
+        if p.requested_generation <= j.generation {
+            store::clear_pending(&tx, bom_id).map_err(|e| e.to_string())?;
+        }
+    }
+    store::delete_write_journal(&tx, bom_id).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(conflict)
 }
 
 /// Record a sync stop (broken/needs_review) discovered during apply.
@@ -2140,6 +2277,7 @@ mod tests {
             &[
                 &["TEST-PART-001", "2", "", ""],
                 &["TEST-PART-001", "5", "", ""],
+                &["TEST-PART-001", "", "", ""], // empty Qty = 1 (`row.qty ?? 1`)
             ],
         );
         let col = |excel_col: i64,
@@ -2212,6 +2350,13 @@ mod tests {
         );
         assert!(
             xml.contains(r#"<c r="D3" t="inlineStr"><is><t></t></is></c>"#),
+            "{xml}"
+        );
+        // Empty Qty row (§ PR-4 review #2): qty defaults to 1 like the UI —
+        // 100 × 1 × 2 = 200, and 1 < MOQ 3 warns.
+        assert!(xml.contains(r#"<c r="C4"><v>200</v></c>"#), "{xml}");
+        assert!(
+            xml.contains(r#"<c r="D4" t="inlineStr"><is><t>MOQ 3 未満</t></is></c>"#),
             "{xml}"
         );
     }
@@ -2426,6 +2571,264 @@ mod tests {
         // (i) an empty run is a no-op.
         assert_eq!(adopt(&mut conn, &bom_id, &[]), None);
         assert_eq!(gen_of(&conn), 4);
+    }
+
+    /// PR-4 review #1 (integration): partNo/source roles moved onto custom columns
+    /// drive BOTH the snapshot lookup at read (compose) and the writeback keys —
+    /// the stale legacy partsNo column must not be consulted.
+    #[test]
+    fn apply_resolves_fetch_keys_via_role_columns() {
+        let path = temp_xlsx(
+            "apply-roles.xlsx",
+            &["旧型番", "モデル", "発注先", "数量", "EC単価"],
+            &[&["OLD-STALE", "TEST-PART-001", "MISUMI", "2", ""]],
+        );
+        let col = |excel_col: i64, label: &str, key: &str, role: Option<&str>| LinkColumnConfig {
+            excel_col,
+            header_label: Some(label.into()),
+            app_key: Some(key.into()),
+            ownership: LinkOwnership::User,
+            required: false,
+            role: role.map(str::to_string),
+            source_field: None,
+            projection: None,
+        };
+        let cfg = LinkCreateConfig {
+            bom_id: None,
+            name: Some("roles".into()),
+            workbook_path: path.to_string_lossy().into_owned(),
+            sheet_name: "Sheet1".into(),
+            header_row: 1,
+            data_start_row: 2,
+            columns: vec![
+                col(0, "旧型番", "partsNo", None), // legacy column, role moved away
+                col(1, "モデル", "modelCode", Some("partNo")),
+                col(2, "発注先", "srcCol", Some("source")),
+                col(3, "数量", "qty", None),
+                LinkColumnConfig {
+                    excel_col: 4,
+                    header_label: Some("EC単価".into()),
+                    app_key: Some("ecUnitPrice".into()),
+                    ownership: LinkOwnership::App,
+                    required: false,
+                    role: None,
+                    source_field: Some("quote.unitPrice".into()),
+                    projection: Some(LinkProjection::Writeback),
+                },
+            ],
+        };
+        let mut conn = mem();
+        let view = create_link(&mut conn, &cfg).unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
+        let bom_id = view.doc.id.clone().unwrap();
+        // Snapshots exist for BOTH part numbers — the written value proves which
+        // column keyed the lookup.
+        adopt(
+            &mut conn,
+            &bom_id,
+            &[
+                ("TEST-PART-001", mk_quote("115")),
+                ("OLD-STALE", mk_quote("999")),
+            ],
+        );
+
+        // Read side: compose resolves the snapshot via the role columns too.
+        let view = open_link(&mut conn, &bom_id).unwrap();
+        let q = view.doc.rows[0]
+            .supplier
+            .as_ref()
+            .expect("snapshot via role");
+        assert_eq!(q.quote.as_ref().unwrap().unit_price.as_deref(), Some("115"));
+
+        // Write side.
+        let out = apply_link(&mut conn, &bom_id, &apply_bk("roles")).unwrap();
+        assert!(matches!(out, ApplyOutcome::Applied { .. }), "{out:?}");
+        let xml = sheet_xml_of(&path, "Sheet1");
+        assert!(xml.contains(r#"<c r="E2"><v>115</v></c>"#), "{xml}");
+        assert!(
+            !xml.contains(">999<"),
+            "stale partsNo keyed the lookup: {xml}"
+        );
+    }
+
+    /// Manual replay of §4.2.2 up to ReplaceFileW, then a simulated crash before
+    /// the finalize commit: the journal lets the next open complete ledger/state
+    /// (PR-4 review #3). Non-conflict variant.
+    #[cfg(windows)]
+    #[test]
+    fn open_recovers_interrupted_write() {
+        let path = temp_xlsx(
+            "recover-ok.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]);
+        let f0_hex = fp_hex(&path);
+
+        // Steps 5-7 by hand (what apply_link does), then "crash".
+        let mut zip = xlsx::open_zip(&path).unwrap();
+        let part = xlsx::sheet_part_for(&mut zip, "Sheet1").unwrap();
+        drop(zip);
+        let mut edits = std::collections::BTreeMap::new();
+        edits.insert("C2".to_string(), xlsx::CellValue::Number(115.0));
+        let dir = path.parent().unwrap();
+        let temp = dir.join(".recover-ok.mbm-temp-x.xlsx");
+        xlsx::write_patched(&path, &temp, &part, &edits, true).unwrap();
+        let new_hex = fp_hex(&temp);
+        let backup = dir.join("recover-ok.mbm-backup-x.xlsx");
+        store::upsert_write_journal(
+            &conn,
+            &bom_id,
+            &store::WriteJournal {
+                backup_path: backup.to_string_lossy().into_owned(),
+                temp_path: temp.to_string_lossy().into_owned(),
+                f0_fp: f0_hex.clone(),
+                new_fp: new_hex.clone(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+        writeback::replace_with_backup(&path, &temp, &backup).unwrap();
+        // -- crash: no finalize commit --
+
+        let view = open_link(&mut conn, &bom_id).unwrap();
+        assert!(
+            view.warnings.iter().any(|w| w.contains("復旧しました")),
+            "{:?}",
+            view.warnings
+        );
+        assert!(store::get_write_journal(&conn, &bom_id).unwrap().is_none());
+        let backups = store::list_backups(&conn, &bom_id).unwrap();
+        assert_eq!(backups.len(), 1);
+        assert!(!backups[0].is_conflict);
+        assert_eq!(backups[0].f0_fp, f0_hex);
+        assert_eq!(
+            backups[0].location,
+            crate::model::BackupLocation::VolumeTemp,
+            "reconcile leaves the transfer to a later apply"
+        );
+        assert!(backup.exists(), "the backup file is preserved");
+        let st = store::get_state(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(st.applied_generation, 1);
+        assert_eq!(st.last_app_write_fp.as_deref(), Some(new_hex.as_str()));
+        assert_eq!(st.sync_status, SyncStatus::Linked);
+        assert_eq!(
+            st.calc_state,
+            CalcState::Stale,
+            "§9-12 via the restore rule"
+        );
+    }
+
+    /// Conflict variant: an external version landed right before the replace —
+    /// the recovery must derive is_conflict from the REAL backup content and keep
+    /// the displaced version discoverable (unresolved_conflicts).
+    #[cfg(windows)]
+    #[test]
+    fn open_recovers_interrupted_write_as_conflict() {
+        let path = temp_xlsx(
+            "recover-cf.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]);
+        let f0_hex = fp_hex(&path);
+
+        let mut zip = xlsx::open_zip(&path).unwrap();
+        let part = xlsx::sheet_part_for(&mut zip, "Sheet1").unwrap();
+        drop(zip);
+        let mut edits = std::collections::BTreeMap::new();
+        edits.insert("C2".to_string(), xlsx::CellValue::Number(115.0));
+        let dir = path.parent().unwrap();
+        let temp = dir.join(".recover-cf.mbm-temp-x.xlsx");
+        xlsx::write_patched(&path, &temp, &part, &edits, true).unwrap();
+        let new_hex = fp_hex(&temp);
+        let backup = dir.join("recover-cf.mbm-backup-x.xlsx");
+        store::upsert_write_journal(
+            &conn,
+            &bom_id,
+            &store::WriteJournal {
+                backup_path: backup.to_string_lossy().into_owned(),
+                temp_path: temp.to_string_lossy().into_owned(),
+                f0_fp: f0_hex.clone(),
+                new_fp: new_hex,
+                generation: 1,
+            },
+        )
+        .unwrap();
+        // External F1 lands between the journal and the replace.
+        temp_xlsx(
+            "recover-cf.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-009", "9", ""]],
+        );
+        writeback::replace_with_backup(&path, &temp, &backup).unwrap();
+        // -- crash --
+
+        let view = open_link(&mut conn, &bom_id).unwrap();
+        assert!(
+            view.warnings.iter().any(|w| w.contains("競合")),
+            "{:?}",
+            view.warnings
+        );
+        let backups = store::list_backups(&conn, &bom_id).unwrap();
+        assert_eq!(backups.len(), 1);
+        assert!(
+            backups[0].is_conflict,
+            "backup≠F0 must be derived on recovery"
+        );
+        let open_conflicts = store::unresolved_conflicts(&conn).unwrap();
+        assert_eq!(open_conflicts.len(), 1, "displaced version is discoverable");
+        // The workbook itself holds the app version the interrupted write placed.
+        let xml = sheet_xml_of(&path, "Sheet1");
+        assert!(xml.contains("<v>115</v>"), "{xml}");
+    }
+
+    /// A journal without its backup file means the replace never ran (ReplaceFileW
+    /// is atomic): the journal is voided, the temp swept, nothing enters the ledger.
+    #[test]
+    fn open_voids_stale_journal_when_replace_never_ran() {
+        let path = temp_xlsx(
+            "recover-void.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        let dir = path.parent().unwrap();
+        let temp = dir.join(".recover-void.mbm-temp-x.xlsx");
+        std::fs::write(&temp, b"leftover temp").unwrap();
+        store::upsert_write_journal(
+            &conn,
+            &bom_id,
+            &store::WriteJournal {
+                backup_path: dir
+                    .join("recover-void.mbm-backup-never.xlsx")
+                    .to_string_lossy()
+                    .into_owned(),
+                temp_path: temp.to_string_lossy().into_owned(),
+                f0_fp: "aa".into(),
+                new_fp: "bb".into(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+
+        let view = open_link(&mut conn, &bom_id).unwrap();
+        assert!(
+            !view.warnings.iter().any(|w| w.contains("復旧")),
+            "no recovery banner for a void journal: {:?}",
+            view.warnings
+        );
+        assert!(store::get_write_journal(&conn, &bom_id).unwrap().is_none());
+        assert!(!temp.exists(), "stale temp must be swept");
+        assert!(store::list_backups(&conn, &bom_id).unwrap().is_empty());
     }
 
     /// The sandwiched read returns the fingerprint of exactly the content both

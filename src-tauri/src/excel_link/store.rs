@@ -586,6 +586,65 @@ pub struct NewBackup {
     pub f0_fp: String,
 }
 
+/// Prepared write journal (V6): everything the reconcile needs to finish an
+/// interrupted §4.2.2 replace. Persisted BEFORE ReplaceFileW; deleted inside the
+/// post-replace finalize transaction. One row per BOM (a link runs one write at
+/// a time), so upsert semantics are safe.
+pub struct WriteJournal {
+    pub backup_path: String,
+    pub temp_path: String,
+    pub f0_fp: String,
+    pub new_fp: String,
+    pub generation: i64,
+}
+
+pub fn upsert_write_journal(
+    conn: &Connection,
+    bom_id: &str,
+    j: &WriteJournal,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO bom_link_write_journal            (bom_id, backup_path, temp_path, f0_fp, new_fp, generation, created_at)          VALUES(?1, ?2, ?3, ?4, ?5, ?6, datetime('now', 'localtime'))          ON CONFLICT(bom_id) DO UPDATE SET            backup_path = excluded.backup_path, temp_path = excluded.temp_path,            f0_fp = excluded.f0_fp, new_fp = excluded.new_fp,            generation = excluded.generation, created_at = excluded.created_at",
+        params![
+            bom_id,
+            j.backup_path,
+            j.temp_path,
+            j.f0_fp,
+            j.new_fp,
+            j.generation
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_write_journal(
+    conn: &Connection,
+    bom_id: &str,
+) -> rusqlite::Result<Option<WriteJournal>> {
+    conn.query_row(
+        "SELECT backup_path, temp_path, f0_fp, new_fp, generation          FROM bom_link_write_journal WHERE bom_id = ?1",
+        [bom_id],
+        |r| {
+            Ok(WriteJournal {
+                backup_path: r.get(0)?,
+                temp_path: r.get(1)?,
+                f0_fp: r.get(2)?,
+                new_fp: r.get(3)?,
+                generation: r.get(4)?,
+            })
+        },
+    )
+    .optional()
+}
+
+pub fn delete_write_journal(conn: &Connection, bom_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM bom_link_write_journal WHERE bom_id = ?1",
+        [bom_id],
+    )?;
+    Ok(())
+}
+
 /// `bom_link_backup` row as stored.
 pub struct BackupRecord {
     pub id: i64,

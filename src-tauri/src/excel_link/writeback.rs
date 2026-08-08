@@ -38,10 +38,16 @@ pub(crate) fn plan_writeback(
         return Ok(Err(RefuseReason::Truncated)); // §3.2 / §9-23
     }
 
-    // Column lookup by app_key (the §4.9 rebuild convention shared with compose).
-    let by_key = |key: &str| contract.mapped.iter().find(|m| m.app_key == key);
-    let value_at = |row0: u32, key: &str| -> Option<String> {
-        by_key(key).and_then(|m| outcome.values.get(&(row0, m.excel_col)).cloned())
+    // Fetch-key columns resolve via ROLE first, legacy core app_key as fallback —
+    // the exact rule the fetch pipeline uses (partNoColumn/sourceColumn in
+    // types/bom.ts, mirrored by Contract::part_no_column). Using fixed app_keys
+    // here would make a role-moved BOM fetch by one column and write back by
+    // another (PR-4 review #1).
+    let part_col = contract.part_no_column();
+    let source_col = contract.source_column();
+    let qty_col = contract.mapped.iter().find(|m| m.app_key == "qty");
+    let cell_of = |row0: u32, m: Option<&crate::excel_link::contract::MappedColumn>| {
+        m.and_then(|m| outcome.values.get(&(row0, m.excel_col)).cloned())
     };
 
     // Adopted snapshots, parsed once. Only rows whose LATEST attempt succeeded are
@@ -60,16 +66,21 @@ pub(crate) fn plan_writeback(
     let last = outcome.last_data_row;
     for row1 in contract.data_start_row..=last {
         let row0 = row1 - 1;
-        let Some(parts_no) = value_at(row0, "partsNo").filter(|p| !p.trim().is_empty()) else {
+        let Some(parts_no) = cell_of(row0, part_col).filter(|p| !p.trim().is_empty()) else {
             continue;
         };
-        let supplier = value_at(row0, "order").unwrap_or_else(|| "MISUMI".into());
+        let supplier = cell_of(row0, source_col)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "MISUMI".into());
         let Some(payload) = payload_by_key.get(&(supplier, parts_no)) else {
             continue; // no adopted success snapshot → skip the row's app cells
         };
-        let qty: f64 = value_at(row0, "qty")
+        // Missing/unparseable Qty counts as 1 — `row.qty ?? 1` in columns.ts
+        // (compose parses the same cell with `.parse().ok()`, so None there = 1 in
+        // the UI too). An explicit 0 stays 0 (PR-4 review #2).
+        let qty: f64 = cell_of(row0, qty_col)
             .and_then(|q| q.parse().ok())
-            .unwrap_or(0.0);
+            .unwrap_or(1.0);
         for m in &app_columns {
             let Some(source) = m.source_field.as_deref() else {
                 continue;
@@ -118,20 +129,22 @@ fn resolve_value(
             let unit: f64 = lookup(payload, "quote.unitPrice")?
                 .as_str()
                 .and_then(|s| s.parse().ok())?;
-            Some(xlsx::CellValue::Number(
-                unit * qty
-                    * if qty_multiplier > 0.0 {
-                        qty_multiplier
-                    } else {
-                        1.0
-                    },
-            ))
+            // `qtyMultiplier || 1` in columns.ts: 0/NaN fall back to 1, any other
+            // value (including negative) is used as-is (PR-4 review #2).
+            let mult = if qty_multiplier == 0.0 || qty_multiplier.is_nan() {
+                1.0
+            } else {
+                qty_multiplier
+            };
+            Some(xlsx::CellValue::Number(unit * qty * mult))
         }
         "quote.moqNote" => {
             let moq = lookup(payload, "quote.moq")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            if moq > 0 && (qty as i64) < moq {
+            // Float comparison like the UI (`qty < moq` in columns.ts) — an i64
+            // cast would truncate 2.5 to 2 and change the verdict.
+            if moq > 0 && qty < moq as f64 {
                 Some(xlsx::CellValue::Text(format!("MOQ {moq} 未満")))
             } else {
                 Some(xlsx::CellValue::Text(String::new())) // clear a stale warning
@@ -247,9 +260,14 @@ mod tests {
         // §4.5 / §9-18: unitPrice × row qty × qtyMultiplier — the columns.ts formula.
         let v = resolve_value(&payload(), "quote.subtotal", 2.0, 2.0).unwrap();
         assert_eq!(v, xlsx::CellValue::Number(400.0));
-        // Multiplier <= 0 falls back to 1 (defensive, matches the frontend).
+        // `qtyMultiplier || 1` semantics (columns.ts): 0 and NaN fall back to 1,
+        // anything else — negative included — is used as-is (PR-4 review #2).
         let v = resolve_value(&payload(), "quote.subtotal", 5.0, 0.0).unwrap();
         assert_eq!(v, xlsx::CellValue::Number(500.0));
+        let v = resolve_value(&payload(), "quote.subtotal", 5.0, f64::NAN).unwrap();
+        assert_eq!(v, xlsx::CellValue::Number(500.0));
+        let v = resolve_value(&payload(), "quote.subtotal", 2.0, -1.0).unwrap();
+        assert_eq!(v, xlsx::CellValue::Number(-200.0));
         // No unit price → skip the cell, never write 0.
         let p = json!({ "quote": {} });
         assert!(resolve_value(&p, "quote.subtotal", 2.0, 1.0).is_none());
@@ -389,6 +407,158 @@ mod tests {
         assert_eq!(plan.generation, 7);
         assert_eq!(plan.edits.len(), 1, "{:?}", plan.edits);
         assert_eq!(plan.edits.get("C2"), Some(&xlsx::CellValue::Number(100.0)));
+    }
+
+    /// PR-4 review #1: the partNo/source fetch keys must resolve via the ROLE
+    /// columns (fallback core app_key) — the same rule as partNoColumn/sourceColumn
+    /// on the frontend — or a role-moved BOM writes values fetched by one column
+    /// using lookups against another.
+    #[test]
+    fn plan_resolves_part_and_source_via_role_columns() {
+        use crate::excel_link::store::{LinkColumn, LinkHeader};
+        use crate::model::{EnvVerdict, LinkOwnership, LinkProjection};
+        let header = LinkHeader {
+            bom_id: "B1".into(),
+            workbook_path: "wb.xlsx".into(),
+            sheet_name: "Sheet1".into(),
+            header_row: 1,
+            data_start_row: 2,
+            env_verdict: EnvVerdict::Allow,
+            env_resolved_path: None,
+            env_fs_name: None,
+            env_checked_at: None,
+            created_at: "2026-08-01".into(),
+            updated_at: "2026-08-01".into(),
+        };
+        let col = |excel_col: i64, key: &str, role: Option<&str>| LinkColumn {
+            excel_col,
+            header_label: Some(key.into()),
+            app_key: Some(key.into()),
+            ownership: LinkOwnership::User,
+            required: false,
+            role: role.map(str::to_string),
+            source_field: None,
+            projection: None,
+        };
+        let cols = vec![
+            // A stale legacy partsNo column WITHOUT the role — must NOT be used.
+            col(0, "partsNo", None),
+            // The role-designated fetch keys live on custom columns.
+            col(1, "modelCode", Some("partNo")),
+            col(2, "srcCol", Some("source")),
+            col(3, "qty", None),
+            LinkColumn {
+                excel_col: 4,
+                header_label: Some("EC単価".into()),
+                app_key: Some("ecUnitPrice".into()),
+                ownership: LinkOwnership::App,
+                required: false,
+                role: None,
+                source_field: Some("quote.unitPrice".into()),
+                projection: Some(LinkProjection::Writeback),
+            },
+        ];
+        let c = Contract::try_from_store(&header, &cols).unwrap();
+
+        let mut values = std::collections::BTreeMap::new();
+        values.insert((1u32, 0u32), "OLD-STALE".to_string()); // legacy column
+        values.insert((1u32, 1u32), "TEST-PART-001".to_string()); // role: partNo
+        values.insert((1u32, 2u32), "MISUMI".to_string()); // role: source
+        values.insert((1u32, 3u32), "2".to_string());
+        let outcome = ReadOutcome {
+            sheets: vec![],
+            values,
+            formula_cells: vec![],
+            value_readable: true,
+            last_data_row: 2,
+            truncated: false,
+            calc_mode: None,
+        };
+        // Both parts have adopted snapshots — the written value proves which
+        // column keyed the lookup.
+        let quotes = vec![
+            quote_rec("TEST-PART-001", "115", true),
+            quote_rec("OLD-STALE", "999", true),
+        ];
+        let plan = plan_writeback(&c, &outcome, &quotes, 1.0, 1, PLAIN_SHEET)
+            .unwrap()
+            .unwrap_or_else(|r| panic!("refused: {r:?}"));
+        assert_eq!(
+            plan.edits.get("E2"),
+            Some(&xlsx::CellValue::Number(115.0)),
+            "must key on the role column, not the stale partsNo: {:?}",
+            plan.edits
+        );
+    }
+
+    /// PR-4 review #2: a missing/unparseable Qty cell counts as 1 (`row.qty ?? 1`
+    /// in columns.ts — compose's `.parse().ok()` yields None for the same cells),
+    /// so the subtotal is unitPrice × 1, never 0. An explicit 0 stays 0.
+    #[test]
+    fn plan_defaults_missing_qty_to_one() {
+        use crate::excel_link::store::{LinkColumn, LinkHeader};
+        use crate::model::{EnvVerdict, LinkOwnership, LinkProjection};
+        let header = LinkHeader {
+            bom_id: "B1".into(),
+            workbook_path: "wb.xlsx".into(),
+            sheet_name: "Sheet1".into(),
+            header_row: 1,
+            data_start_row: 2,
+            env_verdict: EnvVerdict::Allow,
+            env_resolved_path: None,
+            env_fs_name: None,
+            env_checked_at: None,
+            created_at: "2026-08-01".into(),
+            updated_at: "2026-08-01".into(),
+        };
+        let user = |excel_col: i64, key: &str| LinkColumn {
+            excel_col,
+            header_label: Some(key.into()),
+            app_key: Some(key.into()),
+            ownership: LinkOwnership::User,
+            required: false,
+            role: None,
+            source_field: None,
+            projection: None,
+        };
+        let cols = vec![
+            user(0, "partsNo"),
+            user(1, "qty"),
+            LinkColumn {
+                excel_col: 2,
+                header_label: Some("小計".into()),
+                app_key: Some("subtotal".into()),
+                ownership: LinkOwnership::App,
+                required: false,
+                role: None,
+                source_field: Some("quote.subtotal".into()),
+                projection: Some(LinkProjection::Writeback),
+            },
+        ];
+        let c = Contract::try_from_store(&header, &cols).unwrap();
+
+        let mut values = std::collections::BTreeMap::new();
+        values.insert((1u32, 0u32), "TEST-PART-001".to_string()); // row2: no qty cell
+        values.insert((2u32, 0u32), "TEST-PART-001".to_string()); // row3: garbage qty
+        values.insert((2u32, 1u32), "x個".to_string());
+        values.insert((3u32, 0u32), "TEST-PART-001".to_string()); // row4: explicit 0
+        values.insert((3u32, 1u32), "0".to_string());
+        let outcome = ReadOutcome {
+            sheets: vec![],
+            values,
+            formula_cells: vec![],
+            value_readable: true,
+            last_data_row: 4,
+            truncated: false,
+            calc_mode: None,
+        };
+        let quotes = vec![quote_rec("TEST-PART-001", "100", true)];
+        let plan = plan_writeback(&c, &outcome, &quotes, 1.0, 1, PLAIN_SHEET)
+            .unwrap()
+            .unwrap_or_else(|r| panic!("refused: {r:?}"));
+        assert_eq!(plan.edits.get("C2"), Some(&xlsx::CellValue::Number(100.0)));
+        assert_eq!(plan.edits.get("C3"), Some(&xlsx::CellValue::Number(100.0)));
+        assert_eq!(plan.edits.get("C4"), Some(&xlsx::CellValue::Number(0.0)));
     }
 
     #[test]
