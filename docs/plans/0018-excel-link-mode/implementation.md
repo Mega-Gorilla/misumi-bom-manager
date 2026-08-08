@@ -357,12 +357,19 @@ pub enum ApplyOutcome {
 
 - **書き込みジャーナル(V6・PR-4 レビュー対応)**: fs と SQLite は同一トランザクションにできない
   (§4.2.1)ため、ReplaceFileW の**直前**に `bom_link_write_journal`(backup_path/temp_path/
-  F0/new_fp/generation)を永続化する。置換成功後の 1 トランザクション(台帳+state+pending)が
+  F0/new_fp/generation)を **INSERT のみ**で永続化する(既存行は未完了置換の唯一の復旧情報の
+  ため上書き禁止 — PK で強制)。置換成功後の 1 トランザクション(台帳+state+pending)が
   ジャーナルを同時に削除して確定。置換〜確定の間でクラッシュ・障害が起きた場合は、次回の
   open/apply 冒頭の reconcile が「backup ファイルの存在 ⟺ 置換は実行された」(ReplaceFileW の
-  原子性)で判定し、実 backup の指紋から競合を導出して台帳・state を完遂する(backup 不在なら
-  ジャーナル破棄+temp 掃除のみ)。復旧された backup は volume_temp のまま残る(移送は次回
-  apply の通常経路。未解決競合は保持ポリシー対象外なので保全される)
+  原子性)で判定し、実 backup の指紋から競合を導出して台帳・state を完遂した上で、
+  **§4.2.2 の6段階移送も同時に完遂する**(open も app-data の backup ディレクトリを受け取る)。
+  backup 不在ならジャーナル破棄+temp 掃除のみ。**reconcile が失敗してジャーナルが残っている間、
+  apply は fail closed で拒否**する(ジャーナルは不変のまま次回再試行)。apply の移送は
+  「その apply が作った行」だけでなく**当該 BOM の未移送 volume_temp 行を全件掃き出す**
+- **競合ゲート(§1.3 の固定)**: 未解決競合 backup(`is_conflict=1 AND resolved_at IS NULL`)が
+  存在する間、open は読み取りを継続しつつ `sync_status=conflict` を維持し(Safe 再読込でも
+  Linked へ自動復元しない)、apply はファイルに触れる前に `Refused(unresolved_conflict)` で
+  拒否する。解除は ユーザーの競合解決(`mark_resolved`・PR-5 のコマンド)のみ
 
 `LinkedBomView` は `doc: BomDoc`（合成済み。Broken 時は前回スナップショット）＋ `verdict`＋
 `calc_state`＋`sync_status`＋`env_verdict`＋`pending`＋`formula_cells`（fx 表示用）。

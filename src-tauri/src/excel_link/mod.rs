@@ -379,10 +379,16 @@ fn db_load(conn: &Connection, bom_id: &str) -> Result<Option<BomDoc>, String> {
 
 /// Open/refresh a linked BOM: read → verify → restore → compose (§2.3 — the common
 /// entry for first display, the manual "更新" button and (PR-7) auto reload).
-pub fn open_link(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, String> {
+pub fn open_link(
+    conn: &mut Connection,
+    bom_id: &str,
+    backup_dir: &Path,
+) -> Result<LinkedBomView, String> {
     // An interrupted write (crash/error between ReplaceFileW and the finalize
     // commit) is reconciled BEFORE anything reads the state (PR-4 review #3).
-    let recovered = reconcile_write_journal(conn, bom_id);
+    // backup_dir lets the recovery also finish the §4.2.2 transfer, so a
+    // recovered backup does not linger in a (possibly cloud-synced) folder.
+    let recovered = reconcile_write_journal(conn, bom_id, backup_dir);
     let mut view = open_link_inner(conn, bom_id)?;
     view.warnings.splice(0..0, recovered);
     Ok(view)
@@ -485,9 +491,20 @@ fn open_link_inner(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView,
                 .map_err(|e| e.to_string())?;
             let calc = calc_state::restore(&fp, &persisted);
 
+            // §1.3: conflict = 同期停止。A Safe re-read must NOT auto-restore Linked
+            // while an unresolved conflict backup exists — only the user's
+            // resolution (mark_resolved, PR-5) lifts the stop (2nd review #1).
+            // Reading continues either way; the ledger is the durable record.
+            let conflicted =
+                store::has_unresolved_conflict(conn, bom_id).map_err(|e| e.to_string())?;
+            let sync_status = if conflicted {
+                SyncStatus::Conflict
+            } else {
+                SyncStatus::Linked
+            };
             let mut st = rec.state.clone();
-            st.sync_status = SyncStatus::Linked;
-            st.sync_error = None;
+            st.sync_status = sync_status;
+            st.sync_error = conflicted.then(|| "E_POST_REPLACE_CONFLICT".to_string());
             st.calc_state = calc;
             st.last_read_fp = Some(fingerprint::to_hex(&fp));
             st.structure_fp = Some(verify.structure_fp.clone());
@@ -509,7 +526,7 @@ fn open_link_inner(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView,
                 doc,
                 verdict: verify.to_verdict(&contract),
                 calc_state: calc,
-                sync_status: SyncStatus::Linked,
+                sync_status,
                 columns_meta: columns_meta(&contract),
                 env,
                 formula_cells: outcome.formula_cells,
@@ -723,7 +740,27 @@ pub fn apply_link(
 
     // Complete any interrupted previous write first: its outcome (fingerprints,
     // generation, a possible conflict) is the baseline this apply builds on.
-    let recovered = reconcile_write_journal(conn, bom_id);
+    let recovered = reconcile_write_journal(conn, bom_id, backup_dir);
+
+    // A journal that SURVIVED reconcile is an unfinished replace we could not
+    // recover — it is the only pointer to an unmanaged backup, and starting a
+    // new write would overwrite it. Fail closed (2nd review #2).
+    if store::get_write_journal(conn, bom_id)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        return Err(format!(
+            "前回の書き込みの復旧が完了していません。復旧が成功するまで新しい反映は実行できません: {}",
+            recovered.join(" / ")
+        ));
+    }
+    // §1.3: an unresolved conflict stops sync — no further write until the user
+    // resolves it (2nd review #1). Checked BEFORE any file access.
+    if store::has_unresolved_conflict(conn, bom_id).map_err(|e| e.to_string())? {
+        return Ok(crate::model::ApplyOutcome::Refused {
+            reason: crate::model::RefuseReason::UnresolvedConflict,
+        });
+    }
 
     let rec = store::get_link(conn, bom_id)
         .map_err(|e| e.to_string())?
@@ -864,7 +901,7 @@ pub fn apply_link(
     // bookkeeping later. ReplaceFileW is atomic, so "the backup file exists" is
     // the exact criterion for "the replace happened" (PR-4 review #3).
     let backup_path = backup::unique_backup_path(dir, &stem);
-    if let Err(e) = store::upsert_write_journal(
+    if let Err(e) = store::insert_write_journal(
         conn,
         bom_id,
         &store::WriteJournal {
@@ -946,9 +983,9 @@ pub fn apply_link(
     // §4.2.2 transfer (backup must not stay in a cloud-synced folder — case-08) +
     // retention. Failures are warnings: the write itself succeeded.
     let mut warnings = recovered;
-    if let Err(w) = backup::transfer(conn, ledger_id, &backup_path, backup_dir) {
-        warnings.push(w);
-    }
+    // Sweep EVERY untransferred backup of this BOM (this write's row plus any
+    // row a crash recovery added earlier) out of the workbook folder.
+    warnings.extend(backup::transfer_pending(conn, bom_id, backup_dir));
     warnings.extend(backup::run_retention(conn, bom_id));
 
     let final_backup_path: String = conn
@@ -979,7 +1016,7 @@ pub fn apply_link(
 /// journal) or does not (it never ran — void the journal, sweep the temp).
 /// Total by design: every failure becomes a warning and the journal stays for the
 /// next attempt; the caller proceeds with a normal open/apply either way.
-fn reconcile_write_journal(conn: &mut Connection, bom_id: &str) -> Vec<String> {
+fn reconcile_write_journal(conn: &mut Connection, bom_id: &str, backup_dir: &Path) -> Vec<String> {
     let j = match store::get_write_journal(conn, bom_id) {
         Ok(Some(j)) => j,
         Ok(None) => return Vec::new(),
@@ -996,16 +1033,19 @@ fn reconcile_write_journal(conn: &mut Connection, bom_id: &str) -> Vec<String> {
     }
     match finalize_journal(conn, bom_id, &j) {
         Ok(conflict) => {
-            let mut w = vec![format!(
-                "中断されていた前回の書き込みを復旧しました。バックアップはワークブックと同じフォルダに残っています: {}",
-                j.backup_path
-            )];
+            let mut w = vec![
+                "中断されていた前回の書き込みを復旧し、バックアップを台帳へ記録しました"
+                    .to_string(),
+            ];
             if conflict {
                 w.push(
                     "復旧時に外部変更との競合を検出しました (backup≠F0)。バックアップに外部版が保全されています"
                         .into(),
                 );
             }
+            // §4.2.2: finish the transfer too — a recovered backup must not stay
+            // in a (possibly cloud-synced) workbook folder (2nd review #3).
+            w.extend(backup::transfer_pending(conn, bom_id, backup_dir));
             w
         }
         Err(e) => vec![format!(
@@ -1227,7 +1267,7 @@ mod tests {
 
         // ---- adopted quote snapshot composes into the view (§9-1) ----
         store::record_quote_ok(&conn, &bom_id, "TEST-PART-001", &mk_quote("115"), 1).unwrap();
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         let q = view.doc.rows[0].supplier.as_ref().expect("quote composed");
         assert_eq!(q.quote.as_ref().unwrap().unit_price.as_deref(), Some("115"));
         assert!(view.doc.rows[1].supplier.is_none()); // no snapshot for part 2
@@ -1239,7 +1279,7 @@ mod tests {
             &[&["TEST-PART-999", "9", ""]],
         );
         assert_eq!(path2, path);
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         assert_eq!(
             view.sync_status,
             SyncStatus::NeedsReview,
@@ -1261,7 +1301,7 @@ mod tests {
         // text in place reads as a RENAME candidate (Confirm, rule 8) — deleting
         // the COLUMN is what makes the required label unmatchable → Broken. ----
         temp_xlsx("lifecycle.xlsx", &["数量", "EC単価"], &[&["1", ""]]);
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         assert_eq!(view.sync_status, SyncStatus::Broken);
         assert!(matches!(view.verdict, StructureVerdict::Broken { .. }));
 
@@ -1271,7 +1311,7 @@ mod tests {
             &["型番", "数量", "EC単価"],
             &[&["TEST-PART-001", "2", ""]],
         );
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         assert_eq!(view.sync_status, SyncStatus::Linked);
         assert_eq!(view.doc.rows.len(), 1);
 
@@ -1306,7 +1346,7 @@ mod tests {
             &["型番", "数量", "EC単価", "備考"],
             &[&["TEST-PART-001", "2", "", "急ぎ"]],
         );
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
         match &view.verdict {
             StructureVerdict::Safe { new_columns } => {
@@ -1353,7 +1393,7 @@ mod tests {
                 &["TEST-PART-001", "1", ""],
             ],
         );
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         assert_eq!(view.sync_status, SyncStatus::Linked);
         let parts: Vec<_> = view
             .doc
@@ -1392,7 +1432,7 @@ mod tests {
             .share_mode(0x1)
             .open(&path)
             .unwrap();
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         assert_eq!(view.sync_status, SyncStatus::Linked);
         assert_eq!(view.doc.rows.len(), 1);
     }
@@ -1409,7 +1449,7 @@ mod tests {
         let view = create_link(&mut conn, &config(&path)).unwrap();
         let bom_id = view.doc.id.clone().unwrap();
         std::fs::remove_file(&path).unwrap();
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         assert_eq!(view.sync_status, SyncStatus::Broken);
         assert_eq!(view.doc.rows.len(), 1); // previous snapshot
         match view.verdict {
@@ -1491,7 +1531,7 @@ mod tests {
 
         // And it round-trips through open (read back from the DB contract).
         let bom_id = view.doc.id.clone().unwrap();
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         assert_eq!(
             view.doc
                 .columns
@@ -1653,7 +1693,7 @@ mod tests {
 
         // Corrupt the workbook: observe() fails BEFORE any write.
         std::fs::write(&path, b"broken zip").unwrap();
-        assert!(open_link(&mut conn, &bom_id).is_err());
+        assert!(open_link(&mut conn, &bom_id, &test_bk()).is_err());
 
         let rec = store::get_link(&conn, &bom_id).unwrap().unwrap();
         assert_eq!(rec.columns, before_cols);
@@ -1687,7 +1727,7 @@ mod tests {
         let view = create_link(&mut conn, &config(&path)).unwrap();
         let bom_id = view.doc.id.clone().unwrap();
         store::record_quote_ok(&conn, &bom_id, "TEST-PART-001", &mk_quote("115"), 1).unwrap();
-        open_link(&mut conn, &bom_id).unwrap();
+        open_link(&mut conn, &bom_id, &test_bk()).unwrap();
 
         unlink(&mut conn, &bom_id).unwrap();
 
@@ -1768,7 +1808,7 @@ mod tests {
 
         // Retarget the shortcut to another xlsx: open must fail closed, not adopt.
         crate::excel_link::env::write_lnk_for_tests(&lnk, &real_b);
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         assert_eq!(view.sync_status, SyncStatus::Broken);
         match view.verdict {
             StructureVerdict::Broken { reasons } => {
@@ -1807,7 +1847,7 @@ mod tests {
         let bom_id = view.doc.id.clone().unwrap();
 
         std::fs::remove_file(&real).unwrap();
-        let view = open_link(&mut conn, &bom_id).unwrap(); // Broken, NOT Err
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap(); // Broken, NOT Err
         assert_eq!(view.sync_status, SyncStatus::Broken);
         match view.verdict {
             StructureVerdict::Broken { reasons } => assert!(
@@ -1869,7 +1909,7 @@ mod tests {
         assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
         assert!(view.warnings.iter().any(|w| w.contains("書き戻しが無効")));
         let bom_id = view.doc.id.clone().unwrap();
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         assert_eq!(view.sync_status, SyncStatus::Linked);
         assert_eq!(view.doc.rows[0].parts_no.as_deref(), Some("TEST-PART-001"));
 
@@ -1901,6 +1941,13 @@ mod tests {
     // ---- PR-4: writeback (§4.2.2 steps 1-9) ----------------------------------
 
     use crate::model::{ApplyOutcome, CalcState, RefuseReason};
+
+    /// Shared backup dir for opens in tests (reconcile transfer target).
+    fn test_bk() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join("mbm-open-bk");
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
 
     fn apply_bk(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("mbm-apply-bk-{tag}"));
@@ -2049,7 +2096,7 @@ mod tests {
 
         // §9-12: reopening (= app restart) keeps Stale — only an Excel-saved read
         // may promote the calc state.
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         assert_eq!(view.calc_state, CalcState::Stale);
         assert_eq!(view.sync_status, SyncStatus::Linked);
 
@@ -2430,7 +2477,7 @@ mod tests {
             &["型番", "数量", "EC単価"],
             &[&["TEST-PART-001", "2", "999"]],
         );
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         let q = view.doc.rows[0].supplier.as_ref().unwrap();
         assert_eq!(
             q.quote.as_ref().unwrap().unit_price.as_deref(),
@@ -2633,7 +2680,7 @@ mod tests {
         );
 
         // Read side: compose resolves the snapshot via the role columns too.
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         let q = view.doc.rows[0]
             .supplier
             .as_ref()
@@ -2679,7 +2726,7 @@ mod tests {
         xlsx::write_patched(&path, &temp, &part, &edits, true).unwrap();
         let new_hex = fp_hex(&temp);
         let backup = dir.join("recover-ok.mbm-backup-x.xlsx");
-        store::upsert_write_journal(
+        store::insert_write_journal(
             &conn,
             &bom_id,
             &store::WriteJournal {
@@ -2694,9 +2741,10 @@ mod tests {
         writeback::replace_with_backup(&path, &temp, &backup).unwrap();
         // -- crash: no finalize commit --
 
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let bk = apply_bk("recover-ok");
+        let view = open_link(&mut conn, &bom_id, &bk).unwrap();
         assert!(
-            view.warnings.iter().any(|w| w.contains("復旧しました")),
+            view.warnings.iter().any(|w| w.contains("復旧し")),
             "{:?}",
             view.warnings
         );
@@ -2705,12 +2753,12 @@ mod tests {
         assert_eq!(backups.len(), 1);
         assert!(!backups[0].is_conflict);
         assert_eq!(backups[0].f0_fp, f0_hex);
-        assert_eq!(
-            backups[0].location,
-            crate::model::BackupLocation::VolumeTemp,
-            "reconcile leaves the transfer to a later apply"
-        );
-        assert!(backup.exists(), "the backup file is preserved");
+        // 2nd review #3: the recovery finishes the §4.2.2 transfer too — the
+        // backup must NOT linger beside the (possibly cloud-synced) workbook.
+        assert_eq!(backups[0].location, crate::model::BackupLocation::AppData);
+        assert!(Path::new(&backups[0].backup_path).starts_with(&bk));
+        assert!(Path::new(&backups[0].backup_path).exists());
+        assert!(!backup.exists(), "moved out of the workbook folder");
         let st = store::get_state(&conn, &bom_id).unwrap().unwrap();
         assert_eq!(st.applied_generation, 1);
         assert_eq!(st.last_app_write_fp.as_deref(), Some(new_hex.as_str()));
@@ -2749,7 +2797,7 @@ mod tests {
         xlsx::write_patched(&path, &temp, &part, &edits, true).unwrap();
         let new_hex = fp_hex(&temp);
         let backup = dir.join("recover-cf.mbm-backup-x.xlsx");
-        store::upsert_write_journal(
+        store::insert_write_journal(
             &conn,
             &bom_id,
             &store::WriteJournal {
@@ -2770,7 +2818,8 @@ mod tests {
         writeback::replace_with_backup(&path, &temp, &backup).unwrap();
         // -- crash --
 
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let bk = apply_bk("recover-cf");
+        let view = open_link(&mut conn, &bom_id, &bk).unwrap();
         assert!(
             view.warnings.iter().any(|w| w.contains("競合")),
             "{:?}",
@@ -2784,9 +2833,94 @@ mod tests {
         );
         let open_conflicts = store::unresolved_conflicts(&conn).unwrap();
         assert_eq!(open_conflicts.len(), 1, "displaced version is discoverable");
+        let conflict_id = open_conflicts[0].id;
+        // 2nd review #3: conflict backups are transferred out of the workbook
+        // folder too (their protection lives in the ledger, not the location).
+        assert_eq!(backups[0].location, crate::model::BackupLocation::AppData);
+        assert!(!backup.exists());
         // The workbook itself holds the app version the interrupted write placed.
         let xml = sheet_xml_of(&path, "Sheet1");
         assert!(xml.contains("<v>115</v>"), "{xml}");
+
+        // 2nd review #1 (§1.3): conflict = 同期停止. The view AND the persisted
+        // state stay Conflict through further Safe opens…
+        assert_eq!(view.sync_status, SyncStatus::Conflict);
+        let view = open_link(&mut conn, &bom_id, &bk).unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Conflict, "no auto-restore");
+        let st = store::get_state(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(st.sync_status, SyncStatus::Conflict);
+        assert_eq!(st.sync_error.as_deref(), Some("E_POST_REPLACE_CONFLICT"));
+        // …and apply refuses BEFORE touching the file.
+        let before = fp_hex(&path);
+        let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
+        assert!(matches!(
+            out,
+            ApplyOutcome::Refused {
+                reason: RefuseReason::UnresolvedConflict
+            }
+        ));
+        assert_eq!(fp_hex(&path), before, "refused apply must not write");
+
+        // Only the USER's resolution lifts the stop (PR-5 command uses
+        // mark_resolved) — then open restores Linked and apply works again.
+        store::mark_resolved(&conn, conflict_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &bk).unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Linked);
+        let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
+        assert!(matches!(out, ApplyOutcome::Applied { .. }), "{out:?}");
+    }
+
+    /// 2nd review #2: a journal that reconcile could NOT recover (here: the backup
+    /// path is unreadable as a file) must block any new write — the journal is the
+    /// only pointer to the unmanaged backup and must survive unchanged.
+    #[test]
+    fn apply_fails_closed_while_recovery_is_pending() {
+        let path = temp_xlsx(
+            "recover-stuck.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]);
+
+        // A journal whose backup path EXISTS but cannot be fingerprinted (it is a
+        // directory) — finalize fails, the journal must stay.
+        let dir = path.parent().unwrap();
+        let blocked = dir.join("recover-stuck-backup-dir");
+        std::fs::create_dir_all(&blocked).unwrap();
+        store::insert_write_journal(
+            &conn,
+            &bom_id,
+            &store::WriteJournal {
+                backup_path: blocked.to_string_lossy().into_owned(),
+                temp_path: dir.join("none.tmp").to_string_lossy().into_owned(),
+                f0_fp: "aa".into(),
+                new_fp: "bb".into(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+
+        let bk = apply_bk("recover-stuck");
+        let before = fp_hex(&path);
+        let err = apply_link(&mut conn, &bom_id, &bk).unwrap_err();
+        assert!(err.contains("復旧が完了していません"), "{err}");
+        assert_eq!(fp_hex(&path), before, "no write while recovery is pending");
+        // The journal survives UNCHANGED (insert-only + fail closed).
+        let j = store::get_write_journal(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(j.f0_fp, "aa");
+        assert_eq!(j.new_fp, "bb");
+        assert!(store::list_backups(&conn, &bom_id).unwrap().is_empty());
+        // Open still works (previous snapshot remains usable) and surfaces the
+        // recovery failure as a warning.
+        let view = open_link(&mut conn, &bom_id, &bk).unwrap();
+        assert!(
+            view.warnings.iter().any(|w| w.contains("復旧に失敗")),
+            "{:?}",
+            view.warnings
+        );
     }
 
     /// A journal without its backup file means the replace never ran (ReplaceFileW
@@ -2804,7 +2938,7 @@ mod tests {
         let dir = path.parent().unwrap();
         let temp = dir.join(".recover-void.mbm-temp-x.xlsx");
         std::fs::write(&temp, b"leftover temp").unwrap();
-        store::upsert_write_journal(
+        store::insert_write_journal(
             &conn,
             &bom_id,
             &store::WriteJournal {
@@ -2820,7 +2954,7 @@ mod tests {
         )
         .unwrap();
 
-        let view = open_link(&mut conn, &bom_id).unwrap();
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
         assert!(
             !view.warnings.iter().any(|w| w.contains("復旧")),
             "no recovery banner for a void journal: {:?}",

@@ -83,6 +83,28 @@ pub fn transfer(
     Ok(())
 }
 
+/// §4.2.2 transfer sweep: move EVERY still-untransferred backup of this BOM into
+/// app data — the row the current apply created and any row a crash recovery
+/// (reconcile) added earlier. Failures stay warnings; the files remain protected
+/// (volume_temp rows are excluded from retention).
+pub fn transfer_pending(
+    conn: &Connection,
+    origin_bom_id: &str,
+    app_backup_dir: &Path,
+) -> Vec<String> {
+    let rows = match store::untransferred_backups(conn, origin_bom_id) {
+        Ok(r) => r,
+        Err(e) => return vec![format!("未移送バックアップの照会に失敗しました: {e}")],
+    };
+    let mut warnings = Vec::new();
+    for row in rows {
+        if let Err(w) = transfer(conn, row.id, Path::new(&row.backup_path), app_backup_dir) {
+            warnings.push(w);
+        }
+    }
+    warnings
+}
+
 /// Retention policy execution (implementation.md §0): candidates come from the SQL
 /// predicate (rank>5 AND age>30d, excluding unresolved conflicts / volume_temp /
 /// already-deleted); the FILE delete must succeed before mark_deleted, and a

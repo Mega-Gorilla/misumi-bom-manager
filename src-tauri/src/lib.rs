@@ -261,9 +261,26 @@ fn excel_link_create(
 /// Read + structure verdict + calc-state restore + compose. Common entry for first
 /// display, the manual "更新" button and (PR-7) auto reload.
 #[tauri::command]
-fn excel_link_open(db: State<DbState>, bom_id: String) -> Result<model::LinkedBomView, String> {
+fn excel_link_open(
+    app: AppHandle,
+    db: State<DbState>,
+    bom_id: String,
+) -> Result<model::LinkedBomView, String> {
+    let backup_dir = link_backup_dir(&app)?;
     let mut conn = db.0.lock().map_err(|e| e.to_string())?;
-    excel_link::open_link(&mut conn, &bom_id)
+    excel_link::open_link(&mut conn, &bom_id, &backup_dir)
+}
+
+/// App-data directory the §4.2.2 backup transfer targets (shared by open/apply —
+/// open needs it too because crash recovery finishes the transfer).
+fn link_backup_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("backups");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
 }
 
 /// Unlink: freeze the display cache as a conventional BOM (§1.3).

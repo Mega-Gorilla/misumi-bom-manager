@@ -530,6 +530,9 @@ pub enum RefuseReason {
     Env,
     Structure,
     FingerprintChanged,
+    /// An unresolved conflict backup exists for this BOM (§1.3: conflict stops
+    /// sync until the USER resolves it) — no further write may run before that.
+    UnresolvedConflict,
     Spill,
     FormulaCell,
     Truncated,

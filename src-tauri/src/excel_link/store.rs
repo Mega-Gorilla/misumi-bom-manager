@@ -598,13 +598,18 @@ pub struct WriteJournal {
     pub generation: i64,
 }
 
-pub fn upsert_write_journal(
+/// INSERT only - by design there is no upsert: an existing row is the sole
+/// recovery record of an unfinished replace, and overwriting it would lose the
+/// only pointer to an unmanaged backup (2nd review #2). The caller must have
+/// verified the journal is empty (apply fails closed otherwise); the PRIMARY KEY
+/// enforces it against every other path.
+pub fn insert_write_journal(
     conn: &Connection,
     bom_id: &str,
     j: &WriteJournal,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO bom_link_write_journal            (bom_id, backup_path, temp_path, f0_fp, new_fp, generation, created_at)          VALUES(?1, ?2, ?3, ?4, ?5, ?6, datetime('now', 'localtime'))          ON CONFLICT(bom_id) DO UPDATE SET            backup_path = excluded.backup_path, temp_path = excluded.temp_path,            f0_fp = excluded.f0_fp, new_fp = excluded.new_fp,            generation = excluded.generation, created_at = excluded.created_at",
+        "INSERT INTO bom_link_write_journal \n           (bom_id, backup_path, temp_path, f0_fp, new_fp, generation, created_at) \n         VALUES(?1, ?2, ?3, ?4, ?5, ?6, datetime('now', 'localtime'))",
         params![
             bom_id,
             j.backup_path,
@@ -729,6 +734,34 @@ pub fn unresolved_conflicts(conn: &Connection) -> rusqlite::Result<Vec<BackupRec
 }
 
 /// Step 6 of the transfer: the file now lives in app data under `new_path`.
+/// §1.3 conflict gate: does this BOM have a conflict backup the user has not
+/// resolved yet? While true, open keeps sync_status=conflict and apply refuses.
+pub fn has_unresolved_conflict(conn: &Connection, origin_bom_id: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bom_link_backup \
+          WHERE origin_bom_id = ?1 AND is_conflict = 1 AND resolved_at IS NULL \
+            AND deleted_at IS NULL)",
+        [origin_bom_id],
+        |r| r.get(0),
+    )
+}
+
+/// Ledger rows whose backup file still sits beside the workbook (volume_temp) —
+/// the §4.2.2 transfer sweep re-targets ALL of them, not only the row the
+/// current apply created (2nd review #3: recovered backups need a way out too).
+pub fn untransferred_backups(
+    conn: &Connection,
+    origin_bom_id: &str,
+) -> rusqlite::Result<Vec<BackupRecord>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BACKUP_COLS} FROM bom_link_backup \
+         WHERE origin_bom_id = ?1 AND location = 'volume_temp' AND deleted_at IS NULL \
+         ORDER BY id"
+    ))?;
+    let it = stmt.query_map([origin_bom_id], map_backup)?;
+    it.collect()
+}
+
 pub fn mark_transferred(conn: &Connection, id: i64, new_path: &str) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE bom_link_backup SET backup_path = ?2, location = 'app_data', \
