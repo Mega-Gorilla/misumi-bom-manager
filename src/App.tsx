@@ -291,13 +291,13 @@ export default function App() {
         setStatus(p.total > 0 ? `取得中 ${p.done}/${p.total}…` : "キャッシュから取得中…"),
       );
       const items = targets.map((r) => ({ partNo: partOf(r) }));
-      const quotes = await api.quote("MISUMI", items, force);
+      const { results } = await api.quote("MISUMI", items, force, doc.id);
       const byId = new Map<string, SupplierQuote>();
       // Store the raw quote only. Subtotal and the MOQ note are derived LIVE in the
       // supplier column getters from the row's current Qty/multiplier, so they stay
       // correct after the user edits Qty (no stale stamped values).
       targets.forEach((r, idx) => {
-        const q = quotes[idx];
+        const q = results[idx];
         if (q) byId.set(r.id, q);
       });
       // Apply fresh quotes to targets; clear stale supplier data from rows that are no
@@ -314,8 +314,8 @@ export default function App() {
         // Apply linked-column write policies (fillEmpty/overwrite) with the fresh results.
         return applyLinkedColumns({ ...d, rows });
       });
-      const errs = quotes.filter((q) => q?.status === "error").length;
-      setStatus(`取得完了（${quotes.length} 件${errs ? ` / エラー ${errs}` : ""}）`);
+      const errs = results.filter((q) => q?.status === "error").length;
+      setStatus(`取得完了（${results.length} 件${errs ? ` / エラー ${errs}` : ""}）`);
     } catch (e) {
       setStatus(String(e));
     } finally {

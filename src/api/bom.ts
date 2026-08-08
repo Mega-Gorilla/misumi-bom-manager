@@ -83,13 +83,29 @@ export interface QuoteProgress {
   total: number;
 }
 
+/** One failed part number of a quote run (unique parts, not per-row). */
+export interface QuoteFailure {
+  partsNo: string;
+  message: string;
+}
+
+/** Outcome of a quote run. `generation` is set only when `bomId` names a LINKED
+ *  BOM and its adopted snapshot actually changed (Excel link mode, PR-4). */
+export interface QuoteOutcome {
+  results: SupplierQuote[];
+  generation?: number;
+  failed: QuoteFailure[];
+}
+
 /** Fetch supplier quotes for items (cache-first; misses fetched in chunks).
- *  Returns one quote per input item (aligned by index). */
+ *  `results` has one quote per input item (aligned by index). Pass the BOM id so a
+ *  linked BOM adopts the run into its snapshot; conventional BOMs are unaffected. */
 export const quote = (
   supplier: string,
   items: QuoteItem[],
   force = false,
-): Promise<SupplierQuote[]> => invoke("quote", { supplier, items, force });
+  bomId?: string,
+): Promise<QuoteOutcome> => invoke("quote", { supplier, items, force, bomId });
 
 /** Subscribe to backend `quote-progress` events. Await the returned fn to stop. */
 export const onQuoteProgress = (cb: (p: QuoteProgress) => void): Promise<UnlistenFn> =>

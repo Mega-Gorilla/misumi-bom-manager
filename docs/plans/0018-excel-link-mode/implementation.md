@@ -312,9 +312,15 @@ excel_link/
   - snapshot が無い初回失敗の型番で Excel 側にアプリ所有列の既存値がある場合、UI は「保持値」として
     警告表示するが、**DB 正本値・業務計算には採用しない**（§4.3: Excel 上のアプリ所有値は取り込まない）
   - Excel へは成功行のみ書く（失敗行のセルはスキップ）
+- 「変わった」の判定は payload の**意味内容**(status/product/quote/errors/warnings)で行い、
+  **fetched_at と raw は除外**する(除外しないと再取得のたびに世代が進み「全件同値は進めない」が成立しない — PR-4 実装)
 - 戻り値: `QuoteOutcome { results: Vec<SupplierQuote>, generation: Option<i64>, failed: Vec<…> }`。
   現行の `Promise<SupplierQuote[]>`（src/api/bom.ts）と App.tsx の呼び出しも **PR-4 で同時に更新**し、
   従来 BOM 経路は §9-26 の回帰テスト対象に含める
+- **計算フィールド**(PR-4 実装): 契約の `source_field` は payload への dotted path に加え、
+  行文脈から §4.5 の式で計算する2種を定義する — `quote.subtotal` = unitPrice × 行qty × qtyMultiplier
+  (フロントの LIVE 導出 columns.ts と同一式)、`quote.moqNote` = 行qty < MOQ のとき警告文字列
+  (それ以外は空文字で古い警告をクリア)。payload に値が無い一般 path はセルをスキップする
 - 実装・テストは **PR-4**（同型番複数行〔§9-18〕・部分失敗の世代/警告接続・cache hit 初採用で世代が
   進むこと・他 BOM の取得でこの BOM の世代が進まないこと）。latest-wins〔§9-17〕は **PR-5**、
   失敗行の「前回値・手動値の可能性あり」UI 表示は **PR-6**
@@ -335,10 +341,11 @@ pub enum StructureVerdict {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ApplyOutcome {
-    Applied  { generation: i64, fingerprint: String },
+    Applied  { generation: i64, fingerprint: String, warnings: Vec<String> },
+                                      // warnings = backup 移送/保持の非致命な後処理警告 (書き込み自体は成功)
     Pending  { reason: String },      // "fileOpen" 等 → bom_link_pending 記録済み (§4.2.1)
     Refused  { reason: RefuseReason },// 構造NG/指紋変化/スピル交差/5000行超/env降格 — 書かずに終了
-    Conflict { backup_id: i64, backup_path: String },  // backup≠F0 (§4.2.2)。同期停止済み
+    Conflict { backup_id: i64, backup_path: String, warnings: Vec<String> },  // backup≠F0 (§4.2.2)。同期停止済み
 }
 ```
 

@@ -7,12 +7,14 @@
 // PRs add: writeback / backup (PR-4), pending/confirm orchestration (PR-5),
 // watch (PR-7).
 
+pub mod backup;
 pub mod calc_state;
 pub mod contract;
 pub mod env;
 pub mod fingerprint;
 pub mod reader;
 pub mod store;
+pub mod writeback;
 pub mod xlsx;
 
 use crate::model::{
@@ -453,9 +455,7 @@ pub fn open_link(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, S
 
     // Stable content fingerprint (§4.6.1) and the two read channels (§3.5: works
     // while Excel holds the file open — read sharing is allowed).
-    let fp = fingerprint::stable_fingerprint(path, FP_RETRIES, FP_BACKOFF)
-        .map_err(|e| format!("指紋の取得に失敗しました: {e}"))?;
-    let outcome = reader::observe(path, &contract)?;
+    let (fp, outcome) = read_stable(path, &contract)?;
     let verify = contract::verify_structure(&contract, &outcome.sheets);
 
     let warnings = read_warnings(&outcome);
@@ -585,6 +585,367 @@ fn fresh_user_key(existing: &BTreeSet<String>, excel_col: u32) -> String {
 
 // Re-export used by model.rs (LinkedBomView / LinkProbe embed it).
 pub use env::EnvCheck;
+
+// ---- write path orchestration (PR-4: §4.2.2 steps 1-2 and 9 around writeback) ----
+
+const STABLE_READ_ATTEMPTS: usize = 3;
+
+/// Sandwiched read (PR #29/#30 handover): fingerprint → both read channels →
+/// fingerprint again; only identical before/after fingerprints prove the two
+/// channels saw the same version. A writer racing us (share-permitting saves)
+/// makes the sandwich differ → retry, then fail (never trust a torn read).
+fn read_stable(
+    path: &Path,
+    contract: &Contract,
+) -> Result<(fingerprint::Fingerprint, reader::ReadOutcome), String> {
+    for _ in 0..STABLE_READ_ATTEMPTS {
+        let fp1 = fingerprint::stable_fingerprint(path, FP_RETRIES, FP_BACKOFF)
+            .map_err(|e| format!("指紋の取得に失敗しました: {e}"))?;
+        let outcome = reader::observe(path, contract)?;
+        let fp2 = fingerprint::file_fingerprint(path).map_err(|e| e.to_string())?;
+        if fp1 == fp2 {
+            return Ok((fp1, outcome));
+        }
+    }
+    Err("安定した読み取りができませんでした (他プロセスが書き込み中の可能性があります)".into())
+}
+
+/// Adopt a quote run into the linked BOM's snapshot + advance the generation when
+/// the snapshot MEANINGFULLY changed (implementation.md §2.3). `quotes` is one
+/// entry per unique part number (the command's dedup unit). Returns None when the
+/// BOM is not linked or nothing changed. Everything commits in ONE transaction.
+pub fn adopt_quotes(
+    conn: &mut Connection,
+    bom_id: &str,
+    quotes: &[(String, crate::model::SupplierQuote)],
+) -> Result<Option<i64>, String> {
+    let Some(rec) = store::get_link(conn, bom_id).map_err(|e| e.to_string())? else {
+        return Ok(None); // conventional BOM: shared cache only, no snapshot
+    };
+    let prev: std::collections::HashMap<(String, String), String> =
+        store::list_quotes(conn, bom_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter_map(|q| {
+                let p = q.payload_json?;
+                Some(((q.supplier_code, q.parts_no), p))
+            })
+            .collect();
+
+    // Meaning of "changed" (implementation.md §2.3): the SEMANTIC payload —
+    // fetched_at and raw are excluded, otherwise every re-fetch would advance the
+    // generation and "全件同値は進めない" could never hold.
+    fn semantic(v: &serde_json::Value) -> serde_json::Value {
+        let mut v = v.clone();
+        if let Some(o) = v.as_object_mut() {
+            o.remove("fetchedAt");
+            o.remove("raw");
+        }
+        v
+    }
+    let mut any_changed = false;
+    let mut oks: Vec<&(String, crate::model::SupplierQuote)> = Vec::new();
+    let mut errs: Vec<&(String, crate::model::SupplierQuote)> = Vec::new();
+    for pair in quotes {
+        let (part, q) = pair;
+        if q.status == "ok" && q.errors.is_empty() && q.fetched_at.is_some() {
+            let new_v = serde_json::to_value(q).map_err(|e| e.to_string())?;
+            let changed = match prev.get(&(q.supplier_code.clone(), part.clone())) {
+                None => true, // first adoption (cache hit or fresh — both count)
+                Some(old) => {
+                    let old_v: serde_json::Value =
+                        serde_json::from_str(old).unwrap_or(serde_json::Value::Null);
+                    semantic(&old_v) != semantic(&new_v)
+                }
+            };
+            any_changed |= changed;
+            oks.push(pair);
+        } else {
+            errs.push(pair);
+        }
+    }
+    if oks.is_empty() && errs.is_empty() {
+        return Ok(None);
+    }
+
+    let gen = if any_changed {
+        rec.state.ec_generation + 1
+    } else {
+        rec.state.ec_generation
+    };
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for (part, q) in &oks {
+        store::record_quote_ok(&tx, bom_id, part, q, gen).map_err(|e| e.to_string())?;
+    }
+    for (part, q) in &errs {
+        let msg = if q.errors.is_empty() {
+            "取得に失敗しました".to_string()
+        } else {
+            q.errors.join("; ")
+        };
+        store::record_quote_error(
+            &tx,
+            bom_id,
+            &q.supplier_code,
+            part,
+            "quote_error",
+            Some(&msg),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if any_changed {
+        let mut st = rec.state.clone();
+        st.ec_generation = gen;
+        store::update_state(&tx, bom_id, &st).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(any_changed.then_some(gen))
+}
+
+/// 「Excel へ反映」 = §4.2.2 steps 1-9 (measured in 3c). ALL reads, the verdict and
+/// the write plan happen before any file/DB mutation; the replace itself is the
+/// backup-carrying atomic swap whose backup/F0 comparison closes the race window.
+pub fn apply_link(
+    conn: &mut Connection,
+    bom_id: &str,
+    backup_dir: &Path,
+) -> Result<crate::model::ApplyOutcome, String> {
+    use crate::model::{ApplyOutcome, RefuseReason};
+
+    let rec = store::get_link(conn, bom_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "この BOM は Excel にリンクされていません".to_string())?;
+    let meta = db_load(conn, bom_id)?
+        .ok_or_else(|| format!("BOM が見つかりません: {bom_id}"))?
+        .meta;
+
+    // Environment: writeback verdict + read target + retarget guard (same rules as
+    // open — a NoWriteback environment or a swapped shortcut never gets written).
+    let env = env::check_env(Path::new(&rec.header.workbook_path));
+    if env.verdict == crate::model::EnvVerdict::NoWriteback {
+        return Ok(ApplyOutcome::Refused {
+            reason: RefuseReason::Env,
+        });
+    }
+    if rec.header.env_resolved_path.is_some() && env_identity(&env).is_some() {
+        let stored = workbook_identity(
+            rec.header.env_resolved_path.as_deref(),
+            &rec.header.workbook_path,
+        );
+        let now = workbook_identity(env_identity(&env).as_deref(), &rec.header.workbook_path);
+        if stored != now {
+            mark_stopped(
+                conn,
+                bom_id,
+                &rec.state,
+                SyncStatus::Broken,
+                "E_WORKBOOK_RETARGETED",
+            )?;
+            return Ok(ApplyOutcome::Refused {
+                reason: RefuseReason::Structure,
+            });
+        }
+    }
+    let Some(io_path) = io_path_of(&env, Path::new(&rec.header.workbook_path)) else {
+        mark_stopped(
+            conn,
+            bom_id,
+            &rec.state,
+            SyncStatus::Broken,
+            "E_WORKBOOK_UNRESOLVABLE",
+        )?;
+        return Ok(ApplyOutcome::Refused {
+            reason: RefuseReason::Structure,
+        });
+    };
+    let path = io_path.as_path();
+    if !path.exists() {
+        mark_stopped(
+            conn,
+            bom_id,
+            &rec.state,
+            SyncStatus::Broken,
+            "E_WORKBOOK_MISSING",
+        )?;
+        return Ok(ApplyOutcome::Refused {
+            reason: RefuseReason::Structure,
+        });
+    }
+
+    let contract =
+        Contract::try_from_store(&rec.header, &rec.columns).map_err(|e| e.to_string())?;
+
+    // Steps 1-2 merged: the fresh sandwiched read IS the re-read, and comparing its
+    // fingerprint against last_read_fp IS the §4.6.2 check — F0 is exactly the
+    // fingerprint of the content the values below are derived from (rule 20).
+    let (f0, outcome) = read_stable(path, &contract)?;
+    let f0_hex = fingerprint::to_hex(&f0);
+    if rec.state.last_read_fp.as_deref() != Some(f0_hex.as_str()) {
+        return Ok(ApplyOutcome::Refused {
+            reason: RefuseReason::FingerprintChanged, // §9-15/24: reload (open) first
+        });
+    }
+    let verify = contract::verify_structure(&contract, &outcome.sheets);
+    if verify.severity() != Severity::Safe {
+        let (status, code) = if verify.severity() == Severity::Broken {
+            (SyncStatus::Broken, "E_STRUCTURE_BROKEN")
+        } else {
+            (SyncStatus::NeedsReview, "E_STRUCTURE_NEEDS_REVIEW")
+        };
+        mark_stopped(conn, bom_id, &rec.state, status, code)?;
+        return Ok(ApplyOutcome::Refused {
+            reason: RefuseReason::Structure,
+        });
+    }
+
+    // Steps 3-4: plan + guards (fail closed, no side effects yet).
+    let mut zip = xlsx::open_zip(path)?;
+    let sheet_part = xlsx::sheet_part_for(&mut zip, &contract.sheet_name)?;
+    let sheet_xml = xlsx::read_part(&mut zip, &sheet_part)?;
+    drop(zip);
+    let quotes = store::list_quotes(conn, bom_id).map_err(|e| e.to_string())?;
+    let plan = match writeback::plan_writeback(
+        &contract,
+        &outcome,
+        &quotes,
+        meta.qty_multiplier,
+        rec.state.ec_generation,
+        &sheet_xml,
+    )? {
+        Ok(p) => p,
+        Err(reason) => return Ok(ApplyOutcome::Refused { reason }),
+    };
+
+    // Step 5: surgical temp in the SAME directory (ReplaceFileW volume constraint).
+    let dir = path
+        .parent()
+        .ok_or("リンク先の親ディレクトリがありません")?;
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "bom".into());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp = dir.join(format!(".{stem}.mbm-temp-{nanos}.xlsx"));
+    xlsx::write_patched(path, &temp, &sheet_part, &plan.edits, true)?;
+    let new_fp = fingerprint::file_fingerprint(&temp).map_err(|e| e.to_string())?;
+
+    // Step 6 (speed-up only, F0 is NOT re-taken — rule 20).
+    match fingerprint::file_fingerprint(path) {
+        Ok(now) if now == f0 => {}
+        _ => {
+            let _ = std::fs::remove_file(&temp);
+            return Ok(ApplyOutcome::Refused {
+                reason: RefuseReason::FingerprintChanged,
+            });
+        }
+    }
+
+    // Step 7: backup-carrying atomic replace.
+    let backup_path = backup::unique_backup_path(dir, &stem);
+    match writeback::replace_with_backup(path, &temp, &backup_path) {
+        Ok(()) => {}
+        Err(writeback::ReplaceError::SharingViolation) => {
+            let _ = std::fs::remove_file(&temp);
+            store::upsert_pending(conn, bom_id, plan.generation).map_err(|e| e.to_string())?;
+            store::record_pending_attempt(conn, bom_id, "file_open").map_err(|e| e.to_string())?;
+            return Ok(ApplyOutcome::Pending {
+                reason: "fileOpen".into(),
+            });
+        }
+        Err(writeback::ReplaceError::Other(e)) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
+    }
+
+    // Step 8: post-hoc conflict detection (backup vs F0).
+    let (conflict, backup_fp) = writeback::verify_backup(&backup_path, &f0)?;
+
+    // Step 9 + ledger, in ONE transaction (crash-safe: the ledger row exists from
+    // the moment the backup file exists in the DB's view).
+    let new_hex = fingerprint::to_hex(&new_fp);
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let now = crate::db::now_string(&tx).map_err(|e| e.to_string())?;
+    let ledger_id = store::insert_backup(
+        &tx,
+        &store::NewBackup {
+            origin_bom_id: bom_id.to_string(),
+            workbook_path: rec.header.workbook_path.clone(),
+            backup_path: backup_path.to_string_lossy().into_owned(),
+            backup_fp: fingerprint::to_hex(&backup_fp),
+            f0_fp: f0_hex.clone(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let mut st = rec.state.clone();
+    st.last_app_write_fp = Some(new_hex.clone());
+    st.last_app_write_at = Some(now.clone());
+    st.last_read_fp = Some(new_hex.clone());
+    st.last_read_at = Some(now);
+    st.calc_state = crate::model::CalcState::Stale; // §4.4.1: every app write stales the caches
+    st.recalc_requested = true;
+    st.applied_generation = plan.generation;
+    if conflict {
+        st.sync_status = SyncStatus::Conflict;
+        st.sync_error = Some("E_POST_REPLACE_CONFLICT".into());
+    } else {
+        st.sync_status = SyncStatus::Linked;
+        st.sync_error = None;
+    }
+    store::update_state(&tx, bom_id, &st).map_err(|e| e.to_string())?;
+    if let Some(p) = store::get_pending(&tx, bom_id).map_err(|e| e.to_string())? {
+        if p.requested_generation <= plan.generation {
+            store::clear_pending(&tx, bom_id).map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+
+    // §4.2.2 transfer (backup must not stay in a cloud-synced folder — case-08) +
+    // retention. Failures are warnings: the write itself succeeded.
+    let mut warnings = Vec::new();
+    if let Err(w) = backup::transfer(conn, ledger_id, &backup_path, backup_dir) {
+        warnings.push(w);
+    }
+    warnings.extend(backup::run_retention(conn, bom_id));
+
+    let final_backup_path: String = conn
+        .query_row(
+            "SELECT backup_path FROM bom_link_backup WHERE id = ?1",
+            [ledger_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if conflict {
+        Ok(crate::model::ApplyOutcome::Conflict {
+            backup_id: ledger_id,
+            backup_path: final_backup_path,
+            warnings,
+        })
+    } else {
+        Ok(crate::model::ApplyOutcome::Applied {
+            generation: plan.generation,
+            fingerprint: new_hex,
+            warnings,
+        })
+    }
+}
+
+/// Record a sync stop (broken/needs_review) discovered during apply.
+fn mark_stopped(
+    conn: &Connection,
+    bom_id: &str,
+    state: &store::LinkState,
+    status: SyncStatus,
+    code: &str,
+) -> Result<(), String> {
+    let mut st = state.clone();
+    st.sync_status = status;
+    st.sync_error = Some(code.to_string());
+    store::update_state(conn, bom_id, &st).map_err(|e| e.to_string())
+}
 
 #[cfg(test)]
 mod tests {
@@ -1387,6 +1748,706 @@ mod tests {
         let err = expect_err(create_link(&mut conn, &config(&lnk)));
         assert!(err.contains("1ワークブック=1リンク"), "{err}");
 
+        // PR-4: a NoWriteback environment refuses apply outright (§4.10 gates
+        // writeback only — reading linked fine above).
+        let out = apply_link(&mut conn, &bom_id, &dir.join("bk")).unwrap();
+        assert!(matches!(
+            out,
+            crate::model::ApplyOutcome::Refused {
+                reason: crate::model::RefuseReason::Env
+            }
+        ));
+
         let _ = std::fs::remove_dir(&sym);
+    }
+
+    // ---- PR-4: writeback (§4.2.2 steps 1-9) ----------------------------------
+
+    use crate::model::{ApplyOutcome, CalcState, RefuseReason};
+
+    fn apply_bk(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("mbm-apply-bk-{tag}"));
+        let _ = std::fs::remove_dir_all(&d);
+        d // transfer() creates it
+    }
+
+    fn build_xlsx(
+        name: &str,
+        build: impl FnOnce(&mut rust_xlsxwriter::Workbook),
+    ) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("mbm-link-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let mut wb = rust_xlsxwriter::Workbook::new();
+        build(&mut wb);
+        let _ = std::fs::remove_file(&path);
+        wb.save(&path).unwrap();
+        path
+    }
+
+    fn std_headers(ws: &mut rust_xlsxwriter::Worksheet) {
+        for (c, h) in ["型番", "数量", "EC単価"].iter().enumerate() {
+            ws.write_string(0, c as u16, *h).unwrap();
+        }
+    }
+
+    fn sheet_xml_of(path: &Path, sheet: &str) -> String {
+        let mut zip = xlsx::open_zip(path).unwrap();
+        let part = xlsx::sheet_part_for(&mut zip, sheet).unwrap();
+        xlsx::read_part(&mut zip, &part).unwrap()
+    }
+
+    fn fp_hex(path: &Path) -> String {
+        fingerprint::to_hex(&fingerprint::file_fingerprint(path).unwrap())
+    }
+
+    fn adopt(conn: &mut Connection, bom_id: &str, quotes: &[(&str, SupplierQuote)]) -> Option<i64> {
+        let v: Vec<(String, SupplierQuote)> = quotes
+            .iter()
+            .map(|(p, q)| (p.to_string(), q.clone()))
+            .collect();
+        adopt_quotes(conn, bom_id, &v).unwrap()
+    }
+
+    fn mk_quote_moq(price: &str, moq: i64) -> SupplierQuote {
+        let mut q = mk_quote(price);
+        q.quote.as_mut().unwrap().moq = Some(moq);
+        q
+    }
+
+    fn mk_quote_err(msg: &str) -> SupplierQuote {
+        SupplierQuote {
+            supplier_code: "MISUMI".into(),
+            status: "error".into(),
+            product: None,
+            quote: None,
+            errors: vec![msg.into()],
+            warnings: vec![],
+            fetched_at: None,
+            raw: None,
+        }
+    }
+
+    /// No leftover work files matching both fragments beside the workbook.
+    fn assert_no_litter(path: &Path, stem_frag: &str, kind_frag: &str) {
+        let leftovers: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.contains(stem_frag) && n.contains(kind_frag))
+            .collect();
+        assert!(leftovers.is_empty(), "litter: {leftovers:?}");
+    }
+
+    /// 正常系 (§4.2.2 手順1〜9) + §9-12 (restart keeps Stale) + §9-15/24 (external
+    /// change refuses the next apply, file untouched).
+    #[test]
+    fn apply_writes_values_updates_state_and_transfers_backup() {
+        let path = temp_xlsx(
+            "apply-ok.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""], &["TEST-PART-002", "3", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        let f0_hex = fp_hex(&path);
+        assert_eq!(
+            adopt(
+                &mut conn,
+                &bom_id,
+                &[
+                    ("TEST-PART-001", mk_quote("115")),
+                    ("TEST-PART-002", mk_quote("230"))
+                ]
+            ),
+            Some(1)
+        );
+
+        let bk = apply_bk("ok");
+        let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
+        let ApplyOutcome::Applied {
+            generation,
+            fingerprint,
+            warnings,
+        } = out
+        else {
+            panic!("expected Applied");
+        };
+        assert_eq!(generation, 1);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(fingerprint, fp_hex(&path), "fingerprint = the written file");
+
+        // Values landed in the app-owned column (inserted cells, no styles before).
+        let xml = sheet_xml_of(&path, "Sheet1");
+        assert!(xml.contains(r#"<c r="C2"><v>115</v></c>"#), "{xml}");
+        assert!(xml.contains(r#"<c r="C3"><v>230</v></c>"#), "{xml}");
+        // fullCalcOnLoad forces recalculation on next Excel open (§4.4.1).
+        let mut zip = xlsx::open_zip(&path).unwrap();
+        let wb = xlsx::read_part(&mut zip, "xl/workbook.xml").unwrap();
+        drop(zip);
+        assert!(wb.contains(r#"fullCalcOnLoad="1""#));
+
+        // Step 9 state: both fingerprints = the new file, Stale until Excel saves.
+        let st = store::get_state(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(st.last_app_write_fp.as_deref(), Some(fingerprint.as_str()));
+        assert_eq!(st.last_read_fp.as_deref(), Some(fingerprint.as_str()));
+        assert_eq!(st.calc_state, CalcState::Stale);
+        assert!(st.recalc_requested);
+        assert_eq!(st.applied_generation, 1);
+        assert_eq!(st.sync_status, SyncStatus::Linked);
+        assert!(st.sync_error.is_none());
+
+        // Ledger: one non-conflict backup, TRANSFERRED into app data (§4.2.2).
+        let backups = store::list_backups(&conn, &bom_id).unwrap();
+        assert_eq!(backups.len(), 1);
+        let b = &backups[0];
+        assert!(!b.is_conflict);
+        assert_eq!(b.f0_fp, f0_hex);
+        assert_eq!(b.location, crate::model::BackupLocation::AppData);
+        assert!(Path::new(&b.backup_path).starts_with(&bk));
+        assert!(Path::new(&b.backup_path).exists());
+        // Nothing left beside the workbook (backup moved, temp consumed).
+        assert_no_litter(&path, "apply-ok", "mbm-backup");
+        assert_no_litter(&path, "apply-ok", "mbm-temp");
+
+        // §9-12: reopening (= app restart) keeps Stale — only an Excel-saved read
+        // may promote the calc state.
+        let view = open_link(&mut conn, &bom_id).unwrap();
+        assert_eq!(view.calc_state, CalcState::Stale);
+        assert_eq!(view.sync_status, SyncStatus::Linked);
+
+        // §9-15/24 (手順1): an external change after the last read refuses apply
+        // and leaves the file byte-identical.
+        temp_xlsx(
+            "apply-ok.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-009", "9", ""]],
+        );
+        let external = fp_hex(&path);
+        let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
+        assert!(matches!(
+            out,
+            ApplyOutcome::Refused {
+                reason: RefuseReason::FingerprintChanged
+            }
+        ));
+        assert_eq!(
+            fp_hex(&path),
+            external,
+            "refused apply must not touch the file"
+        );
+    }
+
+    /// Structure damage found during apply stops sync exactly like open does.
+    #[test]
+    fn apply_refuses_structure_change_and_stops_sync() {
+        let path = temp_xlsx(
+            "apply-structure.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]);
+
+        // Rename a user header (Confirm-level). Sync the stored fingerprint so
+        // step 1 passes and the STRUCTURE check is what fires.
+        temp_xlsx(
+            "apply-structure.xlsx",
+            &["型番", "数", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut st = store::get_state(&conn, &bom_id).unwrap().unwrap();
+        st.last_read_fp = Some(fp_hex(&path));
+        store::update_state(&conn, &bom_id, &st).unwrap();
+
+        let out = apply_link(&mut conn, &bom_id, &apply_bk("structure")).unwrap();
+        assert!(matches!(
+            out,
+            ApplyOutcome::Refused {
+                reason: RefuseReason::Structure
+            }
+        ));
+        let st = store::get_state(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(st.sync_status, SyncStatus::NeedsReview);
+        assert_eq!(st.sync_error.as_deref(), Some("E_STRUCTURE_NEEDS_REVIEW"));
+    }
+
+    #[test]
+    fn apply_refuses_when_nothing_to_write() {
+        let path = temp_xlsx(
+            "apply-nothing.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        // No adopted snapshot → no edits → refuse, never an empty replace.
+        let out = apply_link(&mut conn, &bom_id, &apply_bk("nothing")).unwrap();
+        assert!(matches!(
+            out,
+            ApplyOutcome::Refused {
+                reason: RefuseReason::NothingToWrite
+            }
+        ));
+    }
+
+    /// §4.4 / §9-13: a formula appearing in an app-owned column AFTER creation is
+    /// caught by the STRUCTURE gate (E_FORMULA_IN_APP_COL is Broken) before the
+    /// plan is even computed. The plan-level FormulaCell guard is defense in depth
+    /// — covered directly by writeback::tests.
+    #[test]
+    fn apply_refuses_formula_appearing_in_app_column() {
+        let path = temp_xlsx(
+            "apply-formula.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]);
+
+        // User puts a formula into the EC column. Sync the stored fingerprint so
+        // step 1 passes and the structure gate is what fires.
+        build_xlsx("apply-formula.xlsx", |wb| {
+            let ws = wb.add_worksheet();
+            std_headers(ws);
+            ws.write_string(1, 0, "TEST-PART-001").unwrap();
+            ws.write_number(1, 1, 2.0).unwrap();
+            ws.write_formula(1, 2, "=1+1").unwrap();
+        });
+        let mut st = store::get_state(&conn, &bom_id).unwrap().unwrap();
+        st.last_read_fp = Some(fp_hex(&path));
+        store::update_state(&conn, &bom_id, &st).unwrap();
+        let before = fp_hex(&path);
+
+        let out = apply_link(&mut conn, &bom_id, &apply_bk("formula")).unwrap();
+        assert!(matches!(
+            out,
+            ApplyOutcome::Refused {
+                reason: RefuseReason::Structure
+            }
+        ));
+        let st = store::get_state(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(st.sync_status, SyncStatus::Broken);
+        assert_eq!(st.sync_error.as_deref(), Some("E_STRUCTURE_BROKEN"));
+        assert_eq!(fp_hex(&path), before, "the formula must survive untouched");
+    }
+
+    /// §4.4.2 / §9-13: an array/spill range crossing a target cell blocks the write
+    /// even though the target cell itself has no formula.
+    #[test]
+    fn apply_refuses_spill_intersection() {
+        let path = build_xlsx("apply-spill.xlsx", |wb| {
+            let ws = wb.add_worksheet();
+            std_headers(ws);
+            ws.write_string(1, 0, "TEST-PART-001").unwrap();
+            // Anchor at B2 spilling across B2:C2 — C2 (the write target) is spill
+            // area, not a formula cell.
+            ws.write_dynamic_array_formula(1, 1, 1, 2, "=TRANSPOSE({2;0})")
+                .unwrap();
+        });
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]);
+        let out = apply_link(&mut conn, &bom_id, &apply_bk("spill")).unwrap();
+        assert!(matches!(
+            out,
+            ApplyOutcome::Refused {
+                reason: RefuseReason::Spill
+            }
+        ));
+    }
+
+    /// §3.2 / §9-23: a workbook over MAX_ROWS is readable-but-truncated — apply
+    /// must refuse before computing any edit.
+    #[test]
+    fn apply_refuses_truncated_workbook() {
+        let path = build_xlsx("apply-truncated.xlsx", |wb| {
+            let ws = wb.add_worksheet();
+            std_headers(ws);
+            for r in 0..5001u32 {
+                ws.write_string(r + 1, 0, format!("TEST-PART-{r:05}"))
+                    .unwrap();
+            }
+        });
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        let out = apply_link(&mut conn, &bom_id, &apply_bk("truncated")).unwrap();
+        assert!(matches!(
+            out,
+            ApplyOutcome::Refused {
+                reason: RefuseReason::Truncated
+            }
+        ));
+    }
+
+    /// Excel holding the workbook → Pending (§4.2.1), retry after release applies.
+    #[cfg(windows)]
+    #[test]
+    fn apply_pending_while_file_is_held_then_applies_after_release() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = temp_xlsx(
+            "apply-pend.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]);
+        let before = fp_hex(&path);
+
+        // Excel-style hold: others may READ (apply's own reads must work) but the
+        // delete/rename access ReplaceFileW needs is denied.
+        let hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ
+            .open(&path)
+            .unwrap();
+        let bk = apply_bk("pend");
+        let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
+        match out {
+            ApplyOutcome::Pending { reason } => assert_eq!(reason, "fileOpen"),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+        let p = store::get_pending(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(p.requested_generation, 1);
+        assert_eq!(p.attempt_count, 1);
+        assert_eq!(p.blocked_reason.as_deref(), Some("file_open"));
+        assert_eq!(fp_hex(&path), before, "held file must be untouched");
+        assert_no_litter(&path, "apply-pend", "mbm-temp");
+        drop(hold);
+
+        // Released → the same apply succeeds and the pending row clears.
+        let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
+        assert!(matches!(out, ApplyOutcome::Applied { .. }));
+        assert!(store::get_pending(&conn, &bom_id).unwrap().is_none());
+    }
+
+    /// §9-18: same part on two rows — subtotal is ROW-wise (qty × multiplier) and
+    /// the MOQ note warns exactly the under-MOQ row while clearing the other.
+    #[test]
+    fn apply_writes_row_wise_subtotal_and_moq_note() {
+        let path = temp_xlsx(
+            "apply-s18.xlsx",
+            &["型番", "数量", "小計", "MOQ"],
+            &[
+                &["TEST-PART-001", "2", "", ""],
+                &["TEST-PART-001", "5", "", ""],
+            ],
+        );
+        let col = |excel_col: i64,
+                   label: &str,
+                   key: &str,
+                   own: LinkOwnership,
+                   required: bool,
+                   source: Option<&str>,
+                   proj: Option<LinkProjection>| LinkColumnConfig {
+            excel_col,
+            header_label: Some(label.into()),
+            app_key: Some(key.into()),
+            ownership: own,
+            required,
+            role: None,
+            source_field: source.map(str::to_string),
+            projection: proj,
+        };
+        let cfg = LinkCreateConfig {
+            bom_id: None,
+            name: Some("s18".into()),
+            workbook_path: path.to_string_lossy().into_owned(),
+            sheet_name: "Sheet1".into(),
+            header_row: 1,
+            data_start_row: 2,
+            columns: vec![
+                col(0, "型番", "partsNo", LinkOwnership::User, true, None, None),
+                col(1, "数量", "qty", LinkOwnership::User, false, None, None),
+                col(
+                    2,
+                    "小計",
+                    "subtotal",
+                    LinkOwnership::App,
+                    false,
+                    Some("quote.subtotal"),
+                    Some(LinkProjection::Writeback),
+                ),
+                col(
+                    3,
+                    "MOQ",
+                    "moqNote",
+                    LinkOwnership::App,
+                    false,
+                    Some("quote.moqNote"),
+                    Some(LinkProjection::Writeback),
+                ),
+            ],
+        };
+        let mut conn = mem();
+        let view = create_link(&mut conn, &cfg).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        conn.execute("UPDATE bom SET qty_multiplier = 2 WHERE id = ?1", [&bom_id])
+            .unwrap();
+        adopt(
+            &mut conn,
+            &bom_id,
+            &[("TEST-PART-001", mk_quote_moq("100", 3))],
+        );
+
+        let out = apply_link(&mut conn, &bom_id, &apply_bk("s18")).unwrap();
+        assert!(matches!(out, ApplyOutcome::Applied { .. }), "{out:?}");
+        let xml = sheet_xml_of(&path, "Sheet1");
+        // 100 × 2 × 2 = 400 / 100 × 5 × 2 = 1000 (columns.ts の式・§4.5).
+        assert!(xml.contains(r#"<c r="C2"><v>400</v></c>"#), "{xml}");
+        assert!(xml.contains(r#"<c r="C3"><v>1000</v></c>"#), "{xml}");
+        // qty2 < MOQ3 → warn; qty5 ≥ MOQ3 → CLEARED (empty inline string).
+        assert!(
+            xml.contains(r#"<c r="D2" t="inlineStr"><is><t>MOQ 3 未満</t></is></c>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<c r="D3" t="inlineStr"><is><t></t></is></c>"#),
+            "{xml}"
+        );
+    }
+
+    /// §9-4: user formulas (skipped column), a second sheet and cell styles all
+    /// survive the surgical replace byte-for-byte.
+    #[test]
+    fn apply_preserves_formulas_second_sheet_and_styles() {
+        let path = build_xlsx("apply-preserve.xlsx", |wb| {
+            let bold = rust_xlsxwriter::Format::new().set_bold();
+            let ws = wb.add_worksheet();
+            std_headers(ws);
+            ws.write_string(0, 3, "備考式").unwrap();
+            ws.write_string(1, 0, "TEST-PART-001").unwrap();
+            ws.write_number(1, 1, 2.0).unwrap();
+            ws.write_blank(1, 2, &bold).unwrap(); // styled empty EC cell
+            ws.write_formula(1, 3, "=B2*10").unwrap(); // user formula column
+            let ws2 = wb.add_worksheet();
+            ws2.write_formula(0, 0, "=1+2").unwrap();
+        });
+        let mut cfg = config(&path);
+        cfg.columns.push(LinkColumnConfig {
+            excel_col: 3,
+            header_label: Some("備考式".into()),
+            app_key: None,
+            ownership: LinkOwnership::Skipped,
+            required: false,
+            role: None,
+            source_field: None,
+            projection: None,
+        });
+        let mut conn = mem();
+        let view = create_link(&mut conn, &cfg).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]);
+
+        let out = apply_link(&mut conn, &bom_id, &apply_bk("preserve")).unwrap();
+        assert!(matches!(out, ApplyOutcome::Applied { .. }), "{out:?}");
+
+        let xml = sheet_xml_of(&path, "Sheet1");
+        assert!(xml.contains("<f>B2*10</f>"), "user formula lost: {xml}");
+        // The styled cell kept its s= attribute through the replace.
+        assert!(xml.contains(r#"<c r="C2" s="#), "style lost: {xml}");
+        assert!(xml.contains("<v>115</v>"), "{xml}");
+        let xml2 = sheet_xml_of(&path, "Sheet2");
+        assert!(xml2.contains("<f>1+2</f>"), "second sheet lost: {xml2}");
+    }
+
+    /// §9-22: a manual edit to an app-owned cell is NEVER adopted — the app keeps
+    /// showing the snapshot and the next apply rewrites the cell.
+    #[test]
+    fn manual_edit_to_app_cell_is_not_adopted_and_gets_rewritten() {
+        let path = temp_xlsx(
+            "apply-manual.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]);
+        let bk = apply_bk("manual");
+        assert!(matches!(
+            apply_link(&mut conn, &bom_id, &bk).unwrap(),
+            ApplyOutcome::Applied { .. }
+        ));
+
+        // User hand-edits the EC cell to 999 and the app re-opens the link.
+        temp_xlsx(
+            "apply-manual.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", "999"]],
+        );
+        let view = open_link(&mut conn, &bom_id).unwrap();
+        let q = view.doc.rows[0].supplier.as_ref().unwrap();
+        assert_eq!(
+            q.quote.as_ref().unwrap().unit_price.as_deref(),
+            Some("115"),
+            "compose must show the SNAPSHOT, not the manual 999 (§9-22)"
+        );
+
+        // Next apply rewrites the cell from the snapshot.
+        assert!(matches!(
+            apply_link(&mut conn, &bom_id, &bk).unwrap(),
+            ApplyOutcome::Applied { .. }
+        ));
+        let xml = sheet_xml_of(&path, "Sheet1");
+        assert!(xml.contains("<v>115</v>"), "{xml}");
+        assert!(
+            !xml.contains(">999<"),
+            "manual value must be replaced: {xml}"
+        );
+    }
+
+    /// implementation.md §2.3 の世代確定規則 (9項目).
+    #[test]
+    fn adopt_quotes_generation_rules() {
+        let mut conn = mem();
+        // (a) not a linked BOM → None, nothing recorded.
+        assert_eq!(
+            adopt(&mut conn, "no-such-bom", &[("P", mk_quote("1"))]),
+            None
+        );
+
+        let path = temp_xlsx(
+            "adopt-rules.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""], &["TEST-PART-002", "3", ""]],
+        );
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        let gen_of = |conn: &Connection| {
+            store::get_state(conn, &bom_id)
+                .unwrap()
+                .unwrap()
+                .ec_generation
+        };
+        let row_of = |conn: &Connection, part: &str| {
+            store::list_quotes(conn, &bom_id)
+                .unwrap()
+                .into_iter()
+                .find(|q| q.parts_no == part)
+                .unwrap()
+        };
+
+        // (b) first adoption advances: 0 → 1.
+        assert_eq!(
+            adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]),
+            Some(1)
+        );
+        assert_eq!(row_of(&conn, "TEST-PART-001").generation, Some(1));
+
+        // (c) same SEMANTIC content, different fetchedAt → no advance, but the
+        // attempt/fetch bookkeeping still moves.
+        let mut same = mk_quote("115");
+        same.fetched_at = Some("2026-08-02 10:00:00".into());
+        assert_eq!(adopt(&mut conn, &bom_id, &[("TEST-PART-001", same)]), None);
+        assert_eq!(gen_of(&conn), 1);
+        assert_eq!(
+            row_of(&conn, "TEST-PART-001").fetched_at.as_deref(),
+            Some("2026-08-02 10:00:00")
+        );
+
+        // (d) a value change advances: 1 → 2.
+        assert_eq!(
+            adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("120"))]),
+            Some(2)
+        );
+
+        // (e) first adoption of ANOTHER part — even a cache hit with an older
+        // fetchedAt — is a change: 2 → 3.
+        let mut cached = mk_quote("50");
+        cached.fetched_at = Some("2026-07-01 00:00:00".into());
+        assert_eq!(
+            adopt(&mut conn, &bom_id, &[("TEST-PART-002", cached)]),
+            Some(3)
+        );
+        assert_eq!(row_of(&conn, "TEST-PART-001").generation, Some(2)); // untouched
+
+        // (f) failures alone never advance; the previous payload stays adopted and
+        // the failure is persisted (§0 keep-and-warn across restarts).
+        assert_eq!(
+            adopt(
+                &mut conn,
+                &bom_id,
+                &[("TEST-PART-001", mk_quote_err("timeout"))]
+            ),
+            None
+        );
+        assert_eq!(gen_of(&conn), 3);
+        let r = row_of(&conn, "TEST-PART-001");
+        assert_eq!(r.last_attempt_status, store::AttemptStatus::Error);
+        assert_eq!(r.last_error_message.as_deref(), Some("timeout"));
+        assert_eq!(
+            r.generation,
+            Some(2),
+            "payload adoption survives the failure"
+        );
+        assert!(r.payload_json.as_deref().unwrap().contains("120"));
+
+        // (g) partial success advances once; the failed row records in the SAME run.
+        assert_eq!(
+            adopt(
+                &mut conn,
+                &bom_id,
+                &[
+                    ("TEST-PART-001", mk_quote("130")),
+                    ("TEST-PART-002", mk_quote_err("out of stock"))
+                ]
+            ),
+            Some(4)
+        );
+        assert_eq!(row_of(&conn, "TEST-PART-001").generation, Some(4));
+        let r2 = row_of(&conn, "TEST-PART-002");
+        assert_eq!(r2.last_attempt_status, store::AttemptStatus::Error);
+        assert!(r2.payload_json.as_deref().unwrap().contains("50"));
+
+        // (h) another linked BOM has its own generation line.
+        let path2 = temp_xlsx(
+            "adopt-rules-2.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "1", ""]],
+        );
+        let view2 = create_link(&mut conn, &config(&path2)).unwrap();
+        let bom2 = view2.doc.id.clone().unwrap();
+        assert_eq!(
+            adopt(&mut conn, &bom2, &[("TEST-PART-001", mk_quote("115"))]),
+            Some(1)
+        );
+        assert_eq!(gen_of(&conn), 4, "other BOM's adoption must not leak in");
+
+        // (i) an empty run is a no-op.
+        assert_eq!(adopt(&mut conn, &bom_id, &[]), None);
+        assert_eq!(gen_of(&conn), 4);
+    }
+
+    /// The sandwiched read returns the fingerprint of exactly the content both
+    /// channels observed (PR #29/#30 の引き継ぎ安全要件).
+    #[test]
+    fn read_stable_returns_fingerprint_of_observed_content() {
+        let path = temp_xlsx(
+            "read-stable.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let rec = store::get_link(&conn, &view.doc.id.clone().unwrap())
+            .unwrap()
+            .unwrap();
+        let contract = Contract::try_from_store(&rec.header, &rec.columns).unwrap();
+        let (fp, outcome) = read_stable(&path, &contract).unwrap();
+        assert_eq!(fingerprint::to_hex(&fp), fp_hex(&path));
+        assert_eq!(
+            outcome.values.get(&(1, 0)).map(String::as_str),
+            Some("TEST-PART-001")
+        );
     }
 }

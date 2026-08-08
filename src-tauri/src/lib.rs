@@ -316,6 +316,9 @@ fn fetched_today(q: &model::SupplierQuote, today: &str) -> bool {
 /// Quote `items` from `supplier`. Cache-first (cross-BOM `supplier_cache`), then
 /// fetch only the misses in `<= caps.max_batch` chunks, emitting `quote-progress`.
 /// Returns one normalized quote per input item (repeats share the cached quote).
+/// When `bom_id` names a LINKED BOM, the run is adopted into its per-BOM snapshot
+/// and the generation advances iff the snapshot meaningfully changed
+/// (implementation.md §2.3); conventional BOMs get `generation: None`.
 #[tauri::command]
 async fn quote(
     app: AppHandle,
@@ -323,7 +326,8 @@ async fn quote(
     supplier: String,
     items: Vec<QuoteItem>,
     force: bool,
-) -> Result<Vec<model::SupplierQuote>, String> {
+    bom_id: Option<String>,
+) -> Result<model::QuoteOutcome, String> {
     let provider =
         provider_for(&supplier).ok_or_else(|| format!("未対応のサプライヤです: {supplier}"))?;
     let caps = provider.caps();
@@ -408,7 +412,31 @@ async fn quote(
         }
     }
 
-    // 2) Align results to the input items (repeated parts share their quote).
+    // 2) Adopt into the linked BOM's snapshot + advance the generation (§2.3).
+    //    Third lock scope, after every await: the snapshot UPSERTs and the
+    //    generation bump commit in ONE transaction inside adopt_quotes.
+    let generation = if let Some(bid) = &bom_id {
+        let pairs: Vec<(String, model::SupplierQuote)> = uniq
+            .iter()
+            .filter_map(|p| map.get(p).map(|q| (p.clone(), q.clone())))
+            .collect();
+        let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+        excel_link::adopt_quotes(&mut conn, bid, &pairs)?
+    } else {
+        None
+    };
+
+    // 3) Align results to the input items (repeated parts share their quote).
+    let failed: Vec<model::QuoteFailure> = uniq
+        .iter()
+        .filter_map(|p| {
+            let q = map.get(p)?;
+            (q.status == "error").then(|| model::QuoteFailure {
+                parts_no: p.clone(),
+                message: q.errors.join("; "),
+            })
+        })
+        .collect();
     let results = items
         .iter()
         .map(|it| {
@@ -425,7 +453,29 @@ async fn quote(
             })
         })
         .collect();
-    Ok(results)
+    Ok(model::QuoteOutcome {
+        results,
+        generation,
+        failed,
+    })
+}
+
+/// 「Excel へ反映」 = §4.2.2 steps 1-9 (write-back with backup + post-hoc conflict
+/// detection). Manual retry uses the same command (implementation.md §2.3).
+#[tauri::command]
+fn excel_link_apply(
+    app: AppHandle,
+    db: State<DbState>,
+    bom_id: String,
+) -> Result<model::ApplyOutcome, String> {
+    let backup_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("backups");
+    std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    excel_link::apply_link(&mut conn, &bom_id, &backup_dir)
 }
 
 // ---- Cart (MISUMI) — add BOM rows to the logged-in cart via the bridge ----
@@ -628,7 +678,8 @@ pub fn run() {
             excel_link_probe,
             excel_link_create,
             excel_link_open,
-            excel_link_unlink
+            excel_link_unlink,
+            excel_link_apply
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
