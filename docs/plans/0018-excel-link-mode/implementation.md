@@ -364,8 +364,11 @@ pub enum ApplyOutcome {
   原子性)で判定し、実 backup の指紋から競合を導出して台帳・state を完遂した上で、
   **§4.2.2 の6段階移送も同時に完遂する**(open も app-data の backup ディレクトリを受け取る)。
   backup 不在ならジャーナル破棄+temp 掃除のみ。**reconcile が失敗してジャーナルが残っている間、
-  apply は fail closed で拒否**する(ジャーナルは不変のまま次回再試行)。apply の移送は
-  「その apply が作った行」だけでなく**当該 BOM の未移送 volume_temp 行を全件掃き出す**
+  apply・リンク解除・BOM 削除はいずれも fail closed で拒否**する(ジャーナルは bom_link への
+  FK cascade で消えるため、復旧完了前の削除経路を Rust 側で全て塞ぐ。ジャーナルは不変のまま
+  次回再試行)。**§4.2.2 の移送は open のたびに当該 BOM の未移送 volume_temp 行へ全件実行**
+  (ジャーナル・競合状態と独立。一過性の移送失敗は次回 open で再試行される)。apply も成功経路で
+  同じ全件掃き出しを行う
 - **競合ゲート(§1.3 の固定)**: 未解決競合 backup(`is_conflict=1 AND resolved_at IS NULL`)が
   存在する間、open は読み取りを継続しつつ `sync_status=conflict` を維持し(Safe 再読込でも
   Linked へ自動復元しない)、apply はファイルに触れる前に `Refused(unresolved_conflict)` で

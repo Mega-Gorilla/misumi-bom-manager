@@ -353,6 +353,18 @@ fn env_warning(env: &env::EnvCheck) -> String {
 /// it means simply deleting the bom_link row; contract/state/quotes/pending go via
 /// FK cascade, the backup ledger stays.
 pub fn unlink(conn: &mut Connection, bom_id: &str) -> Result<(), String> {
+    // A pending write journal would be cascade-deleted with bom_link — and it is
+    // the ONLY pointer that can turn the displaced backup into a ledger row
+    // (3rd review #1). Refuse until a link open has reconciled it.
+    if store::get_write_journal(conn, bom_id)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        return Err(
+            "中断された書き込みの復旧が完了していません。先にリンクを開いて復旧してからリンク解除してください"
+                .into(),
+        );
+    }
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     // §1.3 "freeze as a conventional BOM": before the contract cascades away,
     // restore the conventional supplier-link semantics onto the frozen cache —
@@ -388,7 +400,12 @@ pub fn open_link(
     // commit) is reconciled BEFORE anything reads the state (PR-4 review #3).
     // backup_dir lets the recovery also finish the §4.2.2 transfer, so a
     // recovered backup does not linger in a (possibly cloud-synced) folder.
-    let recovered = reconcile_write_journal(conn, bom_id, backup_dir);
+    let mut recovered = reconcile_write_journal(conn, bom_id);
+    // §4.2.2 transfer runs on EVERY open, independent of the journal and of the
+    // conflict gate (3rd review #2): a transfer that failed once (recovered rows
+    // included) is retried here, so no backup lingers in a possibly cloud-synced
+    // folder just because one attempt failed.
+    recovered.extend(backup::transfer_pending(conn, bom_id, backup_dir));
     let mut view = open_link_inner(conn, bom_id)?;
     view.warnings.splice(0..0, recovered);
     Ok(view)
@@ -740,7 +757,7 @@ pub fn apply_link(
 
     // Complete any interrupted previous write first: its outcome (fingerprints,
     // generation, a possible conflict) is the baseline this apply builds on.
-    let recovered = reconcile_write_journal(conn, bom_id, backup_dir);
+    let recovered = reconcile_write_journal(conn, bom_id);
 
     // A journal that SURVIVED reconcile is an unfinished replace we could not
     // recover — it is the only pointer to an unmanaged backup, and starting a
@@ -1016,7 +1033,7 @@ pub fn apply_link(
 /// journal) or does not (it never ran — void the journal, sweep the temp).
 /// Total by design: every failure becomes a warning and the journal stays for the
 /// next attempt; the caller proceeds with a normal open/apply either way.
-fn reconcile_write_journal(conn: &mut Connection, bom_id: &str, backup_dir: &Path) -> Vec<String> {
+fn reconcile_write_journal(conn: &mut Connection, bom_id: &str) -> Vec<String> {
     let j = match store::get_write_journal(conn, bom_id) {
         Ok(Some(j)) => j,
         Ok(None) => return Vec::new(),
@@ -1043,9 +1060,9 @@ fn reconcile_write_journal(conn: &mut Connection, bom_id: &str, backup_dir: &Pat
                         .into(),
                 );
             }
-            // §4.2.2: finish the transfer too — a recovered backup must not stay
-            // in a (possibly cloud-synced) workbook folder (2nd review #3).
-            w.extend(backup::transfer_pending(conn, bom_id, backup_dir));
+            // The §4.2.2 transfer itself runs in the callers (open sweeps on
+            // every call, apply in its success path) so a failed attempt is
+            // retried on the NEXT open too, journal or not (3rd review #2).
             w
         }
         Err(e) => vec![format!(
@@ -2963,6 +2980,128 @@ mod tests {
         assert!(store::get_write_journal(&conn, &bom_id).unwrap().is_none());
         assert!(!temp.exists(), "stale temp must be swept");
         assert!(store::list_backups(&conn, &bom_id).unwrap().is_empty());
+    }
+
+    /// 3rd review #1: while a journal is pending, unlink and BOM deletion must be
+    /// refused — the FK cascade would delete the only pointer that can turn the
+    /// displaced backup into a ledger row. After a recovering open, both work and
+    /// the ledger row survives.
+    #[test]
+    fn unlink_and_delete_refuse_while_journal_pending() {
+        let path = temp_xlsx(
+            "journal-guard.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+
+        // A replace that happened (backup file exists) whose finalize was lost.
+        let dir = path.parent().unwrap();
+        let backup = dir.join("journal-guard.mbm-backup-x.xlsx");
+        std::fs::write(&backup, b"displaced external version").unwrap();
+        store::insert_write_journal(
+            &conn,
+            &bom_id,
+            &store::WriteJournal {
+                backup_path: backup.to_string_lossy().into_owned(),
+                temp_path: dir.join("none.tmp").to_string_lossy().into_owned(),
+                // Valid-shaped (64-hex) dummies: the recovery writes new_fp into
+                // the state, which open then parses as a sha256-v1 fingerprint.
+                f0_fp: "aa".repeat(32),
+                new_fp: "bb".repeat(32),
+                generation: 1,
+            },
+        )
+        .unwrap();
+
+        let err = unlink(&mut conn, &bom_id).unwrap_err();
+        assert!(err.contains("復旧"), "{err}");
+        let err = crate::db::delete_bom(&conn, &bom_id)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("復旧"), "{err}");
+        // Journal + backup are untouched by the refused deletions.
+        assert!(store::get_write_journal(&conn, &bom_id).unwrap().is_some());
+        assert!(backup.exists());
+
+        // A link open reconciles (this backup ≠ F0 → conflict) — after that the
+        // deletions are allowed and the LEDGER survives them (audit trail).
+        let bk = apply_bk("journal-guard");
+        let view = open_link(&mut conn, &bom_id, &bk).unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Conflict);
+        assert!(store::get_write_journal(&conn, &bom_id).unwrap().is_none());
+        unlink(&mut conn, &bom_id).unwrap();
+        let backups = store::list_backups(&conn, &bom_id).unwrap();
+        assert_eq!(backups.len(), 1, "unlink keeps the backup ledger");
+        assert!(backups[0].is_conflict);
+        crate::db::delete_bom(&conn, &bom_id).unwrap();
+        let backups = store::list_backups(&conn, &bom_id).unwrap();
+        assert_eq!(backups.len(), 1, "BOM deletion keeps the ledger too");
+        assert!(backups[0].bom_id.is_none(), "live FK nulled, origin kept");
+    }
+
+    /// 3rd review #2: the §4.2.2 transfer is retried on EVERY open — a one-off
+    /// transfer failure (here: the backup dir path is occupied by a file) must not
+    /// leave the backup beside the workbook forever.
+    #[test]
+    fn open_retries_failed_transfer_on_next_open() {
+        let path = temp_xlsx(
+            "transfer-retry.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+
+        // An untransferred (volume_temp) ledger row with its real file — the state
+        // a failed reconcile-time or apply-time transfer leaves behind. No journal.
+        let dir = path.parent().unwrap();
+        let backup = dir.join("transfer-retry.mbm-backup-x.xlsx");
+        std::fs::write(&backup, b"backup bytes").unwrap();
+        let fp = fp_hex(&backup);
+        store::insert_backup(
+            &conn,
+            &store::NewBackup {
+                origin_bom_id: bom_id.clone(),
+                workbook_path: path.to_string_lossy().into_owned(),
+                backup_path: backup.to_string_lossy().into_owned(),
+                backup_fp: fp.clone(),
+                f0_fp: fp,
+            },
+        )
+        .unwrap();
+
+        // Open #1: the backup dir path is an existing FILE → transfer fails, row
+        // stays volume_temp, file stays put — but the open itself succeeds.
+        let blocked = std::env::temp_dir().join("mbm-transfer-retry-blocked");
+        let _ = std::fs::remove_dir_all(&blocked);
+        let _ = std::fs::remove_file(&blocked);
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        let view = open_link(&mut conn, &bom_id, &blocked).unwrap();
+        assert!(
+            view.warnings.iter().any(|w| w.contains("移送に失敗")),
+            "{:?}",
+            view.warnings
+        );
+        let b = &store::list_backups(&conn, &bom_id).unwrap()[0];
+        assert_eq!(b.location, crate::model::BackupLocation::VolumeTemp);
+        assert!(backup.exists());
+
+        // Open #2 with a usable dir: retried WITHOUT any journal → transferred.
+        let bk = apply_bk("transfer-retry");
+        let view = open_link(&mut conn, &bom_id, &bk).unwrap();
+        assert!(
+            !view.warnings.iter().any(|w| w.contains("移送に失敗")),
+            "{:?}",
+            view.warnings
+        );
+        let b = &store::list_backups(&conn, &bom_id).unwrap()[0];
+        assert_eq!(b.location, crate::model::BackupLocation::AppData);
+        assert!(Path::new(&b.backup_path).starts_with(&bk));
+        assert!(!backup.exists(), "moved out of the workbook folder");
     }
 
     /// The sandwiched read returns the fingerprint of exactly the content both

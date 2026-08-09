@@ -493,6 +493,21 @@ pub(crate) fn clear_column_links(conn: &Connection, id: &str) -> rusqlite::Resul
 }
 
 pub fn delete_bom(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    // A pending Excel-link write journal cascades away with the BOM, and it is the
+    // only recovery pointer for a displaced backup that never reached the ledger
+    // (V6; 3rd review #1). Deleting is fine once a link open has reconciled it.
+    let pending: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bom_link_write_journal WHERE bom_id = ?1)",
+        [id],
+        |r| r.get(0),
+    )?;
+    if pending {
+        return Err(rusqlite::Error::ToSqlConversionFailure(
+            "中断された書き込みの復旧が完了していません。先にリンクを開いて復旧してから削除してください"
+                .to_string()
+                .into(),
+        ));
+    }
     conn.execute("DELETE FROM bom WHERE id = ?1", [id])?; // cascades to columns/rows
     Ok(())
 }
