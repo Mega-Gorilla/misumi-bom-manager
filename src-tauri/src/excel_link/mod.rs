@@ -324,6 +324,7 @@ pub fn create_link(
         formula_cells: outcome.formula_cells,
         truncated: outcome.truncated,
         warnings,
+        pending: None,
     })
 }
 
@@ -408,7 +409,21 @@ pub fn open_link(
     recovered.extend(backup::transfer_pending(conn, bom_id, backup_dir));
     let mut view = open_link_inner(conn, bom_id)?;
     view.warnings.splice(0..0, recovered);
+    view.pending = store::get_pending(conn, bom_id)
+        .map_err(|e| e.to_string())?
+        .map(pending_info);
     Ok(view)
+}
+
+/// PendingRecord -> IPC projection (§4.2.1: the row itself is the 反映待ち state).
+fn pending_info(p: store::PendingRecord) -> crate::model::PendingInfo {
+    crate::model::PendingInfo {
+        requested_generation: p.requested_generation,
+        requested_at: p.requested_at,
+        last_attempt_at: p.last_attempt_at,
+        attempt_count: p.attempt_count,
+        blocked_reason: p.blocked_reason,
+    }
 }
 
 fn open_link_inner(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView, String> {
@@ -549,6 +564,7 @@ fn open_link_inner(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView,
                 formula_cells: outcome.formula_cells,
                 truncated: outcome.truncated,
                 warnings,
+                pending: None,
             })
         }
         Severity::Confirm | Severity::Broken => {
@@ -579,6 +595,7 @@ fn open_link_inner(conn: &mut Connection, bom_id: &str) -> Result<LinkedBomView,
                 formula_cells: outcome.formula_cells,
                 truncated: outcome.truncated,
                 warnings,
+                pending: None,
             })
         }
     }
@@ -606,6 +623,7 @@ fn broken_view(
         formula_cells: vec![],
         truncated: false,
         warnings: vec![],
+        pending: None,
     })
 }
 
@@ -782,6 +800,7 @@ pub fn apply_link(
     if store::has_unresolved_conflict(conn, bom_id).map_err(|e| e.to_string())? {
         return Ok(crate::model::ApplyOutcome::Refused {
             reason: crate::model::RefuseReason::UnresolvedConflict,
+            warnings: recovered,
         });
     }
 
@@ -798,6 +817,7 @@ pub fn apply_link(
     if env.verdict == crate::model::EnvVerdict::NoWriteback {
         return Ok(ApplyOutcome::Refused {
             reason: RefuseReason::Env,
+            warnings: recovered,
         });
     }
     if rec.header.env_resolved_path.is_some() && env_identity(&env).is_some() {
@@ -816,6 +836,7 @@ pub fn apply_link(
             )?;
             return Ok(ApplyOutcome::Refused {
                 reason: RefuseReason::Structure,
+                warnings: recovered.clone(),
             });
         }
     }
@@ -829,6 +850,7 @@ pub fn apply_link(
         )?;
         return Ok(ApplyOutcome::Refused {
             reason: RefuseReason::Structure,
+            warnings: recovered.clone(),
         });
     };
     let path = io_path.as_path();
@@ -842,6 +864,7 @@ pub fn apply_link(
         )?;
         return Ok(ApplyOutcome::Refused {
             reason: RefuseReason::Structure,
+            warnings: recovered.clone(),
         });
     }
 
@@ -856,6 +879,7 @@ pub fn apply_link(
     if rec.state.last_read_fp.as_deref() != Some(f0_hex.as_str()) {
         return Ok(ApplyOutcome::Refused {
             reason: RefuseReason::FingerprintChanged, // §9-15/24: reload (open) first
+            warnings: recovered.clone(),
         });
     }
     let verify = contract::verify_structure(&contract, &outcome.sheets);
@@ -868,6 +892,7 @@ pub fn apply_link(
         mark_stopped(conn, bom_id, &rec.state, status, code)?;
         return Ok(ApplyOutcome::Refused {
             reason: RefuseReason::Structure,
+            warnings: recovered.clone(),
         });
     }
 
@@ -886,7 +911,12 @@ pub fn apply_link(
         &sheet_xml,
     )? {
         Ok(p) => p,
-        Err(reason) => return Ok(ApplyOutcome::Refused { reason }),
+        Err(reason) => {
+            return Ok(ApplyOutcome::Refused {
+                reason,
+                warnings: recovered.clone(),
+            })
+        }
     };
 
     // Step 5: surgical temp in the SAME directory (ReplaceFileW volume constraint).
@@ -913,6 +943,7 @@ pub fn apply_link(
             let _ = std::fs::remove_file(&temp);
             return Ok(ApplyOutcome::Refused {
                 reason: RefuseReason::FingerprintChanged,
+                warnings: recovered.clone(),
             });
         }
     }
@@ -948,6 +979,7 @@ pub fn apply_link(
             store::record_pending_attempt(conn, bom_id, "file_open").map_err(|e| e.to_string())?;
             return Ok(ApplyOutcome::Pending {
                 reason: "fileOpen".into(),
+                warnings: recovered.clone(),
             });
         }
         Err(writeback::ReplaceError::Other(e)) => {
@@ -1031,6 +1063,338 @@ pub fn apply_link(
             warnings,
         })
     }
+}
+
+/// Lightweight status (§2.3): DB reads plus ONE file-existence probe (the `~$`
+/// owner-file hint). Never opens or hashes the workbook — cheap enough to poll.
+pub fn status(conn: &Connection, bom_id: &str) -> Result<crate::model::LinkStatus, String> {
+    let rec = store::get_link(conn, bom_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "この BOM は Excel にリンクされていません".to_string())?;
+    let pending = store::get_pending(conn, bom_id)
+        .map_err(|e| e.to_string())?
+        .map(pending_info);
+    let conflicts = store::unresolved_conflicts_for(conn, bom_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|b| crate::model::ConflictInfo {
+            backup_id: b.id,
+            backup_path: b.backup_path,
+            created_at: b.created_at,
+            transferred: b.transferred_at.is_some(),
+        })
+        .collect();
+    let untransferred = store::untransferred_backups(conn, bom_id)
+        .map_err(|e| e.to_string())?
+        .len() as i64;
+    let recovery_pending = store::get_write_journal(conn, bom_id)
+        .map_err(|e| e.to_string())?
+        .is_some();
+    Ok(crate::model::LinkStatus {
+        sync_status: rec.state.sync_status,
+        sync_error: rec.state.sync_error.clone(),
+        calc_state: rec.state.calc_state,
+        ec_generation: rec.state.ec_generation,
+        applied_generation: rec.state.applied_generation,
+        pending,
+        conflicts,
+        untransferred,
+        recovery_pending,
+        excel_lock_hint: excel_lock_hint(&rec.header),
+    })
+}
+
+/// The `~$` owner-file existence check (§4.2.1: a cheap PREDICTION that Excel has
+/// the workbook open; the authority stays the actual write-open attempt). Checks
+/// beside the READ target so a `.lnk` link probes the real workbook's folder; an
+/// unresolvable link yields false (the hint must never fail the status call).
+fn excel_lock_hint(header: &store::LinkHeader) -> bool {
+    // Poll-friendly contract: NO env re-resolution here (check_env resolves .lnk
+    // chains, spawns a COM thread, canonicalizes, inspects reparse points — far
+    // too heavy under the DB mutex). The RESOLVED path the last create/open
+    // recorded is the probe target; a bare stored path works as fallback unless
+    // it is a .lnk (whose target only check_env could find — open/apply stay the
+    // authority for that, and the hint simply reads false until then).
+    let target = match &header.env_resolved_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let p = Path::new(&header.workbook_path);
+            let is_lnk = p
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("lnk"))
+                .unwrap_or(false);
+            if is_lnk {
+                return false;
+            }
+            p.to_path_buf()
+        }
+    };
+    match (target.parent(), target.file_name()) {
+        (Some(dir), Some(name)) => dir.join(format!("~${}", name.to_string_lossy())).exists(),
+        _ => false,
+    }
+}
+
+/// Confirm-verdict resolution (§2.3 / §1.3 "候補確定 → linked"). Two fail-closed
+/// guards before anything is written: the STRUCTURE FINGERPRINT the candidates
+/// were generated from must still match (freshness — the workbook may have
+/// changed again), and every accepted candidate must be one the CURRENT verify
+/// actually offers (membership — contract.rs stays the single place that decides
+/// what is offered). Ends with a normal open so the caller gets the refreshed
+/// view (Safe → Linked) through the one code path that owns state transitions.
+pub fn confirm_link(
+    conn: &mut Connection,
+    bom_id: &str,
+    req: &crate::model::LinkConfirmRequest,
+    backup_dir: &Path,
+) -> Result<LinkedBomView, String> {
+    let rec = store::get_link(conn, bom_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "この BOM は Excel にリンクされていません".to_string())?;
+    let contract =
+        Contract::try_from_store(&rec.header, &rec.columns).map_err(|e| e.to_string())?;
+
+    // Environment preconditions are Errs here, not state transitions — open owns
+    // those. The user resolves them by re-opening the link.
+    let env = env::check_env(Path::new(&rec.header.workbook_path));
+    if rec.header.env_resolved_path.is_some() && env_identity(&env).is_some() {
+        let stored = workbook_identity(
+            rec.header.env_resolved_path.as_deref(),
+            &rec.header.workbook_path,
+        );
+        let now = workbook_identity(env_identity(&env).as_deref(), &rec.header.workbook_path);
+        if stored != now {
+            return Err("リンク先が変更されています。リンクを開き直してください".into());
+        }
+    }
+    let Some(io_path) = io_path_of(&env, Path::new(&rec.header.workbook_path)) else {
+        return Err("リンク先を解決できません。リンクを開き直してください".into());
+    };
+    if !io_path.exists() {
+        return Err("リンク先ファイルが見つかりません。リンクを開き直してください".into());
+    }
+
+    let (_fp, outcome) = read_stable(&io_path, &contract)?;
+    let verify = contract::verify_structure(&contract, &outcome.sheets);
+    if verify.severity() != Severity::Confirm {
+        return Err(
+            "確認が必要な構造変化はありません (状態が変わりました)。リンクを開き直してください"
+                .into(),
+        );
+    }
+    // Freshness guard: the candidates were generated from THIS structure.
+    if verify.structure_fp != req.structure_fp {
+        return Err(
+            "候補の提示後にワークブック構造が再度変更されています。リンクを開き直してください"
+                .into(),
+        );
+    }
+    // Membership guard: only currently-offered candidates may be applied.
+    let offered: Vec<crate::model::LinkResolutionCandidate> = verify
+        .anomalies
+        .iter()
+        .flat_map(|a| a.candidates(&contract))
+        .collect();
+    for c in &req.accepted {
+        if !offered.contains(c) {
+            return Err("提示されていない候補が含まれています".into());
+        }
+    }
+    // Selection-consistency guards: the wire format is a flat list, so mutually
+    // EXCLUSIVE alternatives for one anomaly (KeepSkipped vs ImportSkippedAsUser
+    // vs SkipColumn, keyed by the same excel_col) must not arrive together —
+    // otherwise application order would silently pick the winner. Duplicates and
+    // an empty selection are refused for the same reason: the user's choice has
+    // to be explicit, never an artifact of list order.
+    if req.accepted.is_empty() {
+        return Err("確定する候補が指定されていません".into());
+    }
+    for (i, c) in req.accepted.iter().enumerate() {
+        if req.accepted[i + 1..].contains(c) {
+            return Err("同じ候補が重複しています".into());
+        }
+    }
+    {
+        use crate::model::LinkResolutionCandidate as C;
+        let mut seen_cols = BTreeSet::new();
+        for c in &req.accepted {
+            let col = match c {
+                C::KeepSkipped { excel_col, .. }
+                | C::ImportSkippedAsUser { excel_col, .. }
+                | C::SkipColumn { excel_col } => Some(*excel_col),
+                _ => None,
+            };
+            if let Some(col) = col {
+                if !seen_cols.insert(col) {
+                    return Err(format!(
+                        "同じ列 (excel_col={col}) に対して排他的な候補が複数指定されています"
+                    ));
+                }
+            }
+        }
+    }
+
+    // Map candidates onto the stored contract (pure — unit-tested), prove the
+    // RESULT is still a well-formed contract, then commit header + columns
+    // atomically. Partial resolution is allowed by design: with several
+    // anomalies the user may confirm a subset, and the closing open reports the
+    // remaining ones as a fresh Confirm verdict (documented in §2.3).
+    let mut header = rec.header.clone();
+    let mut columns = rec.columns.clone();
+    apply_candidates(&mut header, &mut columns, &req.accepted);
+    Contract::try_from_store(&header, &columns)
+        .map_err(|e| format!("候補適用後の契約が不正です: {e}"))?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    store::update_link_header(
+        &tx,
+        bom_id,
+        &header.sheet_name,
+        header.header_row,
+        header.data_start_row,
+    )
+    .map_err(|e| e.to_string())?;
+    store::replace_columns(&tx, bom_id, &columns).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+
+    open_link(conn, bom_id, backup_dir)
+}
+
+/// Candidate -> contract mapping (implementation.md: "maps an accepted candidate
+/// onto SQL without further judgement" — contract.rs decided what is offered, the
+/// membership guard enforced it, so this is a mechanical projection).
+fn apply_candidates(
+    header: &mut store::LinkHeader,
+    columns: &mut Vec<store::LinkColumn>,
+    accepted: &[crate::model::LinkResolutionCandidate],
+) {
+    use crate::model::LinkResolutionCandidate as C;
+    for cand in accepted {
+        match cand {
+            C::AdoptSheetRename { new_sheet } => header.sheet_name = new_sheet.clone(),
+            C::AdoptHeaderRowMove {
+                new_header_row,
+                new_data_start_row,
+            } => {
+                header.header_row = *new_header_row;
+                header.data_start_row = *new_data_start_row;
+            }
+            C::AdoptColumnMove {
+                app_key,
+                new_excel_col,
+            } => {
+                if let Some(col) = columns
+                    .iter_mut()
+                    .find(|c| c.app_key.as_deref() == Some(app_key))
+                {
+                    col.excel_col = *new_excel_col;
+                }
+            }
+            C::AdoptRename { app_key, new_label } => {
+                if let Some(col) = columns
+                    .iter_mut()
+                    .find(|c| c.app_key.as_deref() == Some(app_key))
+                {
+                    col.header_label = Some(new_label.clone());
+                }
+            }
+            C::DropOptionalColumn { app_key } => {
+                columns.retain(|c| c.app_key.as_deref() != Some(app_key));
+            }
+            C::ImportSkippedAsUser { excel_col, label } => {
+                let keys: BTreeSet<String> =
+                    columns.iter().filter_map(|c| c.app_key.clone()).collect();
+                let key = fresh_user_key(&keys, *excel_col as u32);
+                if let Some(col) = columns.iter_mut().find(|c| c.excel_col == *excel_col) {
+                    col.ownership = crate::model::LinkOwnership::User;
+                    col.app_key = Some(key);
+                    col.header_label = Some(label.clone());
+                } else {
+                    columns.push(store::LinkColumn {
+                        excel_col: *excel_col,
+                        header_label: Some(label.clone()),
+                        app_key: Some(key),
+                        ownership: crate::model::LinkOwnership::User,
+                        required: false,
+                        role: None,
+                        source_field: None,
+                        projection: None,
+                    });
+                }
+            }
+            C::KeepSkipped {
+                excel_col,
+                new_label,
+            } => {
+                if let Some(col) = columns.iter_mut().find(|c| c.excel_col == *excel_col) {
+                    if new_label.is_some() {
+                        col.header_label = new_label.clone();
+                    }
+                } else {
+                    columns.push(skipped_column(*excel_col, new_label.clone()));
+                }
+            }
+            C::SkipColumn { excel_col } => {
+                if !columns.iter().any(|c| c.excel_col == *excel_col) {
+                    columns.push(skipped_column(*excel_col, None));
+                }
+            }
+        }
+    }
+}
+
+fn skipped_column(excel_col: i64, header_label: Option<String>) -> store::LinkColumn {
+    store::LinkColumn {
+        excel_col,
+        header_label,
+        app_key: None,
+        ownership: crate::model::LinkOwnership::Skipped,
+        required: false,
+        role: None,
+        source_field: None,
+        projection: None,
+    }
+}
+
+/// Record the USER's conflict resolution (§1.3: the only thing that lifts the
+/// conflict stop). Validates the ledger row belongs to this BOM and is actually
+/// an open conflict, then marks it resolved and — when no other conflict remains
+/// and the state still says Conflict — restores Linked in the same transaction.
+/// Broken/NeedsReview are never overwritten (they stop sync for their own
+/// reasons). Opening the backup folder is the frontend's job (PR-6).
+pub fn resolve_conflict(
+    conn: &mut Connection,
+    bom_id: &str,
+    backup_id: i64,
+    action: crate::model::ConflictAction,
+) -> Result<(), String> {
+    let crate::model::ConflictAction::Resolved = action;
+    let b = store::get_backup(conn, backup_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("バックアップが見つかりません (id={backup_id})"))?;
+    if b.origin_bom_id != bom_id {
+        return Err("この BOM のバックアップではありません".into());
+    }
+    if !b.is_conflict {
+        return Err("競合バックアップではありません".into());
+    }
+    if b.resolved_at.is_some() {
+        return Err("この競合は解決済みです".into());
+    }
+
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    store::mark_resolved(&tx, backup_id).map_err(|e| e.to_string())?;
+    if let Some(rec) = store::get_link(&tx, bom_id).map_err(|e| e.to_string())? {
+        let still_conflicted =
+            store::has_unresolved_conflict(&tx, bom_id).map_err(|e| e.to_string())?;
+        if !still_conflicted && rec.state.sync_status == SyncStatus::Conflict {
+            let mut st = rec.state.clone();
+            st.sync_status = SyncStatus::Linked;
+            st.sync_error = None;
+            store::update_state(&tx, bom_id, &st).map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Recover from a write interrupted between ReplaceFileW and the finalize commit
@@ -1954,7 +2318,8 @@ mod tests {
         assert!(matches!(
             out,
             crate::model::ApplyOutcome::Refused {
-                reason: crate::model::RefuseReason::Env
+                reason: crate::model::RefuseReason::Env,
+                ..
             }
         ));
 
@@ -2135,7 +2500,8 @@ mod tests {
         assert!(matches!(
             out,
             ApplyOutcome::Refused {
-                reason: RefuseReason::FingerprintChanged
+                reason: RefuseReason::FingerprintChanged,
+                ..
             }
         ));
         assert_eq!(
@@ -2173,7 +2539,8 @@ mod tests {
         assert!(matches!(
             out,
             ApplyOutcome::Refused {
-                reason: RefuseReason::Structure
+                reason: RefuseReason::Structure,
+                ..
             }
         ));
         let st = store::get_state(&conn, &bom_id).unwrap().unwrap();
@@ -2196,7 +2563,8 @@ mod tests {
         assert!(matches!(
             out,
             ApplyOutcome::Refused {
-                reason: RefuseReason::NothingToWrite
+                reason: RefuseReason::NothingToWrite,
+                ..
             }
         ));
     }
@@ -2235,7 +2603,8 @@ mod tests {
         assert!(matches!(
             out,
             ApplyOutcome::Refused {
-                reason: RefuseReason::Structure
+                reason: RefuseReason::Structure,
+                ..
             }
         ));
         let st = store::get_state(&conn, &bom_id).unwrap().unwrap();
@@ -2265,7 +2634,8 @@ mod tests {
         assert!(matches!(
             out,
             ApplyOutcome::Refused {
-                reason: RefuseReason::Spill
+                reason: RefuseReason::Spill,
+                ..
             }
         ));
     }
@@ -2289,7 +2659,8 @@ mod tests {
         assert!(matches!(
             out,
             ApplyOutcome::Refused {
-                reason: RefuseReason::Truncated
+                reason: RefuseReason::Truncated,
+                ..
             }
         ));
     }
@@ -2320,7 +2691,7 @@ mod tests {
         let bk = apply_bk("pend");
         let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
         match out {
-            ApplyOutcome::Pending { reason } => assert_eq!(reason, "fileOpen"),
+            ApplyOutcome::Pending { reason, .. } => assert_eq!(reason, "fileOpen"),
             other => panic!("expected Pending, got {other:?}"),
         }
         let p = store::get_pending(&conn, &bom_id).unwrap().unwrap();
@@ -2879,7 +3250,8 @@ mod tests {
         assert!(matches!(
             out,
             ApplyOutcome::Refused {
-                reason: RefuseReason::UnresolvedConflict
+                reason: RefuseReason::UnresolvedConflict,
+                ..
             }
         ));
         assert_eq!(fp_hex(&path), before, "refused apply must not write");
@@ -2944,12 +3316,16 @@ mod tests {
 
         let bk = apply_bk("recover-apply");
         let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
-        assert!(matches!(
-            out,
+        match &out {
             ApplyOutcome::Refused {
-                reason: RefuseReason::UnresolvedConflict
+                reason: RefuseReason::UnresolvedConflict,
+                warnings,
+            } => {
+                // PR-5: the refusal now CARRIES the recovery notice (review handover).
+                assert!(warnings.iter().any(|w| w.contains("復旧")), "{warnings:?}");
             }
-        ));
+            other => panic!("expected Refused(UnresolvedConflict), got {other:?}"),
+        }
         // Refused — but the recovered backup was ledgered AND transferred.
         assert!(store::get_write_journal(&conn, &bom_id).unwrap().is_none());
         let backups = store::list_backups(&conn, &bom_id).unwrap();
@@ -3199,5 +3575,760 @@ mod tests {
             outcome.values.get(&(1, 0)).map(String::as_str),
             Some("TEST-PART-001")
         );
+    }
+
+    // ---- PR-5: status / confirm / resolve_conflict / §9-5·17·25 ----------------
+
+    use crate::model::{ConflictAction, LinkConfirmRequest, LinkResolutionCandidate};
+
+    fn ledger_row(conn: &Connection, bom_id: &str, path: &Path, conflict: bool) -> i64 {
+        std::fs::write(path, b"backup bytes").unwrap();
+        let fp = fp_hex(path);
+        let f0 = if conflict {
+            "f0".repeat(32)
+        } else {
+            fp.clone()
+        };
+        store::insert_backup(
+            conn,
+            &store::NewBackup {
+                origin_bom_id: bom_id.to_string(),
+                workbook_path: "wb.xlsx".into(),
+                backup_path: path.to_string_lossy().into_owned(),
+                backup_fp: fp,
+                f0_fp: f0,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn status_reports_state_ledger_and_lock_hint() {
+        let path = temp_xlsx(
+            "status-basic.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        assert!(status(&conn, "no-such").is_err(), "not linked must be Err");
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+
+        let st = status(&conn, &bom_id).unwrap();
+        assert_eq!(st.sync_status, SyncStatus::Linked);
+        assert_eq!(st.calc_state, CalcState::Unverified);
+        assert_eq!((st.ec_generation, st.applied_generation), (0, 0));
+        assert!(st.pending.is_none());
+        assert!(st.conflicts.is_empty());
+        assert_eq!(st.untransferred, 0);
+        assert!(!st.recovery_pending);
+        assert!(!st.excel_lock_hint);
+
+        // The `~$` owner file beside the workbook flips the hint (§4.2.1 予告).
+        let owner = path.parent().unwrap().join("~$status-basic.xlsx");
+        std::fs::write(&owner, b"lock").unwrap();
+        assert!(status(&conn, &bom_id).unwrap().excel_lock_hint);
+        std::fs::remove_file(&owner).unwrap();
+        assert!(!status(&conn, &bom_id).unwrap().excel_lock_hint);
+
+        // Ledger projections: one untransferred plain backup + one TRANSFERRED
+        // conflict → conflicts lists the conflict, untransferred counts the other.
+        let dir = path.parent().unwrap();
+        ledger_row(&conn, &bom_id, &dir.join("status-basic.plain.bak"), false);
+        let cid = ledger_row(&conn, &bom_id, &dir.join("status-basic.cf.bak"), true);
+        store::mark_transferred(&conn, cid, &dir.join("moved.bak").to_string_lossy()).unwrap();
+        let st = status(&conn, &bom_id).unwrap();
+        assert_eq!(st.untransferred, 1);
+        assert_eq!(st.conflicts.len(), 1);
+        assert_eq!(st.conflicts[0].backup_id, cid);
+        assert!(st.conflicts[0].transferred);
+
+        // A surviving write journal is surfaced as recovery_pending.
+        store::insert_write_journal(
+            &conn,
+            &bom_id,
+            &store::WriteJournal {
+                backup_path: dir.join("none.bak").to_string_lossy().into_owned(),
+                temp_path: dir.join("none.tmp").to_string_lossy().into_owned(),
+                f0_fp: "aa".repeat(32),
+                new_fp: "bb".repeat(32),
+                generation: 1,
+            },
+        )
+        .unwrap();
+        assert!(status(&conn, &bom_id).unwrap().recovery_pending);
+    }
+
+    /// Drive a link into a Confirm verdict by renaming the 数量 header, and return
+    /// (bom_id, offered candidates, structure_fp).
+    fn confirm_fixture(
+        conn: &mut Connection,
+        name: &str,
+    ) -> (
+        std::path::PathBuf,
+        String,
+        Vec<LinkResolutionCandidate>,
+        String,
+    ) {
+        let path = temp_xlsx(
+            name,
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let view = create_link(conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        temp_xlsx(
+            name,
+            &["型番", "数", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let view = open_link(conn, &bom_id, &test_bk()).unwrap();
+        assert_eq!(view.sync_status, SyncStatus::NeedsReview);
+        let crate::model::StructureVerdict::Confirm {
+            candidates,
+            structure_fp,
+            ..
+        } = view.verdict
+        else {
+            panic!("expected Confirm, got {:?}", view.verdict);
+        };
+        (path, bom_id, candidates, structure_fp)
+    }
+
+    #[test]
+    fn confirm_applies_rename_candidate_and_restores_linked() {
+        let mut conn = mem();
+        let (_path, bom_id, candidates, structure_fp) =
+            confirm_fixture(&mut conn, "confirm-rename.xlsx");
+        let rename: Vec<_> = candidates
+            .iter()
+            .filter(|c| matches!(c, LinkResolutionCandidate::AdoptRename { .. }))
+            .cloned()
+            .collect();
+        assert!(!rename.is_empty(), "{candidates:?}");
+
+        let view = confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp,
+                accepted: rename,
+            },
+            &test_bk(),
+        )
+        .unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
+        // Contract adopted the new label; the next open is Safe again.
+        let rec = store::get_link(&conn, &bom_id).unwrap().unwrap();
+        assert!(rec
+            .columns
+            .iter()
+            .any(|c| c.header_label.as_deref() == Some("数")));
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Linked);
+        assert!(matches!(view.verdict, StructureVerdict::Safe { .. }));
+    }
+
+    #[test]
+    fn confirm_adopts_sheet_rename() {
+        let path = temp_xlsx(
+            "confirm-sheet.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        build_xlsx("confirm-sheet.xlsx", |wb| {
+            let ws = wb.add_worksheet();
+            ws.set_name("データ").unwrap();
+            std_headers(ws);
+            ws.write_string(1, 0, "TEST-PART-001").unwrap();
+            ws.write_number(1, 1, 2.0).unwrap();
+        });
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
+        let crate::model::StructureVerdict::Confirm {
+            candidates,
+            structure_fp,
+            ..
+        } = view.verdict
+        else {
+            panic!("expected Confirm, got {:?}", view.verdict);
+        };
+        let adopt: Vec<_> = candidates
+            .iter()
+            .filter(|c| matches!(c, LinkResolutionCandidate::AdoptSheetRename { .. }))
+            .cloned()
+            .collect();
+        assert!(!adopt.is_empty(), "{candidates:?}");
+        let view = confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp,
+                accepted: adopt,
+            },
+            &test_bk(),
+        )
+        .unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
+        let rec = store::get_link(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(rec.header.sheet_name, "データ");
+    }
+
+    #[test]
+    fn confirm_guards_fail_closed() {
+        let mut conn = mem();
+        let (_path, bom_id, candidates, structure_fp) =
+            confirm_fixture(&mut conn, "confirm-guard.xlsx");
+
+        // Freshness: a stale/wrong echoed structure_fp is refused, contract intact.
+        let err = expect_err(confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp: "deadbeef".into(),
+                accepted: candidates.clone(),
+            },
+            &test_bk(),
+        ));
+        assert!(err.contains("開き直して"), "{err}");
+        let rec = store::get_link(&conn, &bom_id).unwrap().unwrap();
+        assert!(rec
+            .columns
+            .iter()
+            .any(|c| c.header_label.as_deref() == Some("数量")));
+
+        // Membership: a candidate the current verify does not offer is refused.
+        let err = expect_err(confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp: structure_fp.clone(),
+                accepted: vec![LinkResolutionCandidate::AdoptRename {
+                    app_key: "qty".into(),
+                    new_label: "偽ラベル".into(),
+                }],
+            },
+            &test_bk(),
+        ));
+        assert!(err.contains("提示されていない"), "{err}");
+
+        // No Confirm pending (Safe file) → nothing to confirm.
+        temp_xlsx(
+            "confirm-guard.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let err = expect_err(confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp,
+                accepted: candidates,
+            },
+            &test_bk(),
+        ));
+        assert!(err.contains("構造変化はありません"), "{err}");
+    }
+
+    #[test]
+    fn apply_candidates_maps_all_variants() {
+        use LinkResolutionCandidate as C;
+        let mut header = store::LinkHeader {
+            bom_id: "B1".into(),
+            workbook_path: "wb.xlsx".into(),
+            sheet_name: "Sheet1".into(),
+            header_row: 1,
+            data_start_row: 2,
+            env_verdict: crate::model::EnvVerdict::Allow,
+            env_resolved_path: None,
+            env_fs_name: None,
+            env_checked_at: None,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+        };
+        let col = |excel_col: i64, key: Option<&str>, own| store::LinkColumn {
+            excel_col,
+            header_label: Some(format!("c{excel_col}")),
+            app_key: key.map(str::to_string),
+            ownership: own,
+            required: false,
+            role: None,
+            source_field: None,
+            projection: None,
+        };
+        let mut columns = vec![
+            col(0, Some("partsNo"), LinkOwnership::User),
+            col(1, Some("qty"), LinkOwnership::User),
+            col(2, Some("opt"), LinkOwnership::User),
+            col(3, None, LinkOwnership::Skipped),
+        ];
+        apply_candidates(
+            &mut header,
+            &mut columns,
+            &[
+                C::AdoptSheetRename {
+                    new_sheet: "S2".into(),
+                },
+                C::AdoptHeaderRowMove {
+                    new_header_row: 3,
+                    new_data_start_row: 4,
+                },
+                C::AdoptColumnMove {
+                    app_key: "qty".into(),
+                    new_excel_col: 5,
+                },
+                C::AdoptRename {
+                    app_key: "partsNo".into(),
+                    new_label: "型番v2".into(),
+                },
+                C::DropOptionalColumn {
+                    app_key: "opt".into(),
+                },
+                C::ImportSkippedAsUser {
+                    excel_col: 3,
+                    label: "メモ".into(),
+                },
+                C::KeepSkipped {
+                    excel_col: 6,
+                    new_label: Some("無視".into()),
+                },
+                C::SkipColumn { excel_col: 7 },
+            ],
+        );
+        assert_eq!(header.sheet_name, "S2");
+        assert_eq!((header.header_row, header.data_start_row), (3, 4));
+        let by_key = |k: &str| columns.iter().find(|c| c.app_key.as_deref() == Some(k));
+        assert_eq!(by_key("qty").unwrap().excel_col, 5);
+        assert_eq!(
+            by_key("partsNo").unwrap().header_label.as_deref(),
+            Some("型番v2")
+        );
+        assert!(by_key("opt").is_none(), "dropped");
+        // Skipped col 3 became a user column with a fresh key + the new label.
+        let imported = columns.iter().find(|c| c.excel_col == 3).unwrap();
+        assert_eq!(imported.ownership, LinkOwnership::User);
+        assert!(imported.app_key.is_some());
+        assert_eq!(imported.header_label.as_deref(), Some("メモ"));
+        // KeepSkipped/SkipColumn appended skipped rows.
+        let kept = columns.iter().find(|c| c.excel_col == 6).unwrap();
+        assert_eq!(kept.ownership, LinkOwnership::Skipped);
+        assert_eq!(kept.header_label.as_deref(), Some("無視"));
+        let skipped = columns.iter().find(|c| c.excel_col == 7).unwrap();
+        assert_eq!(skipped.ownership, LinkOwnership::Skipped);
+        assert!(skipped.app_key.is_none());
+    }
+
+    #[test]
+    fn resolve_conflict_validates_and_restores_linked() {
+        let path = temp_xlsx(
+            "resolve-cf.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        let dir = path.parent().unwrap();
+        let cid = ledger_row(&conn, &bom_id, &dir.join("resolve-cf.bak"), true);
+        let plain = ledger_row(&conn, &bom_id, &dir.join("resolve-plain.bak"), false);
+        let mut st = store::get_state(&conn, &bom_id).unwrap().unwrap();
+        st.sync_status = SyncStatus::Conflict;
+        st.sync_error = Some("E_POST_REPLACE_CONFLICT".into());
+        store::update_state(&conn, &bom_id, &st).unwrap();
+
+        // Validation: unknown id / foreign BOM / non-conflict row — all Err.
+        let err =
+            resolve_conflict(&mut conn, &bom_id, cid + 999, ConflictAction::Resolved).unwrap_err();
+        assert!(err.contains("見つかりません"), "{err}");
+        let path2 = temp_xlsx(
+            "resolve-cf-2.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "1", ""]],
+        );
+        let bom2 = create_link(&mut conn, &config(&path2))
+            .unwrap()
+            .doc
+            .id
+            .unwrap();
+        let err = resolve_conflict(&mut conn, &bom2, cid, ConflictAction::Resolved).unwrap_err();
+        assert!(err.contains("この BOM の"), "{err}");
+        let err =
+            resolve_conflict(&mut conn, &bom_id, plain, ConflictAction::Resolved).unwrap_err();
+        assert!(err.contains("競合バックアップではありません"), "{err}");
+
+        // The real resolution: ledger stamped + state restored in one step.
+        resolve_conflict(&mut conn, &bom_id, cid, ConflictAction::Resolved).unwrap();
+        assert!(store::get_backup(&conn, cid)
+            .unwrap()
+            .unwrap()
+            .resolved_at
+            .is_some());
+        let st = store::get_state(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(st.sync_status, SyncStatus::Linked);
+        assert!(st.sync_error.is_none());
+        assert!(status(&conn, &bom_id).unwrap().conflicts.is_empty());
+        // Resolving twice is refused.
+        let err = resolve_conflict(&mut conn, &bom_id, cid, ConflictAction::Resolved).unwrap_err();
+        assert!(err.contains("解決済み"), "{err}");
+    }
+
+    #[test]
+    fn resolve_conflict_never_overwrites_broken() {
+        let path = temp_xlsx(
+            "resolve-broken.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        let cid = ledger_row(
+            &conn,
+            &bom_id,
+            &path.parent().unwrap().join("resolve-broken.bak"),
+            true,
+        );
+        // Sync is stopped for a DIFFERENT reason — resolving the conflict must
+        // not fake a recovery.
+        let mut st = store::get_state(&conn, &bom_id).unwrap().unwrap();
+        st.sync_status = SyncStatus::Broken;
+        st.sync_error = Some("E_STRUCTURE_BROKEN".into());
+        store::update_state(&conn, &bom_id, &st).unwrap();
+
+        resolve_conflict(&mut conn, &bom_id, cid, ConflictAction::Resolved).unwrap();
+        let st = store::get_state(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(st.sync_status, SyncStatus::Broken, "Broken must survive");
+        assert_eq!(st.sync_error.as_deref(), Some("E_STRUCTURE_BROKEN"));
+    }
+
+    /// §9-5 (手動経路) + §9-17 (latest-wins): quotes fetched while Excel holds the
+    /// file stack into ONE pending row that tracks the newest generation; the
+    /// manual retry after release writes only that newest state.
+    #[cfg(windows)]
+    #[test]
+    fn pending_latest_wins_applies_only_newest_generation() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = temp_xlsx(
+            "latest-wins.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        assert_eq!(
+            adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]),
+            Some(1)
+        );
+
+        let hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ: Excel-style hold
+            .open(&path)
+            .unwrap();
+        let bk = apply_bk("latest-wins");
+        let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
+        assert!(matches!(out, ApplyOutcome::Pending { .. }));
+        // status + view surface the pending row (§9-5 UI hooks).
+        let st = status(&conn, &bom_id).unwrap();
+        assert_eq!(st.pending.as_ref().unwrap().requested_generation, 1);
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
+        assert_eq!(view.pending.as_ref().unwrap().requested_generation, 1);
+
+        // A second fetch while held: the pending row advances to gen 2 with fresh
+        // retry bookkeeping — no queue, latest wins (§4.2.1).
+        assert_eq!(
+            adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("120"))]),
+            Some(2)
+        );
+        let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
+        assert!(matches!(out, ApplyOutcome::Pending { .. }));
+        let p = store::get_pending(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(p.requested_generation, 2);
+        assert_eq!(p.attempt_count, 1, "bookkeeping reset on the real advance");
+        drop(hold);
+
+        // §9-5 manual path: Excel closed → the SAME apply command succeeds and
+        // writes the newest generation only.
+        let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
+        let ApplyOutcome::Applied { generation, .. } = out else {
+            panic!("expected Applied, got {out:?}");
+        };
+        assert_eq!(generation, 2);
+        let xml = sheet_xml_of(&path, "Sheet1");
+        assert!(xml.contains("<v>120</v>"), "newest value only: {xml}");
+        assert!(!xml.contains("<v>115</v>"), "{xml}");
+        assert!(store::get_pending(&conn, &bom_id).unwrap().is_none());
+        assert!(status(&conn, &bom_id).unwrap().pending.is_none());
+    }
+
+    /// §9-25 / §4.6.2 手順1〜5: an external edit blocks the write (no auto-merge),
+    /// the reload is a separate explicit step, and the retry regenerates from the
+    /// CURRENT rows.
+    #[test]
+    fn external_change_blocks_write_until_reload() {
+        let path = temp_xlsx(
+            "s25.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]);
+
+        // External edit: a row was ADDED since our last read.
+        temp_xlsx(
+            "s25.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""], &["TEST-PART-001", "5", ""]],
+        );
+        let external = fp_hex(&path);
+        let bk = apply_bk("s25");
+        let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
+        assert!(matches!(
+            out,
+            ApplyOutcome::Refused {
+                reason: RefuseReason::FingerprintChanged,
+                ..
+            }
+        ));
+        assert_eq!(fp_hex(&path), external, "no auto-merge, file untouched");
+
+        // Reload (open) then retry: both CURRENT rows get the value (§4.5 再生成).
+        open_link(&mut conn, &bom_id, &test_bk()).unwrap();
+        let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
+        assert!(matches!(out, ApplyOutcome::Applied { .. }), "{out:?}");
+        let xml = sheet_xml_of(&path, "Sheet1");
+        assert!(xml.contains(r#"<c r="C2"><v>115</v></c>"#), "{xml}");
+        assert!(xml.contains(r#"<c r="C3"><v>115</v></c>"#), "{xml}");
+    }
+
+    /// 3rd-review #1: the lock hint must probe the STORED resolved path — no env
+    /// re-resolution (check_env is far too heavy under the DB mutex for polling).
+    #[test]
+    fn status_lock_hint_uses_stored_resolved_path() {
+        let path = temp_xlsx(
+            "status-resolved.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+
+        // Point the stored resolved path at a DIFFERENT directory: the hint must
+        // probe there, not beside workbook_path.
+        let other = std::env::temp_dir().join("mbm-status-resolved-target");
+        let _ = std::fs::remove_dir_all(&other);
+        std::fs::create_dir_all(&other).unwrap();
+        let target = other.join("real.xlsx");
+        std::fs::write(&target, b"x").unwrap();
+        conn.execute(
+            "UPDATE bom_link SET env_resolved_path = ?2 WHERE bom_id = ?1",
+            rusqlite::params![bom_id, target.to_string_lossy()],
+        )
+        .unwrap();
+
+        // An owner file beside the WORKBOOK path must not count...
+        let local_owner = path.parent().unwrap().join("~$status-resolved.xlsx");
+        std::fs::write(&local_owner, b"lock").unwrap();
+        assert!(
+            !status(&conn, &bom_id).unwrap().excel_lock_hint,
+            "must probe the resolved path, not workbook_path"
+        );
+        std::fs::remove_file(&local_owner).unwrap();
+        // ...while one beside the RESOLVED target does.
+        std::fs::write(other.join("~$real.xlsx"), b"lock").unwrap();
+        assert!(status(&conn, &bom_id).unwrap().excel_lock_hint);
+
+        // A .lnk workbook path WITHOUT a stored resolved path cannot be probed
+        // cheaply — the hint reads false (open/apply stay the authority).
+        conn.execute(
+            "UPDATE bom_link SET env_resolved_path = NULL, workbook_path = ?2 WHERE bom_id = ?1",
+            rusqlite::params![bom_id, "C:/nowhere/link.lnk"],
+        )
+        .unwrap();
+        assert!(!status(&conn, &bom_id).unwrap().excel_lock_hint);
+    }
+
+    /// Confirm fixture with a SKIPPED column relabel — the anomaly that offers
+    /// mutually exclusive alternatives (KeepSkipped vs ImportSkippedAsUser).
+    fn skipped_relabel_fixture(
+        conn: &mut Connection,
+        name: &str,
+        headers2: &[&str],
+    ) -> (String, Vec<LinkResolutionCandidate>, String) {
+        let path = temp_xlsx(
+            name,
+            &["型番", "数量", "EC単価", "備考"],
+            &[&["TEST-PART-001", "2", "", "m"]],
+        );
+        let mut cfg = config(&path);
+        cfg.columns.push(LinkColumnConfig {
+            excel_col: 3,
+            header_label: Some("備考".into()),
+            app_key: None,
+            ownership: LinkOwnership::Skipped,
+            required: false,
+            role: None,
+            source_field: None,
+            projection: None,
+        });
+        let view = create_link(conn, &cfg).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        temp_xlsx(name, headers2, &[&["TEST-PART-001", "2", "", "m"]]);
+        let view = open_link(conn, &bom_id, &test_bk()).unwrap();
+        let crate::model::StructureVerdict::Confirm {
+            candidates,
+            structure_fp,
+            ..
+        } = view.verdict
+        else {
+            panic!("expected Confirm, got {:?}", view.verdict);
+        };
+        (bom_id, candidates, structure_fp)
+    }
+
+    /// 3rd-review #2: exclusive alternatives for one column, duplicates and an
+    /// empty selection are all refused — application order must never decide.
+    #[test]
+    fn confirm_rejects_exclusive_duplicate_and_empty_selections() {
+        let mut conn = mem();
+        let (bom_id, candidates, structure_fp) = skipped_relabel_fixture(
+            &mut conn,
+            "confirm-excl.xlsx",
+            &["型番", "数量", "EC単価", "備考2"],
+        );
+        let keep = candidates
+            .iter()
+            .find(|c| matches!(c, LinkResolutionCandidate::KeepSkipped { .. }))
+            .cloned()
+            .unwrap();
+        let import = candidates
+            .iter()
+            .find(|c| matches!(c, LinkResolutionCandidate::ImportSkippedAsUser { .. }))
+            .cloned()
+            .unwrap();
+
+        // Both exclusive alternatives at once → refused.
+        let err = expect_err(confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp: structure_fp.clone(),
+                accepted: vec![keep.clone(), import],
+            },
+            &test_bk(),
+        ));
+        assert!(err.contains("排他的な候補"), "{err}");
+        // The same candidate twice → refused.
+        let err = expect_err(confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp: structure_fp.clone(),
+                accepted: vec![keep.clone(), keep.clone()],
+            },
+            &test_bk(),
+        ));
+        assert!(err.contains("重複"), "{err}");
+        // Nothing selected → refused (a no-op re-save is not a confirmation).
+        let err = expect_err(confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp: structure_fp.clone(),
+                accepted: vec![],
+            },
+            &test_bk(),
+        ));
+        assert!(err.contains("指定されていません"), "{err}");
+        // Contract untouched by all three refusals.
+        let rec = store::get_link(&conn, &bom_id).unwrap().unwrap();
+        assert!(rec
+            .columns
+            .iter()
+            .any(|c| c.header_label.as_deref() == Some("備考")));
+
+        // A single unambiguous choice still works.
+        let view = confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp,
+                accepted: vec![keep],
+            },
+            &test_bk(),
+        )
+        .unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
+        let rec = store::get_link(&conn, &bom_id).unwrap().unwrap();
+        assert!(rec
+            .columns
+            .iter()
+            .any(|c| c.header_label.as_deref() == Some("備考2")));
+    }
+
+    /// Partial resolution is allowed BY DESIGN: confirming one of two anomalies
+    /// commits it and honestly reports the remainder as a fresh Confirm verdict;
+    /// a second confirm with the re-echoed fingerprint finishes the job.
+    #[test]
+    fn confirm_partial_resolution_reports_remaining_anomalies() {
+        let mut conn = mem();
+        // TWO anomalies at once: 数量→数 (rename) + 備考→備考2 (skipped relabel).
+        let (bom_id, candidates, structure_fp) = skipped_relabel_fixture(
+            &mut conn,
+            "confirm-partial.xlsx",
+            &["型番", "数", "EC単価", "備考2"],
+        );
+        let rename: Vec<_> = candidates
+            .iter()
+            .filter(|c| matches!(c, LinkResolutionCandidate::AdoptRename { .. }))
+            .cloned()
+            .collect();
+        assert!(!rename.is_empty(), "{candidates:?}");
+
+        // Confirm only the rename: committed, but the view honestly stays
+        // NeedsReview with the remaining skipped-relabel candidates.
+        let view = confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp,
+                accepted: rename,
+            },
+            &test_bk(),
+        )
+        .unwrap();
+        assert_eq!(view.sync_status, SyncStatus::NeedsReview);
+        let crate::model::StructureVerdict::Confirm {
+            candidates,
+            structure_fp,
+            ..
+        } = view.verdict
+        else {
+            panic!("expected remaining Confirm, got {:?}", view.verdict);
+        };
+        let keep = candidates
+            .iter()
+            .find(|c| matches!(c, LinkResolutionCandidate::KeepSkipped { .. }))
+            .cloned()
+            .unwrap();
+
+        // Second confirm with the RE-ECHOED fingerprint finishes the resolution.
+        let view = confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp,
+                accepted: vec![keep],
+            },
+            &test_bk(),
+        )
+        .unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
     }
 }

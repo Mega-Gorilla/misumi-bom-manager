@@ -52,6 +52,7 @@ pub struct LinkColumn {
 }
 
 /// `bom_link` row as stored.
+#[derive(Clone)]
 pub struct LinkHeader {
     pub bom_id: String,
     pub workbook_path: String,
@@ -237,6 +238,23 @@ pub fn replace_columns(
 }
 
 // ---- volatile state (bom_link_state) ------------------------------------------------
+/// Update the contract HEADER coordinates (sheet name / header row / data start).
+/// Only the confirm flow may call this (AdoptSheetRename / AdoptHeaderRowMove) and
+/// it always travels with a replace_columns in the SAME transaction — hence the
+/// Transaction-typed parameter.
+pub fn update_link_header(
+    tx: &rusqlite::Transaction,
+    bom_id: &str,
+    sheet_name: &str,
+    header_row: i64,
+    data_start_row: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE bom_link SET sheet_name = ?2, header_row = ?3, data_start_row = ?4,          updated_at = datetime('now', 'localtime') WHERE bom_id = ?1",
+        params![bom_id, sheet_name, header_row, data_start_row],
+    )?;
+    Ok(())
+}
 
 /// `bom_link_state` row (minus bom_id).
 #[derive(Clone, PartialEq, Debug)]
@@ -727,10 +745,32 @@ pub fn list_backups(conn: &Connection, origin_bom_id: &str) -> rusqlite::Result<
 pub fn unresolved_conflicts(conn: &Connection) -> rusqlite::Result<Vec<BackupRecord>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {BACKUP_COLS} FROM bom_link_backup \
-         WHERE is_conflict = 1 AND resolved_at IS NULL ORDER BY created_at DESC, id DESC"
+         WHERE is_conflict = 1 AND resolved_at IS NULL AND deleted_at IS NULL ORDER BY created_at DESC, id DESC"
     ))?;
     let it = stmt.query_map([], map_backup)?;
     it.collect()
+}
+
+/// Unresolved conflicts of ONE BOM, oldest first — the status/resolve surface.
+/// Same predicate as has_unresolved_conflict (deleted rows excluded).
+pub fn unresolved_conflicts_for(
+    conn: &Connection,
+    origin_bom_id: &str,
+) -> rusqlite::Result<Vec<BackupRecord>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BACKUP_COLS} FROM bom_link_backup          WHERE origin_bom_id = ?1 AND is_conflict = 1 AND resolved_at IS NULL            AND deleted_at IS NULL ORDER BY id"
+    ))?;
+    let it = stmt.query_map([origin_bom_id], map_backup)?;
+    it.collect()
+}
+
+/// One ledger row by id (resolve_conflict validates ownership/state against it).
+pub fn get_backup(conn: &Connection, id: i64) -> rusqlite::Result<Option<BackupRecord>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BACKUP_COLS} FROM bom_link_backup WHERE id = ?1"
+    ))?;
+    let mut it = stmt.query_map([id], map_backup)?;
+    it.next().transpose()
 }
 
 /// Step 6 of the transfer: the file now lives in app data under `new_path`.

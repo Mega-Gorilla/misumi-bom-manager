@@ -440,6 +440,9 @@ pub struct LinkedBomView {
     pub formula_cells: Vec<FormulaCell>,
     pub truncated: bool,
     pub warnings: Vec<String>,
+    /// Live pending row (§4.2.1) — Some = a "反映待ち" is outstanding for this BOM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingInfo>,
 }
 
 /// One mapped contract column as the frontend needs it (bom_link_column projection).
@@ -510,10 +513,19 @@ pub enum ApplyOutcome {
         warnings: Vec<String>,
     },
     /// Could not obtain the write handle (Excel has the file open) —
-    /// bom_link_pending is recorded (§4.2.1; retry orchestration is PR-5).
-    Pending { reason: String },
-    /// Nothing was written (fail closed) — the reason names the guard.
-    Refused { reason: RefuseReason },
+    /// bom_link_pending is recorded (§4.2.1; a later excel_link_apply retries).
+    /// `warnings` carries recovery/transfer notices from the pre-write phase.
+    Pending {
+        reason: String,
+        warnings: Vec<String>,
+    },
+    /// Nothing was written (fail closed) — the reason names the guard. `warnings`
+    /// carries recovery/transfer notices from the pre-write phase (a refused
+    /// apply may still have reconciled an interrupted write — PR-5).
+    Refused {
+        reason: RefuseReason,
+        warnings: Vec<String>,
+    },
     /// Replace happened but backup≠F0 (§4.2.2 step 8): sync stopped, the displaced
     /// external version is preserved in the backup.
     Conflict {
@@ -537,6 +549,79 @@ pub enum RefuseReason {
     FormulaCell,
     Truncated,
     NothingToWrite,
+}
+
+/// Lightweight link status (implementation.md §2.3: sync_status / calc_state /
+/// pending / unresolved conflicts). DB reads plus one file-EXISTENCE check only —
+/// excel_link_status must stay cheap enough to poll.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkStatus {
+    pub sync_status: SyncStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_error: Option<String>,
+    pub calc_state: CalcState,
+    pub ec_generation: i64,
+    pub applied_generation: i64,
+    /// Some = a 反映待ち is outstanding (§4.2.1; the row itself is the state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingInfo>,
+    /// Unresolved conflict backups of THIS BOM (§4.2.2 step 8 evidence).
+    pub conflicts: Vec<ConflictInfo>,
+    /// Backups still sitting beside the workbook (volume_temp) — a transfer that
+    /// failed once; retried on every open/apply (PR-4 review handover).
+    pub untransferred: i64,
+    /// A write journal survived reconciliation: apply/unlink/delete are refused
+    /// until a link open recovers it (V6).
+    pub recovery_pending: bool,
+    /// The `~$` owner file exists beside the workbook — Excel LIKELY has it open.
+    /// A hint only (§4.2.1): the authority stays the write-open attempt.
+    pub excel_lock_hint: bool,
+}
+
+/// bom_link_pending row as the frontend sees it (§4.2.1 latest-wins).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingInfo {
+    pub requested_generation: i64,
+    pub requested_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at: Option<String>,
+    pub attempt_count: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+/// One unresolved conflict backup (ledger projection for the status/resolve UI).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictInfo {
+    pub backup_id: i64,
+    pub backup_path: String,
+    pub created_at: String,
+    /// false = still volume_temp beside the workbook (transfer pending).
+    pub transferred: bool,
+}
+
+/// Input of excel_link_confirm: the accepted subset of the candidates a Confirm
+/// verdict offered, plus the structure fingerprint of the read those candidates
+/// were generated from (echo back — the freshness guard, implementation.md §2.3).
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkConfirmRequest {
+    pub structure_fp: String,
+    pub accepted: Vec<LinkResolutionCandidate>,
+}
+
+/// What excel_link_resolve_conflict does with the backup. An enum from day one so
+/// PR-6+ can add actions (e.g. restoring the external version) without changing
+/// the command shape; PR-5 records the user's resolution only.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub enum ConflictAction {
+    /// The user has seen/kept what they need: mark the conflict resolved and lift
+    /// the §1.3 sync stop.
+    Resolved,
 }
 
 /// Input of excel_link_create (the wizard's outcome).
