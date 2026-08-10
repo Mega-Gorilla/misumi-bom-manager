@@ -485,14 +485,42 @@ fn excel_link_apply(
     db: State<DbState>,
     bom_id: String,
 ) -> Result<model::ApplyOutcome, String> {
-    let backup_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("backups");
-    std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
+    let backup_dir = link_backup_dir(&app)?;
     let mut conn = db.0.lock().map_err(|e| e.to_string())?;
     excel_link::apply_link(&mut conn, &bom_id, &backup_dir)
+}
+
+/// Lightweight link status (§2.3): DB + one file-existence probe, poll-friendly.
+#[tauri::command]
+fn excel_link_status(db: State<DbState>, bom_id: String) -> Result<model::LinkStatus, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    excel_link::status(&conn, &bom_id)
+}
+
+/// Confirm-verdict resolution (§1.3 候補確定 → linked). Returns the refreshed view.
+#[tauri::command]
+fn excel_link_confirm(
+    app: AppHandle,
+    db: State<DbState>,
+    bom_id: String,
+    resolution: model::LinkConfirmRequest,
+) -> Result<model::LinkedBomView, String> {
+    let backup_dir = link_backup_dir(&app)?;
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    excel_link::confirm_link(&mut conn, &bom_id, &resolution, &backup_dir)
+}
+
+/// Record the user's conflict resolution (§1.3: lifts the conflict stop). Opening
+/// the backup folder is the frontend's job (PR-6, opener plugin).
+#[tauri::command]
+fn excel_link_resolve_conflict(
+    db: State<DbState>,
+    bom_id: String,
+    backup_id: i64,
+    action: model::ConflictAction,
+) -> Result<(), String> {
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    excel_link::resolve_conflict(&mut conn, &bom_id, backup_id, action)
 }
 
 // ---- Cart (MISUMI) — add BOM rows to the logged-in cart via the bridge ----
@@ -696,7 +724,10 @@ pub fn run() {
             excel_link_create,
             excel_link_open,
             excel_link_unlink,
-            excel_link_apply
+            excel_link_apply,
+            excel_link_status,
+            excel_link_confirm,
+            excel_link_resolve_conflict
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

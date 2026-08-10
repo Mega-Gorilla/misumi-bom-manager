@@ -283,6 +283,27 @@ excel_link/
 | `excel_link_status(bom_id)` | 軽量ステータス（sync_status・calc_state・pending・未解決競合） | `LinkStatus` |
 | `excel_link_confirm(bom_id, resolution)` | Confirm 判定の候補確定・再マッピング | `LinkedBomView` |
 | `excel_link_resolve_conflict(bom_id, backup_id, action)` | 競合の解決記録・フォルダを開く導線 | `()` |
+
+PR-5 実装の確定事項:
+
+- `LinkStatus`(PR-5 実装) = `{ sync_status, sync_error?, calc_state, ec_generation, applied_generation,
+  pending?: PendingInfo, conflicts: ConflictInfo[], untransferred: i64, recovery_pending: bool,
+  excel_lock_hint: bool }`。DB 読みと `~$` オーナーファイルの**存在チェック1回のみ**(§4.2.1:
+  予告であって権威ではない — 権威は write-open 試行)。`untransferred`/`recovery_pending` は
+  PR-4 レビュー引き継ぎ(移送失敗・復旧未完の可視化)
+- `PendingInfo` = `bom_link_pending` 行の写像 `{ requested_generation, requested_at,
+  last_attempt_at?, attempt_count, blocked_reason? }`。`LinkedBomView` にも `pending?` を追加
+- `excel_link_confirm` の入力 `LinkConfirmRequest = { structure_fp, accepted: LinkResolutionCandidate[] }`。
+  適用前に2つの fail closed ガード: **鮮度**(現在の verify の structure_fp と echo back の一致)+
+  **メンバーシップ**(accepted ⊆ 現在の verify が提示する候補 — contract.rs が提示を決める唯一の
+  場所という規定を入力側でも強制)。適用は header(sheet_name/header_row/data_start_row)+列を
+  1トランザクションで書き換え、最後に通常 open を実行して返す(Safe→Linked 復帰は open の一本道)
+- `ConflictAction` は `resolved` のみ(PR-6+ で restoreBackup 等を拡張し得る enum として導入)。
+  resolve は台帳検証(当該 BOM・is_conflict・未解決)→ `mark_resolved` + state 復帰
+  (未解決競合が尽き、かつ現 state が conflict の場合のみ linked へ。broken/needs_review は上書きしない)
+  を1トランザクションで実行。**フォルダを開く導線はフロント(PR-6・opener)の責務**
+- **再マッピング(Broken 修復・全列再指定)は PR-6**: Broken verdict は structure_fp を持たず
+  鮮度ガードが成立しないため、入力形はウィザード UI と同時に確定する
 | `excel_link_watch(bom_id, enable)` | 監視の開始/停止。検知は `emit("excel-link:changed")` → フロントが `excel_link_open` | `()` |
 
 - 「Excel で編集」はファイル起動のみ（§4.2）→ 既存 `tauri-plugin-opener` をフロント直用、専用コマンドなし
@@ -349,8 +370,12 @@ pub enum StructureVerdict {
 pub enum ApplyOutcome {
     Applied  { generation: i64, fingerprint: String, warnings: Vec<String> },
                                       // warnings = backup 移送/保持の非致命な後処理警告 (書き込み自体は成功)
-    Pending  { reason: String },      // "fileOpen" 等 → bom_link_pending 記録済み (§4.2.1)
-    Refused  { reason: RefuseReason },// 構造NG/指紋変化/スピル交差/5000行超/env降格 — 書かずに終了
+    Pending  { reason: String, warnings: Vec<String> },
+                                      // "fileOpen" 等 → bom_link_pending 記録済み (§4.2.1)
+    Refused  { reason: RefuseReason, warnings: Vec<String> },
+                                      // 構造NG/指紋変化/スピル交差/5000行超/env降格/未解決競合 — 書かずに終了。
+                                      // warnings は書き込み前フェーズ (journal 復旧・移送) の非致命警告
+                                      // (PR-4 レビュー引き継ぎの解消: 拒否経路でも復旧・移送警告が届く — PR-5)
     Conflict { backup_id: i64, backup_path: String, warnings: Vec<String> },  // backup≠F0 (§4.2.2)。同期停止済み
 }
 ```
