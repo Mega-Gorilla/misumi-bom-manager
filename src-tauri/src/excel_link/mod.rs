@@ -4639,7 +4639,12 @@ mod tests {
         let bom_id = view.doc.id.clone().unwrap();
 
         let (dir, name) = watch::watch_target(&conn, &bom_id).unwrap();
-        assert_eq!(dir, path.parent().unwrap());
+        // CI runners hand out 8.3 short paths (RUNNER~1) while the stored resolved
+        // path is canonical — compare canonicalized forms (PR-3 lesson).
+        assert_eq!(
+            std::fs::canonicalize(&dir).unwrap(),
+            std::fs::canonicalize(path.parent().unwrap()).unwrap()
+        );
         assert_eq!(name.to_string_lossy(), "watch-target.xlsx");
 
         // Not linked → Err.
