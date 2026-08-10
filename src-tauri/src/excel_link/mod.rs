@@ -757,7 +757,7 @@ pub fn apply_link(
 
     // Complete any interrupted previous write first: its outcome (fingerprints,
     // generation, a possible conflict) is the baseline this apply builds on.
-    let recovered = reconcile_write_journal(conn, bom_id);
+    let mut recovered = reconcile_write_journal(conn, bom_id);
 
     // A journal that SURVIVED reconcile is an unfinished replace we could not
     // recover — it is the only pointer to an unmanaged backup, and starting a
@@ -771,6 +771,12 @@ pub fn apply_link(
             recovered.join(" / ")
         ));
     }
+    // §4.2.2 transfer of anything the recovery (or an earlier failed attempt)
+    // left in volume_temp — BEFORE the conflict gate, so a conflict recovered by
+    // apply itself still gets its backup out of the workbook folder even though
+    // the apply is refused right below (4th review). The post-write sweep later
+    // covers the row THIS apply creates.
+    recovered.extend(backup::transfer_pending(conn, bom_id, backup_dir));
     // §1.3: an unresolved conflict stops sync — no further write until the user
     // resolves it (2nd review #1). Checked BEFORE any file access.
     if store::has_unresolved_conflict(conn, bom_id).map_err(|e| e.to_string())? {
@@ -2885,6 +2891,74 @@ mod tests {
         assert_eq!(view.sync_status, SyncStatus::Linked);
         let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
         assert!(matches!(out, ApplyOutcome::Applied { .. }), "{out:?}");
+    }
+
+    /// 4th review: when APPLY (not open) is the first call after an interrupted
+    /// conflict write, the recovered backup must still be transferred out of the
+    /// workbook folder even though the apply itself is refused by the conflict
+    /// gate — the transfer runs between reconcile and the gate.
+    #[cfg(windows)]
+    #[test]
+    fn apply_transfers_recovered_backup_even_when_refused() {
+        let path = temp_xlsx(
+            "recover-apply.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]);
+        let f0_hex = fp_hex(&path);
+
+        // Interrupted conflict write: journal → external F1 → replace → crash.
+        let mut zip = xlsx::open_zip(&path).unwrap();
+        let part = xlsx::sheet_part_for(&mut zip, "Sheet1").unwrap();
+        drop(zip);
+        let mut edits = std::collections::BTreeMap::new();
+        edits.insert("C2".to_string(), xlsx::CellValue::Number(115.0));
+        let dir = path.parent().unwrap();
+        let temp = dir.join(".recover-apply.mbm-temp-x.xlsx");
+        xlsx::write_patched(&path, &temp, &part, &edits, true).unwrap();
+        let new_hex = fp_hex(&temp);
+        let backup = dir.join("recover-apply.mbm-backup-x.xlsx");
+        store::insert_write_journal(
+            &conn,
+            &bom_id,
+            &store::WriteJournal {
+                backup_path: backup.to_string_lossy().into_owned(),
+                temp_path: temp.to_string_lossy().into_owned(),
+                f0_fp: f0_hex,
+                new_fp: new_hex,
+                generation: 1,
+            },
+        )
+        .unwrap();
+        temp_xlsx(
+            "recover-apply.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-009", "9", ""]],
+        );
+        writeback::replace_with_backup(&path, &temp, &backup).unwrap();
+        // -- crash; the NEXT call is apply, with no open in between --
+
+        let bk = apply_bk("recover-apply");
+        let out = apply_link(&mut conn, &bom_id, &bk).unwrap();
+        assert!(matches!(
+            out,
+            ApplyOutcome::Refused {
+                reason: RefuseReason::UnresolvedConflict
+            }
+        ));
+        // Refused — but the recovered backup was ledgered AND transferred.
+        assert!(store::get_write_journal(&conn, &bom_id).unwrap().is_none());
+        let backups = store::list_backups(&conn, &bom_id).unwrap();
+        assert_eq!(backups.len(), 1);
+        assert!(backups[0].is_conflict);
+        assert_eq!(backups[0].location, crate::model::BackupLocation::AppData);
+        assert!(Path::new(&backups[0].backup_path).starts_with(&bk));
+        assert!(Path::new(&backups[0].backup_path).exists());
+        assert!(!backup.exists(), "moved out of the workbook folder");
     }
 
     /// 2nd review #2: a journal that reconcile could NOT recover (here: the backup

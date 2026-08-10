@@ -367,8 +367,9 @@ pub enum ApplyOutcome {
   apply・リンク解除・BOM 削除はいずれも fail closed で拒否**する(ジャーナルは bom_link への
   FK cascade で消えるため、復旧完了前の削除経路を Rust 側で全て塞ぐ。ジャーナルは不変のまま
   次回再試行)。**§4.2.2 の移送は open のたびに当該 BOM の未移送 volume_temp 行へ全件実行**
-  (ジャーナル・競合状態と独立。一過性の移送失敗は次回 open で再試行される)。apply も成功経路で
-  同じ全件掃き出しを行う
+  (ジャーナル・競合状態と独立。一過性の移送失敗は次回 open で再試行される)。apply も
+  **reconcile 直後(競合ゲートより前)**と成功経路の両方で同じ全件掃き出しを行う —
+  open を挟まず apply が競合を復旧して Refused になる経路でも移送は完遂する
 - **競合ゲート(§1.3 の固定)**: 未解決競合 backup(`is_conflict=1 AND resolved_at IS NULL`)が
   存在する間、open は読み取りを継続しつつ `sync_status=conflict` を維持し(Safe 再読込でも
   Linked へ自動復元しない)、apply はファイルに触れる前に `Refused(unresolved_conflict)` で
