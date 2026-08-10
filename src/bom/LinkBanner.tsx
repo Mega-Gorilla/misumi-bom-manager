@@ -2,6 +2,7 @@
 // sync/calc バッジ・反映待ち・競合/要確認/破綻の導線・環境降格・同時編集非対応の
 // 常設インジケータ・stale/missing の業務利用不可警告 (§9-9) をまとめて表示する。
 
+import { useEffect, useState } from "react";
 import { AlertTriangle, FolderOpen, Info, Link2, RefreshCw, Users } from "lucide-react";
 import type {
   CalcState,
@@ -34,6 +35,9 @@ interface Props {
   /** ポーリング中の軽量ステータス (無ければ view 由来の値のみで表示)。 */
   status?: LinkStatus;
   warnings: string[];
+  /** §4.8: リンク BOM でも編集可な DB 所有メタ (小計・カート数量に効く)。 */
+  qtyMultiplier: number;
+  onQtyMultiplier: (mult: number) => void;
   onOpenConfirm: () => void;
   onOpenConflict: () => void;
   onRemap: () => void;
@@ -51,6 +55,15 @@ export function LinkBanner(p: Props) {
   const usable = calcUsable(p.calcState);
   const excelOpenHint = p.status?.excelLockHint ?? false;
   const recovery = p.status?.recoveryPending ?? false;
+  const untransferred = p.status?.untransferred ?? 0;
+  // 倍率はローカル編集 → blur/Enter で確定 (毎キーストローク保存を避ける)。
+  const [multText, setMultText] = useState(String(p.qtyMultiplier));
+  useEffect(() => setMultText(String(p.qtyMultiplier)), [p.qtyMultiplier]);
+  const commitMult = () => {
+    const m = Number(multText);
+    if (Number.isFinite(m) && m > 0 && m !== p.qtyMultiplier) p.onQtyMultiplier(m);
+    else setMultText(String(p.qtyMultiplier));
+  };
   return (
     <div className="link-banner">
       <span className="lb-badge lb-link" title="Excel リンク BOM（編集は Excel に集約）">
@@ -86,6 +99,26 @@ export function LinkBanner(p: Props) {
           Excel 使用中?
         </span>
       )}
+      {untransferred > 0 && (
+        <span
+          className="lb-badge lb-warn"
+          title="ワークブックと同じフォルダに退避したままのバックアップがあります。次回の「更新」「Excel へ反映」で自動的にアプリ領域へ移送を再試行します"
+        >
+          未移送バックアップ {untransferred}
+        </span>
+      )}
+      <label className="lb-mult" title="数量倍率（小計・カート投入数量に掛かります。リンク BOM でも編集できる設定です）">
+        倍率 ×
+        <input
+          value={multText}
+          onChange={(e) => setMultText(e.currentTarget.value)}
+          onBlur={commitMult}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.currentTarget.blur();
+            if (e.key === "Escape") setMultText(String(p.qtyMultiplier));
+          }}
+        />
+      </label>
 
       <span className="lb-msgs">
         {!usable && (

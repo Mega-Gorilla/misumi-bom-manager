@@ -55,6 +55,13 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter, onActiveRowChan
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const columnDefs = useMemo(() => buildColumnDefs(doc, link), [doc.columns, link]);
 
+  // 数量倍率は supplier 列の valueGetter が context から読む — 変更時は再評価を強制
+  // (rowData が変わらないため AG Grid は自動では再計算しない)。
+  useEffect(() => {
+    if (!api) return;
+    requestAnimationFrame(() => api.refreshCells({ force: true }));
+  }, [api, doc.meta.qtyMultiplier]);
+
   const onCellValueChanged = useCallback(
     (e: CellValueChangedEvent<BomRow>) => {
       // AG Grid has already mutated e.data via field / valueSetter; reflect it

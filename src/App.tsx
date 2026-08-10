@@ -246,9 +246,26 @@ export default function App() {
   const linkWorkbookPath = (): string | undefined =>
     link?.env.readTarget ?? link?.env.resolvedPath ?? doc?.meta.importedFrom ?? undefined;
 
+  /** 未保存のメタ編集 (名前・数量倍率) を確定してから再読込系操作へ進む。
+   *  adoptLinkView は DB 由来の doc で全置換するため、ここで保存しないと編集が
+   *  消える (レビュー #2)。失敗時は false を返し、呼び出し側は操作を中止する。 */
+  const flushLinkedMeta = async (): Promise<boolean> => {
+    if (!link || !doc?.id) return true;
+    if (JSON.stringify(doc) === savedSnapRef.current) return true;
+    try {
+      await api.bomUpdateMeta(doc.id, doc.meta);
+      savedSnapRef.current = JSON.stringify(doc);
+      return true;
+    } catch (e) {
+      setStatus(`設定の保存に失敗しました: ${e}`);
+      return false;
+    }
+  };
+
   /** 「更新」= excel_link_open で再読込。 */
   const refreshLink = async () => {
     if (!doc?.id || linkBusy) return;
+    if (!(await flushLinkedMeta())) return;
     setLinkBusy(true);
     setStatus("Excel から再読込しています…");
     try {
@@ -265,6 +282,7 @@ export default function App() {
   /** 「Excel へ反映」= excel_link_apply。結果 kind ごとに UI を分岐 (§2.3)。 */
   const applyLink = async () => {
     if (!doc?.id || linkBusy) return;
+    if (!(await flushLinkedMeta())) return;
     setLinkBusy(true);
     setStatus("Excel へ反映しています…");
     try {
@@ -302,6 +320,20 @@ export default function App() {
     }
   };
 
+  /** 数量倍率の変更 (§4.8: リンク BOM でも編集可な DB 所有メタ)。即時永続化。 */
+  const setLinkMultiplier = async (mult: number) => {
+    if (!doc?.id || !Number.isFinite(mult) || mult <= 0) return;
+    const next = { ...doc, meta: { ...doc.meta, qtyMultiplier: mult } };
+    setDoc(next);
+    try {
+      await api.bomUpdateMeta(doc.id, next.meta);
+      savedSnapRef.current = JSON.stringify(next);
+      setStatus(`数量倍率を ×${mult} に変更しました`);
+    } catch (e) {
+      setStatus(String(e));
+    }
+  };
+
   /** 「Excel で編集」= ファイル起動のみ (ロックも受け渡しも無い・§9-6)。 */
   const editInExcel = async () => {
     const path = linkWorkbookPath();
@@ -318,6 +350,7 @@ export default function App() {
 
   const unlinkBom = async () => {
     if (!doc?.id) return;
+    if (!(await flushLinkedMeta())) return;
     if (
       !window.confirm(
         "リンクを解除しますか？\n現在の表示内容は従来 BOM として残ります（Excel との同期は停止します）。",
@@ -337,6 +370,7 @@ export default function App() {
   /** Confirm 候補の確定 (部分確定可 — 残異常は返却 view の Confirm verdict に残る)。 */
   const confirmLinkCandidates = async (accepted: Parameters<typeof api.excelLinkConfirm>[1]["accepted"]) => {
     if (!doc?.id || link?.verdict.kind !== "confirm") return;
+    if (!(await flushLinkedMeta())) return;
     setLinkBusy(true);
     try {
       const view = await api.excelLinkConfirm(doc.id, {
@@ -355,6 +389,7 @@ export default function App() {
 
   const resolveLinkConflict = async (backupId: number) => {
     if (!doc?.id) return;
+    if (!(await flushLinkedMeta())) return;
     setLinkBusy(true);
     try {
       await api.excelLinkResolveConflict(doc.id, backupId);
@@ -393,6 +428,7 @@ export default function App() {
 
   /** 再マッピング (Broken 修復・要確認からの再指定)。既存契約の列を初期値に。 */
   const startLinkRemap = async () => {
+    if (!(await flushLinkedMeta())) return;
     const path = linkWorkbookPath();
     if (!doc?.id || !path) {
       setStatus("ワークブックのパスを解決できません（リンクを解除して作り直してください）");
@@ -577,6 +613,8 @@ export default function App() {
       if (link && doc.id) {
         // リンク BOM: 採用スナップショット (DB 正本) に取り込まれるので、再 open で
         // 合成済み表示に統一する (§2.3)。失敗行は「前回値・手動値の可能性あり」(§0)。
+        // 未保存のメタ編集は再 open で消えるため先に確定 (レビュー #2)。
+        if (!(await flushLinkedMeta())) return;
         const { results, generation, failed } = await api.quote("MISUMI", items, force, doc.id);
         const view = await api.excelLinkOpen(doc.id);
         adoptLinkView(view);
@@ -807,11 +845,12 @@ export default function App() {
   // Leaving the editor with unsaved changes prompts 保存/破棄/キャンセル (Windows convention).
   const back = () => {
     if (link) {
-      // リンク BOM はグリッド編集不可 — 変わり得るのはメタ (名前) だけなので黙って永続化。
-      if (doc?.id && JSON.stringify(doc) !== savedSnapRef.current) {
-        void api.bomUpdateMeta(doc.id, doc.meta).catch(() => {});
-      }
-      void doBack();
+      // リンク BOM はグリッド編集不可 — 未保存はメタ (名前・倍率) のみ。保存を
+      // await し、失敗したら一覧へ戻らずエラーを表示する (レビュー #2)。
+      void (async () => {
+        if (!(await flushLinkedMeta())) return;
+        await doBack();
+      })();
       return;
     }
     if (doc && JSON.stringify(doc) !== savedSnapRef.current) {
@@ -992,6 +1031,8 @@ export default function App() {
               pending={link.pending}
               status={link.status}
               warnings={link.warnings}
+              qtyMultiplier={doc.meta.qtyMultiplier ?? 1}
+              onQtyMultiplier={(m) => void setLinkMultiplier(m)}
               onOpenConfirm={() => setLinkConfirmOpen(true)}
               onOpenConflict={() => setLinkConflictOpen(true)}
               onRemap={() => void startLinkRemap()}
@@ -1138,6 +1179,9 @@ export default function App() {
       )}
       {linkConfirmOpen && link?.verdict.kind === "confirm" && (
         <LinkConfirmDialog
+          // 部分確定で verdict が変わったら選択状態ごと remount する (レビュー #1:
+          // 旧 index が新候補配列へ適用される誤選択を防ぐ)。
+          key={link.verdict.structureFp}
           verdict={link.verdict}
           busy={linkBusy}
           onConfirm={(accepted) => void confirmLinkCandidates(accepted)}
