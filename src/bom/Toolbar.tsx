@@ -19,6 +19,9 @@ import {
   Check,
   Pencil,
   ShoppingCart,
+  FileSpreadsheet,
+  Upload,
+  Link2Off,
 } from "lucide-react";
 
 interface Props {
@@ -44,6 +47,17 @@ interface Props {
   quoting: boolean;
   onAddToCart: () => void;
   addingCart: boolean;
+  /** Excel リンクモード (§4.8): 編集系を無効化し、Excel で編集/更新/反映/解除の導線に置き換える。 */
+  link?: {
+    onEditInExcel: () => void;
+    onRefresh: () => void;
+    onApply: () => void;
+    onUnlink: () => void;
+    refreshing: boolean;
+    applying: boolean;
+    /** §9-9: stale/missing 中は EC 取得・カート投入を止める。 */
+    calcUsable: boolean;
+  };
 }
 
 const ICON = 16;
@@ -155,6 +169,9 @@ export function Toolbar(p: Props) {
     fn();
   };
 
+  // §9-9: stale/missing の値 (型番・数量・小計…) を EC 取得・カート投入に使わない。
+  const ecBlocked = !!p.link && !p.link.calcUsable;
+
   return (
     <div className="topbar" ref={barRef}>
       {/* ---- row 1: menu bar + document title (Windows-app style) ---- */}
@@ -165,12 +182,44 @@ export function Toolbar(p: Props) {
 
         <div className="menubar">
           <TopMenu label="ファイル" menuKey="file" open={openMenu} setOpen={setOpenMenu}>
-            <MenuItem
-              icon={<Save size={MENU_ICON} />}
-              label="保存"
-              hint="Ctrl+S"
-              onClick={run(p.onSave)}
-            />
+            {!p.link && (
+              <MenuItem
+                icon={<Save size={MENU_ICON} />}
+                label="保存"
+                hint="Ctrl+S"
+                onClick={run(p.onSave)}
+              />
+            )}
+            {p.link && (
+              <>
+                <MenuItem
+                  icon={<FileSpreadsheet size={MENU_ICON} />}
+                  label="Excel で編集"
+                  hint="起動のみ・ロックしない"
+                  onClick={run(p.link.onEditInExcel)}
+                />
+                <MenuItem
+                  icon={<RefreshCw size={MENU_ICON} />}
+                  label="更新（Excel から再読込）"
+                  disabled={p.link.refreshing}
+                  onClick={run(p.link.onRefresh)}
+                />
+                <MenuItem
+                  icon={<Upload size={MENU_ICON} />}
+                  label="Excel へ反映"
+                  hint="EC 取得値を書き込み"
+                  disabled={p.link.applying}
+                  onClick={run(p.link.onApply)}
+                />
+                <div className="menu-sep" />
+                <MenuItem
+                  icon={<Link2Off size={MENU_ICON} />}
+                  label="リンクを解除"
+                  hint="従来 BOM 化"
+                  onClick={run(p.link.onUnlink)}
+                />
+              </>
+            )}
             <MenuItem
               icon={<Pencil size={MENU_ICON} />}
               label="名前を変更"
@@ -179,11 +228,13 @@ export function Toolbar(p: Props) {
                 titleRef.current?.select();
               })}
             />
-            <MenuItem
-              icon={<Download size={MENU_ICON} />}
-              label="書き出し（Excel / CSV）"
-              onClick={run(p.onExport)}
-            />
+            {!p.link && (
+              <MenuItem
+                icon={<Download size={MENU_ICON} />}
+                label="書き出し（Excel / CSV）"
+                onClick={run(p.onExport)}
+              />
+            )}
             <div className="menu-sep" />
             <MenuItem
               icon={<ArrowLeft size={MENU_ICON} />}
@@ -193,16 +244,29 @@ export function Toolbar(p: Props) {
           </TopMenu>
 
           <TopMenu label="編集" menuKey="edit" open={openMenu} setOpen={setOpenMenu}>
-            <MenuItem icon={<Plus size={MENU_ICON} />} label="行追加" onClick={run(p.onAddRow)} />
-            <MenuItem icon={<Copy size={MENU_ICON} />} label="複製" onClick={run(p.onDupRows)} />
+            {/* §9-3: リンク BOM は編集を全無効化 (編集は Excel に集約・§4.8)。 */}
+            <MenuItem
+              icon={<Plus size={MENU_ICON} />}
+              label="行追加"
+              disabled={!!p.link}
+              onClick={run(p.onAddRow)}
+            />
+            <MenuItem
+              icon={<Copy size={MENU_ICON} />}
+              label="複製"
+              disabled={!!p.link}
+              onClick={run(p.onDupRows)}
+            />
             <MenuItem
               icon={<Trash2 size={MENU_ICON} />}
               label="行削除"
+              disabled={!!p.link}
               onClick={run(p.onDelRows)}
             />
             <MenuItem
               icon={<ListOrdered size={MENU_ICON} />}
               label="No. を振り直し"
+              disabled={!!p.link}
               onClick={run(p.onRenumber)}
             />
             <div className="menu-sep" />
@@ -210,12 +274,14 @@ export function Toolbar(p: Props) {
               icon={<Undo2 size={MENU_ICON} />}
               label="元に戻す"
               hint="Ctrl+Z"
+              disabled={!!p.link}
               onClick={run(p.onUndo)}
             />
             <MenuItem
               icon={<Redo2 size={MENU_ICON} />}
               label="やり直し"
               hint="Ctrl+Y"
+              disabled={!!p.link}
               onClick={run(p.onRedo)}
             />
           </TopMenu>
@@ -224,6 +290,8 @@ export function Toolbar(p: Props) {
             <MenuItem
               icon={<Columns3 size={MENU_ICON} />}
               label="列管理"
+              hint={p.link ? "リンク BOM は再マッピングで変更" : undefined}
+              disabled={!!p.link}
               onClick={run(p.onManageColumns)}
             />
             <MenuItem
@@ -244,23 +312,23 @@ export function Toolbar(p: Props) {
             <MenuItem
               icon={<DownloadCloud size={MENU_ICON} />}
               label="MISUMI 一括取得"
-              hint="本日取得済みはキャッシュ"
-              disabled={p.quoting}
+              hint={ecBlocked ? "未再計算のため不可" : "本日取得済みはキャッシュ"}
+              disabled={p.quoting || ecBlocked}
               onClick={run(() => p.onQuote(false))}
             />
             <MenuItem
               icon={<RefreshCw size={MENU_ICON} />}
               label="最新化（強制再取得）"
-              hint="キャッシュ無視"
-              disabled={p.quoting}
+              hint={ecBlocked ? "未再計算のため不可" : "キャッシュ無視"}
+              disabled={p.quoting || ecBlocked}
               onClick={run(() => p.onQuote(true))}
             />
             <div className="menu-sep" />
             <MenuItem
               icon={<ShoppingCart size={MENU_ICON} />}
               label="カートに追加（MISUMI）"
-              hint="要ログイン"
-              disabled={p.addingCart}
+              hint={ecBlocked ? "未再計算のため不可" : "要ログイン"}
+              disabled={p.addingCart || ecBlocked}
               onClick={run(p.onAddToCart)}
             />
           </TopMenu>
@@ -285,44 +353,79 @@ export function Toolbar(p: Props) {
 
       {/* ---- row 2: command bar (high-frequency actions + search) ---- */}
       <div className="actionbar">
-        <button className="icon-btn" onClick={p.onUndo} title="元に戻す (Ctrl+Z)">
-          <Undo2 size={ICON} />
-        </button>
-        <button className="icon-btn" onClick={p.onRedo} title="やり直し (Ctrl+Y)">
-          <Redo2 size={ICON} />
-        </button>
+        {!p.link && (
+          <>
+            <button className="icon-btn" onClick={p.onUndo} title="元に戻す (Ctrl+Z)">
+              <Undo2 size={ICON} />
+            </button>
+            <button className="icon-btn" onClick={p.onRedo} title="やり直し (Ctrl+Y)">
+              <Redo2 size={ICON} />
+            </button>
 
-        <span className="sep" />
-        <button onClick={p.onAddRow} title="末尾に行を追加">
-          <Plus size={ICON} /> 行追加
-        </button>
-        <button className="icon-btn" onClick={p.onDupRows} title="選択行を複製">
-          <Copy size={ICON} />
-        </button>
-        <button className="icon-btn" onClick={p.onDelRows} title="選択行を削除">
-          <Trash2 size={ICON} />
-        </button>
+            <span className="sep" />
+            <button onClick={p.onAddRow} title="末尾に行を追加">
+              <Plus size={ICON} /> 行追加
+            </button>
+            <button className="icon-btn" onClick={p.onDupRows} title="選択行を複製">
+              <Copy size={ICON} />
+            </button>
+            <button className="icon-btn" onClick={p.onDelRows} title="選択行を削除">
+              <Trash2 size={ICON} />
+            </button>
 
-        <span className="sep" />
+            <span className="sep" />
+          </>
+        )}
+        {p.link && (
+          <>
+            <button onClick={p.link.onEditInExcel} title="Excel でファイルを開くだけ（ロックも受け渡しも無い・§9-6）">
+              <FileSpreadsheet size={ICON} /> Excel で編集
+            </button>
+            <button
+              onClick={p.link.onRefresh}
+              disabled={p.link.refreshing}
+              title="Excel から再読込 → 構造検証 → 再合成"
+            >
+              <RefreshCw size={ICON} /> 更新
+            </button>
+            <button
+              onClick={p.link.onApply}
+              disabled={p.link.applying}
+              title="EC 取得値をアプリ所有列へ書き込み（Excel が開いていれば反映待ち）"
+            >
+              <Upload size={ICON} /> Excel へ反映
+            </button>
+
+            <span className="sep" />
+          </>
+        )}
         <button
           onClick={() => p.onQuote(false)}
-          disabled={p.quoting}
-          title="ORDER=MISUMI の行を取得（本日取得済みはキャッシュを使用。日付が変わった型番・未取得のみ再取得）"
+          disabled={p.quoting || ecBlocked}
+          title={
+            ecBlocked
+              ? "未再計算（stale/missing）の値は EC 取得に使えません。Excel で再計算・保存後に「更新」してください"
+              : "ORDER=MISUMI の行を取得（本日取得済みはキャッシュを使用。日付が変わった型番・未取得のみ再取得）"
+          }
         >
           <DownloadCloud size={ICON} /> MISUMI 一括取得
         </button>
         <button
           className="icon-btn"
           onClick={() => p.onQuote(true)}
-          disabled={p.quoting}
+          disabled={p.quoting || ecBlocked}
           title="最新化（キャッシュを無視して全件を再取得）"
         >
           <RefreshCw size={ICON} />
         </button>
         <button
           onClick={p.onAddToCart}
-          disabled={p.addingCart}
-          title="ORDER=MISUMI の行を MISUMI のカートにまとめて追加（要ログイン・注文ではなくカート投入）"
+          disabled={p.addingCart || ecBlocked}
+          title={
+            ecBlocked
+              ? "未再計算（stale/missing）の数量は使えません。Excel で再計算・保存後に「更新」してください"
+              : "ORDER=MISUMI の行を MISUMI のカートにまとめて追加（要ログイン・注文ではなくカート投入）"
+          }
         >
           <ShoppingCart size={ICON} /> カートに追加
         </button>

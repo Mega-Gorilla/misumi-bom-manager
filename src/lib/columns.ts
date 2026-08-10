@@ -11,12 +11,34 @@ import type {
 } from "ag-grid-community";
 import type { BomDoc, BomRow, ColumnDef } from "../types/bom";
 import { NUMERIC_CORE_KEYS, ORDER_OPTIONS, partNoColumn, sourceColumn } from "../types/bom";
+import type { FormulaCell, LinkColumnMeta } from "../types/link";
 
-export function buildColumnDefs(doc: BomDoc): ColDef<BomRow>[] {
+/** リンク BOM のグリッドオプション (§4.8: 全列読み取り専用+fx 表示)。 */
+export interface LinkGridOptions {
+  /** 数式セル (0-based 絶対座標・compose の行 ID "r{1-based行}" で対応付け)。 */
+  formulaCells: FormulaCell[];
+  /** excelCol → appKey の対応 (契約メタ)。 */
+  columnsMeta: LinkColumnMeta[];
+}
+
+/** "r{row1}:{colKey}" → 数式文字列 (無ければ空文字)。fx マーカーの索引。 */
+function fxIndex(link: LinkGridOptions): Map<string, string> {
+  const keyByCol = new Map(link.columnsMeta.map((m) => [m.excelCol, m.appKey]));
+  const fx = new Map<string, string>();
+  for (const f of link.formulaCells) {
+    const key = keyByCol.get(f.col);
+    if (!key) continue;
+    fx.set(`r${f.row + 1}:${key}`, f.formula ?? "");
+  }
+  return fx;
+}
+
+export function buildColumnDefs(doc: BomDoc, link?: LinkGridOptions): ColDef<BomRow>[] {
   // The source column (designated EC発注先 role) drives the ORDER gate; bake it into the
   // column defs so getters/cellClassRules use the right column even if it's re-designated.
   const sourceCol = sourceColumn(doc);
-  return doc.columns.map((c) => toColDef(c, sourceCol));
+  const fx = link ? fxIndex(link) : undefined;
+  return doc.columns.map((c) => toColDef(c, sourceCol, fx));
 }
 
 /** Apply linked-column write policies to all rows using the current supplier results.
@@ -228,12 +250,29 @@ export function pendingSuggestion(
   return { current, fetched };
 }
 
-function toColDef(c: ColumnDef, sourceCol?: ColumnDef): ColDef<BomRow> {
+/** fx マーカー (§9-8: 数式セルは値+fx 表示)。リンク BOM のみ。 */
+function fxExtras(c: ColumnDef, fx?: Map<string, string>): Partial<ColDef<BomRow>> {
+  if (!fx) return {};
+  return {
+    cellClassRules: {
+      "cell-fx": (p) => (p.data ? fx.has(`${p.data.id}:${c.key}`) : false),
+    },
+    tooltipValueGetter: (p) => {
+      const f = p.data ? fx.get(`${p.data.id}:${c.key}`) : undefined;
+      if (f === undefined) return "";
+      return f ? `fx: ${f} — Excel が保存した時点の計算結果` : "fx — Excel が保存した時点の計算結果";
+    },
+  };
+}
+
+function toColDef(c: ColumnDef, sourceCol?: ColumnDef, fx?: Map<string, string>): ColDef<BomRow> {
+  const linked = fx !== undefined;
   const base: ColDef<BomRow> = {
     colId: c.key,
     headerName: c.label,
     width: c.width,
-    editable: c.kind !== "supplier" && c.editable,
+    // §4.8/§9-3: リンク BOM は全列読み取り専用 (編集は Excel に集約)。
+    editable: !linked && c.kind !== "supplier" && c.editable,
   };
 
   if (c.kind === "custom") {
@@ -245,20 +284,29 @@ function toColDef(c: ColumnDef, sourceCol?: ColumnDef): ColDef<BomRow> {
         p.data.custom[c.key] = p.newValue == null ? "" : String(p.newValue);
         return true;
       },
-      ...linkExtras(c, sourceCol),
+      ...(linked ? fxExtras(c, fx) : linkExtras(c, sourceCol)),
     };
   }
 
   if (c.kind === "supplier") {
+    const fxx = fxExtras(c, fx);
     return {
       ...base,
       editable: false,
       valueGetter: (p: ValueGetterParams<BomRow>) =>
         supplierValue(p.data, c.link?.field, p.context?.qtyMultiplier ?? 1, sourceCol),
       cellClassRules: {
+        ...(fxx.cellClassRules as Record<string, never> | undefined),
         "cell-error": (p) =>
           supplierActive(p.data, sourceCol) && p.data?.supplier?.status === "error",
       },
+      // §0 決定 (リンク BOM): 取得失敗行は既存値を残して警告する。
+      tooltipValueGetter: linked
+        ? (p) =>
+            supplierActive(p.data, sourceCol) && p.data?.supplier?.status === "error"
+              ? "取得失敗 — 前回値・手動値の可能性あり (Excel には書き込まれません)"
+              : ((fxx.tooltipValueGetter as ((p2: unknown) => string) | undefined)?.(p) ?? "")
+        : undefined,
     };
   }
 
@@ -267,7 +315,7 @@ function toColDef(c: ColumnDef, sourceCol?: ColumnDef): ColDef<BomRow> {
   const core: ColDef<BomRow> = {
     ...base,
     field: c.key as keyof BomRow & string,
-    rowDrag: c.key === "no", // drag handle on the No. column for row reordering
+    rowDrag: !linked && c.key === "no", // drag handle on the No. column for row reordering
     pinned: c.key === "no" ? "left" : undefined, // keep No. visible while scrolling
     valueParser: numeric
       ? (p: ValueParserParams<BomRow>) => {
@@ -276,12 +324,12 @@ function toColDef(c: ColumnDef, sourceCol?: ColumnDef): ColDef<BomRow> {
         }
       : undefined,
   };
-  if (c.key === "order") {
+  if (!linked && c.key === "order") {
     // dropdown editor for the supplier/source (canonical values aid PR-C matching)
     core.cellEditor = "agSelectCellEditor";
     core.cellEditorParams = { values: ORDER_OPTIONS };
   }
-  return { ...core, ...linkExtras(c, sourceCol) };
+  return { ...core, ...(linked ? fxExtras(c, fx) : linkExtras(c, sourceCol)) };
 }
 
 /** The row's supplier result applies only while its ORDER still matches the supplier

@@ -6,12 +6,62 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import type { BomDoc, BomSummary, SupplierQuote, Workbook } from "../types/bom";
+import type { BomDoc, BomMeta, BomSummary, SupplierQuote, Workbook } from "../types/bom";
+import type {
+  ApplyOutcome,
+  ConflictAction,
+  LinkConfirmRequest,
+  LinkCreateConfig,
+  LinkProbe,
+  LinkRemapRequest,
+  LinkStatus,
+  LinkedBomView,
+} from "../types/link";
 
 export const bomList = (): Promise<BomSummary[]> => invoke("bom_list");
 export const bomLoad = (id: string): Promise<BomDoc | null> => invoke("bom_load", { id });
 export const bomSave = (doc: BomDoc): Promise<string> => invoke("bom_save", { doc });
 export const bomDelete = (id: string): Promise<void> => invoke("bom_delete", { id });
+/** Meta-only save (名前 / 数量倍率 / 注文番号区切り) — リンク BOM が使える唯一の保存経路。 */
+export const bomUpdateMeta = (id: string, meta: BomMeta): Promise<void> =>
+  invoke("bom_update_meta", { id, meta });
+
+// ---- Excel リンクモード (docs/plans/0018-excel-link-mode) ----
+
+/** リンクウィザードの下見: シート一覧・ヘッダ候補・環境判定 (読み取りのみ)。 */
+export const excelLinkProbe = (path: string): Promise<LinkProbe> =>
+  invoke("excel_link_probe", { path });
+/** リンク作成 (config.bomId 指定で既存 BOM の昇格)。 */
+export const excelLinkCreate = (config: LinkCreateConfig): Promise<LinkedBomView> =>
+  invoke("excel_link_create", { config });
+/** 読込+構造検証+復元規則+合成。初回表示・「更新」の共通入口。 */
+export const excelLinkOpen = (bomId: string): Promise<LinkedBomView> =>
+  invoke("excel_link_open", { bomId });
+/** リンク解除 (スナップショットを残し従来 BOM 化)。 */
+export const excelLinkUnlink = (bomId: string): Promise<void> =>
+  invoke("excel_link_unlink", { bomId });
+/** 「Excel へ反映」(§4.2.2 手順1〜9)。手動再試行も同コマンド。 */
+export const excelLinkApply = (bomId: string): Promise<ApplyOutcome> =>
+  invoke("excel_link_apply", { bomId });
+/** 軽量ステータス (DB 射影+~$ 存在チェック1回) — ポーリング可。 */
+export const excelLinkStatus = (bomId: string): Promise<LinkStatus> =>
+  invoke("excel_link_status", { bomId });
+/** Confirm 判定の候補確定 (structureFp echo back・部分確定可)。 */
+export const excelLinkConfirm = (
+  bomId: string,
+  resolution: LinkConfirmRequest,
+): Promise<LinkedBomView> => invoke("excel_link_confirm", { bomId, resolution });
+/** 競合解決の記録 (§1.3 同期停止の解除)。フォルダを開くのはフロント (opener)。 */
+export const excelLinkResolveConflict = (
+  bomId: string,
+  backupId: number,
+  action: ConflictAction = "resolved",
+): Promise<void> => invoke("excel_link_resolve_conflict", { bomId, backupId, action });
+/** 再マッピング (Broken 修復) — 契約全置換・state/世代/EC スナップショット保持。 */
+export const excelLinkRemap = (
+  bomId: string,
+  request: LinkRemapRequest,
+): Promise<LinkedBomView> => invoke("excel_link_remap", { bomId, request });
 
 /** One price/delivery observation for a (supplier, part number), newest first. */
 export interface PriceHistoryEntry {

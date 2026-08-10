@@ -311,8 +311,33 @@ PR-5 実装の確定事項:
   resolve は台帳検証(当該 BOM・is_conflict・未解決)→ `mark_resolved` + state 復帰
   (未解決競合が尽き、かつ現 state が conflict の場合のみ linked へ。broken/needs_review は上書きしない)
   を1トランザクションで実行。**フォルダを開く導線はフロント(PR-6・opener)の責務**
-- **再マッピング(Broken 修復・全列再指定)は PR-6**: Broken verdict は structure_fp を持たず
-  鮮度ガードが成立しないため、入力形はウィザード UI と同時に確定する
+- ~~**再マッピング(Broken 修復・全列再指定)は PR-6**~~ → **PR-6 で実装**:
+  `excel_link_remap(bom_id, LinkRemapRequest { sheet_name, header_row, data_start_row, columns })`。
+  契約(header+列)を1トランザクションで全置換し、**state・世代・EC スナップショットは保持**
+  (unlink→create はこれらを失うため使わない)。**新契約が実ファイルに対し Safe と検証できることが
+  完了条件**(create と同水準。鮮度ガードは不要 — コマンド時点の実ファイルで再検証するため)。
+  ワークブックの**パス変更は remap 対象外**(MVP の同一性根拠 = パス。移動・改名はリンク解除→再リンク)
+
+PR-6 実装の確定事項(フロント接続):
+
+- **wire 形の統一**: `StructureVerdict`/`LinkResolutionCandidate`/`ApplyOutcome` に
+  `rename_all_fields = "camelCase"` を追加し、タグ付き enum のフィールドも camelCase に統一
+  (フロント消費者ゼロの PR-6 冒頭が唯一の無償修正機会だった)。文字列 enum の「値」は
+  DB CHECK と揃えるため snake_case のまま。wire 形は model.rs の wire_tests が固定
+- **リンク識別**: `BomMeta.linked`(load_bom が設定・保存時無視)+`BomSummary.is_linked`
+  (一覧バッジ+開く経路の分岐)。§5 の「BomMeta に linked を追加」を実装
+- **save_bom はリンク BOM を拒否**(表示キャッシュの上書き・§1.3 正規化の巻き戻り防止 —
+  UI 非表示に加え Rust 側でも fail closed)。メタのみの保存経路として `bom_update_meta`
+  (名前・数量倍率・注文番号区切り)を新設 = §4.8 の「数量倍率は編集可」の実装点
+- `SheetProbe` に `start_row`(preview[0] の 1-based 絶対行)を追加 — 使用範囲が 1 行目から
+  始まらないシートでウィザードの行番号表示・ヘッダ行指定を正確にする
+- フロント: `src/types/link.ts`(IPC 型の写像)+`src/api/bom.ts` ラッパ 10 本。
+  リンク BOM は全列読み取り専用(columns.ts/BomEditor/Toolbar/FillHandle/列管理を §4.8 どおり
+  無効化)・fx マーカー・LinkBanner(常設ステータス+同時編集非対応インジケータ+§9-9 の
+  業務利用停止)・LinkWizard(作成/remap 共用)・Confirm/Conflict ダイアログ・
+  status 5 秒ポーリング(エディタ表示中のみ)。「Excel で編集」「フォルダを開く」は
+  tauri-plugin-opener をフロント直用(規定どおり)
+| `excel_link_remap(bom_id, request)` | **再マッピング**(Broken 修復・全列再指定 — PR-6 実装)。契約全置換 | `LinkedBomView` |
 | `excel_link_watch(bom_id, enable)` | 監視の開始/停止。検知は `emit("excel-link:changed")` → フロントが `excel_link_open` | `()` |
 
 - 「Excel で編集」はファイル起動のみ（§4.2）→ 既存 `tauri-plugin-opener` をフロント直用、専用コマンドなし

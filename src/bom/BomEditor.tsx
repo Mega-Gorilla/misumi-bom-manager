@@ -13,6 +13,7 @@ import type {
 import type { BomDoc, BomRow } from "../types/bom";
 import { partNoColumn } from "../types/bom";
 import { ackKey, buildColumnDefs, pendingSuggestion, setCellValue } from "../lib/columns";
+import type { LinkGridOptions } from "../lib/columns";
 import { bomTheme } from "../lib/agTheme";
 import { FillHandle } from "./FillHandle";
 
@@ -24,9 +25,11 @@ interface Props {
   /** Fires with the row under the focused cell (or null) so the history drawer can follow
    *  the selection. */
   onActiveRowChange?: (row: BomRow | null) => void;
+  /** Excel リンクモード: 全列読み取り専用+fx マーカー (§4.8/§9-3)。 */
+  link?: LinkGridOptions;
 }
 
-export function BomEditor({ doc, onChange, gridRef, quickFilter, onActiveRowChange }: Props) {
+export function BomEditor({ doc, onChange, gridRef, quickFilter, onActiveRowChange, link }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [api, setApi] = useState<GridApi<BomRow> | null>(null);
   // Open when a linked cell with a pending EC suggestion is double-clicked (adopt / keep / edit).
@@ -49,7 +52,15 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter, onActiveRowChan
   const shiftAnchorRef = useRef<number | null>(null);
 
   // Columns only need to rebuild when the column set changes.
-  const columnDefs = useMemo(() => buildColumnDefs(doc), [doc.columns]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const columnDefs = useMemo(() => buildColumnDefs(doc, link), [doc.columns, link]);
+
+  // 数量倍率は supplier 列の valueGetter が context から読む — 変更時は再評価を強制
+  // (rowData が変わらないため AG Grid は自動では再計算しない)。
+  useEffect(() => {
+    if (!api) return;
+    requestAnimationFrame(() => api.refreshCells({ force: true }));
+  }, [api, doc.meta.qtyMultiplier]);
 
   const onCellValueChanged = useCallback(
     (e: CellValueChangedEvent<BomRow>) => {
@@ -299,18 +310,18 @@ export function BomEditor({ doc, onChange, gridRef, quickFilter, onActiveRowChan
         }}
         onGridReady={(e: GridReadyEvent<BomRow>) => setApi(e.api)}
         onCellValueChanged={onCellValueChanged}
-        onCellDoubleClicked={onCellDoubleClicked}
+        onCellDoubleClicked={link ? undefined : onCellDoubleClicked}
         onCellClicked={onCellClicked}
         onCellFocused={onCellFocused}
-        rowDragManaged
+        rowDragManaged={!link}
         onRowDragEnd={onRowDragEnd}
         quickFilterText={quickFilter}
-        undoRedoCellEditing
+        undoRedoCellEditing={!link}
         undoRedoCellEditingLimit={50}
         defaultColDef={{ resizable: true, sortable: false, filter: true, minWidth: 80 }}
         stopEditingWhenCellsLoseFocus
       />
-      {api && <FillHandle api={api} container={wrapRef} doc={doc} onChange={onChange} />}
+      {api && !link && <FillHandle api={api} container={wrapRef} doc={doc} onChange={onChange} />}
       {chooser && (
         <>
           <div className="sugg-backdrop" onClick={() => setChooser(null)} />

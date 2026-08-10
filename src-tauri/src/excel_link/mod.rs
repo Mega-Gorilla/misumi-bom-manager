@@ -179,6 +179,7 @@ pub fn create_link(
                 qty_multiplier: 1.0,
                 order_no_separator: None,
                 updated_at: None,
+                linked: false, // display-only; recomputed by load_bom
             },
             true,
         ),
@@ -1395,6 +1396,110 @@ pub fn resolve_conflict(
     }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Full remap (PR-6): replace the whole contract — sheet/header coordinates plus
+/// every column mapping — while KEEPING state, generation and the adopted EC
+/// snapshots (the schema separates 契約 from 状態 exactly for this — §1.1 rule 2;
+/// unlink+create would reset them). This is the Broken-repair path (§4.9: 破綻の
+/// 出口 = 再マッピング), so unlike confirm it has no verdict precondition and no
+/// freshness guard: the new mapping is verified against the LIVE file right here,
+/// and only a Safe verdict commits. A path change (moved/renamed workbook) is NOT
+/// remappable — that is unlink+re-link by design (plan.md §4.7 MVP identity).
+pub fn remap_link(
+    conn: &mut Connection,
+    bom_id: &str,
+    req: &crate::model::LinkRemapRequest,
+    backup_dir: &Path,
+) -> Result<LinkedBomView, String> {
+    if req.data_start_row <= req.header_row || req.header_row < 1 {
+        return Err("データ開始行はヘッダ行より下である必要があります".into());
+    }
+    let rec = store::get_link(conn, bom_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "この BOM は Excel にリンクされていません".to_string())?;
+
+    // Same environment preconditions as confirm: failures are Errs, state
+    // transitions stay owned by open.
+    let env = env::check_env(Path::new(&rec.header.workbook_path));
+    if rec.header.env_resolved_path.is_some() && env_identity(&env).is_some() {
+        let stored = workbook_identity(
+            rec.header.env_resolved_path.as_deref(),
+            &rec.header.workbook_path,
+        );
+        let now = workbook_identity(env_identity(&env).as_deref(), &rec.header.workbook_path);
+        if stored != now {
+            return Err("リンク先が変更されています。リンクを解除して作り直してください".into());
+        }
+    }
+    let Some(io_path) = io_path_of(&env, Path::new(&rec.header.workbook_path)) else {
+        return Err(format!(
+            "リンク先を解決できません: {}",
+            env.reason.as_deref().unwrap_or("参照先が見つかりません")
+        ));
+    };
+    if !io_path.exists() {
+        return Err(format!(
+            "リンク先ファイルが見つかりません: {}",
+            rec.header.workbook_path
+        ));
+    }
+
+    // Candidate contract: header coordinates from the request, everything else
+    // (identity, env) from the stored link. try_from_store = validity gate.
+    let mut header = rec.header.clone();
+    header.sheet_name = req.sheet_name.clone();
+    header.header_row = req.header_row;
+    header.data_start_row = req.data_start_row;
+    let columns: Vec<store::LinkColumn> = req
+        .columns
+        .iter()
+        .map(|c| store::LinkColumn {
+            excel_col: c.excel_col,
+            header_label: c.header_label.clone(),
+            app_key: c.app_key.clone(),
+            ownership: c.ownership,
+            required: c.required,
+            role: c.role.clone(),
+            source_field: c.source_field.clone(),
+            projection: c.projection,
+        })
+        .collect();
+    let contract = Contract::try_from_store(&header, &columns)
+        .map_err(|e| format!("マッピングが不正です: {e}"))?;
+
+    // The new mapping must verify Safe against the CURRENT workbook — the same
+    // requirement create_link imposes (a remap that still needs confirmation is
+    // not a repair).
+    let (_fp, outcome) = read_stable(&io_path, &contract)?;
+    let verify = contract::verify_structure(&contract, &outcome.sheets);
+    if verify.severity() != Severity::Safe {
+        return Err(format!(
+            "再マッピングの検証で問題が見つかりました。マッピングを見直して再実行してください: {}",
+            verify
+                .anomalies
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    store::update_link_header(
+        &tx,
+        bom_id,
+        &header.sheet_name,
+        header.header_row,
+        header.data_start_row,
+    )
+    .map_err(|e| e.to_string())?;
+    store::replace_columns(&tx, bom_id, &columns).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+
+    // The closing open regenerates the display cache and restores Linked (the
+    // one code path that owns state transitions).
+    open_link(conn, bom_id, backup_dir)
 }
 
 /// Recover from a write interrupted between ReplaceFileW and the finalize commit
@@ -4330,5 +4435,186 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
+    }
+
+    // ---- PR-6: remap / linked flags / save guard ---------------------------------
+
+    /// Broken repair via remap: the contract is replaced wholesale, the link
+    /// returns to Linked, and state/generation/EC snapshots SURVIVE (the whole
+    /// point vs unlink+create).
+    #[test]
+    fn remap_repairs_broken_link_and_keeps_state() {
+        let path = temp_xlsx(
+            "remap-broken.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        assert_eq!(
+            adopt(&mut conn, &bom_id, &[("TEST-PART-001", mk_quote("115"))]),
+            Some(1)
+        );
+
+        // The required 型番 header disappears entirely (renamed AND moved — an
+        // in-place rename would only be a Confirm candidate, rule 8) → Broken.
+        temp_xlsx(
+            "remap-broken.xlsx",
+            &["数量", "品番", "EC単価"],
+            &[&["2", "TEST-PART-001", ""]],
+        );
+        let view = open_link(&mut conn, &bom_id, &test_bk()).unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Broken);
+
+        // Remap: same columns, but partsNo now maps to the 品番 header.
+        let col = |excel_col: i64,
+                   label: &str,
+                   key: &str,
+                   own: LinkOwnership,
+                   required: bool,
+                   source: Option<&str>,
+                   proj: Option<LinkProjection>| LinkColumnConfig {
+            excel_col,
+            header_label: Some(label.into()),
+            app_key: Some(key.into()),
+            ownership: own,
+            required,
+            role: None,
+            source_field: source.map(str::to_string),
+            projection: proj,
+        };
+        let req = crate::model::LinkRemapRequest {
+            sheet_name: "Sheet1".into(),
+            header_row: 1,
+            data_start_row: 2,
+            columns: vec![
+                col(0, "数量", "qty", LinkOwnership::User, false, None, None),
+                col(1, "品番", "partsNo", LinkOwnership::User, true, None, None),
+                col(
+                    2,
+                    "EC単価",
+                    "ecUnitPrice",
+                    LinkOwnership::App,
+                    false,
+                    Some("quote.unitPrice"),
+                    Some(LinkProjection::Writeback),
+                ),
+            ],
+        };
+        let view = remap_link(&mut conn, &bom_id, &req, &test_bk()).unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
+        assert!(matches!(view.verdict, StructureVerdict::Safe { .. }));
+
+        // State, generation and the adopted snapshot survived the remap.
+        let rec = store::get_link(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(rec.state.ec_generation, 1, "generation must survive");
+        let quotes = store::list_quotes(&conn, &bom_id).unwrap();
+        assert_eq!(quotes.len(), 1, "EC snapshot must survive");
+        assert!(rec
+            .columns
+            .iter()
+            .any(|c| c.header_label.as_deref() == Some("品番")));
+        // The snapshot composes into the refreshed view (read side works).
+        let q = view.doc.rows[0]
+            .supplier
+            .as_ref()
+            .expect("snapshot composed");
+        assert_eq!(q.quote.as_ref().unwrap().unit_price.as_deref(), Some("115"));
+        // And the write side works against the repaired contract.
+        let out = apply_link(&mut conn, &bom_id, &apply_bk("remap")).unwrap();
+        assert!(matches!(out, ApplyOutcome::Applied { .. }), "{out:?}");
+    }
+
+    /// A remap whose mapping does NOT verify Safe against the live file is
+    /// refused wholesale — contract untouched (fail closed, same bar as create).
+    #[test]
+    fn remap_rejects_mapping_that_is_not_safe() {
+        let path = temp_xlsx(
+            "remap-unsafe.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+
+        let mut cfg = config(&path);
+        // Claim a header label that does not exist in the file.
+        cfg.columns[0].header_label = Some("存在しないヘッダ".into());
+        let req = crate::model::LinkRemapRequest {
+            sheet_name: cfg.sheet_name.clone(),
+            header_row: cfg.header_row,
+            data_start_row: cfg.data_start_row,
+            columns: cfg.columns.clone(),
+        };
+        let err = expect_err(remap_link(&mut conn, &bom_id, &req, &test_bk()));
+        assert!(err.contains("マッピングを見直して"), "{err}");
+        // Contract unchanged.
+        let rec = store::get_link(&conn, &bom_id).unwrap().unwrap();
+        assert!(rec
+            .columns
+            .iter()
+            .any(|c| c.header_label.as_deref() == Some("型番")));
+
+        // Not linked → Err.
+        let err = expect_err(remap_link(&mut conn, "no-such", &req, &test_bk()));
+        assert!(err.contains("リンクされていません"), "{err}");
+    }
+
+    /// PR-6: linked flags for the UI split — BomSummary.is_linked (list badge +
+    /// open routing) and BomMeta.linked (loaded doc), plus the save_bom guard
+    /// (a full-replace save would clobber the display cache) and the meta-only
+    /// escape hatch that linked BOMs keep (§4.8: qtyMultiplier is DB-owned).
+    #[test]
+    fn linked_flags_save_guard_and_meta_update() {
+        let path = temp_xlsx(
+            "linked-flags.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+
+        let list = crate::db::list_boms(&conn).unwrap();
+        let entry = list.iter().find(|b| b.id == bom_id).unwrap();
+        assert!(entry.is_linked);
+        let mut doc = crate::db::load_bom(&conn, &bom_id).unwrap().unwrap();
+        assert!(doc.meta.linked);
+
+        // save_bom refuses linked BOMs (display cache is Excel-owned)...
+        let err = crate::db::save_bom(&mut conn, &doc)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("リンク BOM は保存できません"), "{err}");
+        // ...but the meta-only path works and reaches the write path (§4.5:
+        // subtotal = unit × qty × multiplier picks up the new multiplier).
+        doc.meta.qty_multiplier = 2.0;
+        crate::db::update_bom_meta(&conn, &bom_id, &doc.meta).unwrap();
+        let loaded = crate::db::load_bom(&conn, &bom_id).unwrap().unwrap();
+        assert_eq!(loaded.meta.qty_multiplier, 2.0);
+
+        // Conventional BOMs: unaffected flags and save path.
+        let plain = crate::db::save_bom(
+            &mut conn,
+            &crate::model::BomDoc {
+                id: None,
+                version: 1,
+                meta: Default::default(),
+                columns: vec![],
+                rows: vec![],
+            },
+        )
+        .unwrap();
+        let list = crate::db::list_boms(&conn).unwrap();
+        assert!(!list.iter().find(|b| b.id == plain).unwrap().is_linked);
+        assert!(
+            !crate::db::load_bom(&conn, &plain)
+                .unwrap()
+                .unwrap()
+                .meta
+                .linked
+        );
     }
 }

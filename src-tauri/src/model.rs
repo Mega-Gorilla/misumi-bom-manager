@@ -139,6 +139,11 @@ pub struct BomMeta {
     pub order_no_separator: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// True when a bom_link row exists (Excel link mode). Display-only: set by
+    /// load_bom, IGNORED on save (the bom_link row is the single source of truth
+    /// and save_bom refuses linked BOMs anyway).
+    #[serde(default)]
+    pub linked: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -163,6 +168,9 @@ pub struct BomSummary {
     pub name: Option<String>,
     pub row_count: i64,
     pub updated_at: Option<String>,
+    /// Excel link mode: the list view badges linked BOMs and the open flow
+    /// routes them through excel_link_open instead of bom_load.
+    pub is_linked: bool,
 }
 
 /// One appended price/delivery observation for a (supplier, part number), read back
@@ -359,7 +367,11 @@ impl BackupLocation {
 /// Structure verdict of a read (§4.9 3判定), returned as a SUCCESS value — Err is
 /// reserved for I/O and DB failures (implementation.md §2.3).
 #[derive(Serialize, Clone, PartialEq, Debug)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum StructureVerdict {
     /// Auto-adopted; `new_columns` lists newly imported user column labels.
     Safe { new_columns: Vec<String> },
@@ -378,7 +390,11 @@ pub enum StructureVerdict {
 /// accepted candidate onto SQL without further judgement (contract.rs is the single
 /// place that decides what is offered).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum LinkResolutionCandidate {
     AdoptSheetRename {
         new_sheet: String,
@@ -476,6 +492,9 @@ pub struct SheetProbe {
     pub name: String,
     /// First rows × columns as display strings (wizard preview).
     pub preview: Vec<Vec<String>>,
+    /// 1-based ABSOLUTE row of preview[0] (the used range may not start at row 1 —
+    /// without this the wizard cannot label preview rows with real Excel rows).
+    pub start_row: i64,
     /// 1-based heuristic suggestion (row with the most non-empty string cells).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggested_header_row: Option<i64>,
@@ -502,7 +521,11 @@ pub struct QuoteFailure {
 
 /// Outcome of excel_link_apply = §4.2.2 steps 1-9 (implementation.md §2.3).
 #[derive(Serialize, Clone, PartialEq, Debug)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ApplyOutcome {
     /// Written and verified: backup fingerprint matched F0. `warnings` carries
     /// non-fatal after-effects (backup transfer/retention issues) — the write
@@ -624,6 +647,20 @@ pub enum ConflictAction {
     Resolved,
 }
 
+/// Input of excel_link_remap (PR-6): replace the whole contract — sheet/header
+/// coordinates plus every column mapping — while KEEPING state, generation and
+/// the adopted EC snapshots (unlike unlink+create, which resets them). The new
+/// mapping must verify Safe against the current workbook; there is no freshness
+/// guard because the command re-verifies the live file at execution time.
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRemapRequest {
+    pub sheet_name: String,
+    pub header_row: i64,
+    pub data_start_row: i64,
+    pub columns: Vec<LinkColumnConfig>,
+}
+
 /// Input of excel_link_create (the wizard's outcome).
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -662,4 +699,114 @@ pub struct LinkColumnConfig {
     pub source_field: Option<String>,
     #[serde(default)]
     pub projection: Option<LinkProjection>,
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    fn keys(v: &serde_json::Value) -> Vec<String> {
+        v.as_object().unwrap().keys().cloned().collect()
+    }
+
+    /// The TS types (src/types/bom.ts) mirror these wire shapes. The tagged enums
+    /// carry `rename_all_fields = "camelCase"` (PR-6) so EVERYTHING on the wire is
+    /// camelCase — this pins that contract against accidental serde changes.
+    #[test]
+    fn tagged_enums_serialize_fully_camel_case() {
+        let v = serde_json::to_value(StructureVerdict::Safe {
+            new_columns: vec!["x".into()],
+        })
+        .unwrap();
+        assert_eq!(v["kind"], "safe");
+        assert!(v.get("newColumns").is_some(), "{v}");
+
+        let v = serde_json::to_value(StructureVerdict::Confirm {
+            reasons: vec![],
+            candidates: vec![LinkResolutionCandidate::AdoptColumnMove {
+                app_key: "qty".into(),
+                new_excel_col: 3,
+            }],
+            structure_fp: "fp".into(),
+        })
+        .unwrap();
+        assert!(v.get("structureFp").is_some(), "{v}");
+        let cand = &v["candidates"][0];
+        assert_eq!(cand["kind"], "adoptColumnMove");
+        assert!(
+            cand.get("appKey").is_some() && cand.get("newExcelCol").is_some(),
+            "{cand}"
+        );
+
+        let v = serde_json::to_value(ApplyOutcome::Conflict {
+            backup_id: 1,
+            backup_path: "p".into(),
+            warnings: vec![],
+        })
+        .unwrap();
+        assert_eq!(v["kind"], "conflict");
+        assert!(
+            v.get("backupId").is_some() && v.get("backupPath").is_some(),
+            "{v}"
+        );
+
+        let v = serde_json::to_value(ApplyOutcome::Refused {
+            reason: RefuseReason::FingerprintChanged,
+            warnings: vec!["w".into()],
+        })
+        .unwrap();
+        assert_eq!(v["reason"], "fingerprint_changed"); // enum VALUES stay snake_case (DB parity)
+        assert_eq!(v["warnings"][0], "w");
+
+        // Round-trip: the frontend echoes candidates back into confirm.
+        let cand: LinkResolutionCandidate = serde_json::from_value(serde_json::json!({
+            "kind": "keepSkipped", "excelCol": 5, "newLabel": null
+        }))
+        .unwrap();
+        assert_eq!(
+            cand,
+            LinkResolutionCandidate::KeepSkipped {
+                excel_col: 5,
+                new_label: None
+            }
+        );
+    }
+
+    #[test]
+    fn status_and_view_shapes_are_camel_case() {
+        let st = LinkStatus {
+            sync_status: SyncStatus::Linked,
+            sync_error: None,
+            calc_state: CalcState::Stale,
+            ec_generation: 2,
+            applied_generation: 1,
+            pending: Some(PendingInfo {
+                requested_generation: 2,
+                requested_at: "t".into(),
+                last_attempt_at: None,
+                attempt_count: 1,
+                blocked_reason: Some("file_open".into()),
+            }),
+            conflicts: vec![],
+            untransferred: 0,
+            recovery_pending: false,
+            excel_lock_hint: true,
+        };
+        let v = serde_json::to_value(&st).unwrap();
+        for k in [
+            "syncStatus",
+            "calcState",
+            "ecGeneration",
+            "appliedGeneration",
+            "untransferred",
+            "recoveryPending",
+            "excelLockHint",
+        ] {
+            assert!(v.get(k).is_some(), "missing {k}: {:?}", keys(&v));
+        }
+        assert_eq!(v["syncStatus"], "linked");
+        assert_eq!(v["calcState"], "stale");
+        assert_eq!(v["pending"]["requestedGeneration"], 2);
+        assert_eq!(v["pending"]["blockedReason"], "file_open");
+    }
 }
