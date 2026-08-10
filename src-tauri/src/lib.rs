@@ -202,6 +202,15 @@ fn bom_save(db: State<DbState>, doc: model::BomDoc) -> Result<String, String> {
     db::save_bom(&mut conn, &doc).map_err(|e| e.to_string())
 }
 
+/// Meta-only save (name / 数量倍率 / order-no separator) — the only save path a
+/// linked BOM may use (§4.8: qtyMultiplier is DB-owned meta; columns/rows are
+/// Excel-owned and save_bom refuses linked BOMs).
+#[tauri::command]
+fn bom_update_meta(db: State<DbState>, id: String, meta: model::BomMeta) -> Result<(), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    db::update_bom_meta(&conn, &id, &meta).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn bom_delete(db: State<DbState>, id: String) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -510,6 +519,20 @@ fn excel_link_confirm(
     excel_link::confirm_link(&mut conn, &bom_id, &resolution, &backup_dir)
 }
 
+/// Full contract remap — the Broken-repair path (PR-6). Keeps state/generation/
+/// EC snapshots, unlike unlink+create.
+#[tauri::command]
+fn excel_link_remap(
+    app: AppHandle,
+    db: State<DbState>,
+    bom_id: String,
+    request: model::LinkRemapRequest,
+) -> Result<model::LinkedBomView, String> {
+    let backup_dir = link_backup_dir(&app)?;
+    let mut conn = db.0.lock().map_err(|e| e.to_string())?;
+    excel_link::remap_link(&mut conn, &bom_id, &request, &backup_dir)
+}
+
 /// Record the user's conflict resolution (§1.3: lifts the conflict stop). Opening
 /// the backup folder is the frontend's job (PR-6, opener plugin).
 #[tauri::command]
@@ -727,7 +750,9 @@ pub fn run() {
             excel_link_apply,
             excel_link_status,
             excel_link_confirm,
-            excel_link_resolve_conflict
+            excel_link_resolve_conflict,
+            excel_link_remap,
+            bom_update_meta
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

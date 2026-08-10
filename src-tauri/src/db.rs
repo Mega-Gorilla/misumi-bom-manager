@@ -312,7 +312,8 @@ pub fn new_id() -> String {
 pub fn list_boms(conn: &Connection) -> rusqlite::Result<Vec<BomSummary>> {
     let mut stmt = conn.prepare(
         "SELECT b.id, b.name, b.updated_at, \
-         (SELECT COUNT(*) FROM bom_row r WHERE r.bom_id = b.id) AS rc \
+         (SELECT COUNT(*) FROM bom_row r WHERE r.bom_id = b.id) AS rc, \
+         EXISTS(SELECT 1 FROM bom_link l WHERE l.bom_id = b.id) AS linked \
          FROM bom b ORDER BY b.updated_at DESC",
     )?;
     let it = stmt.query_map([], |r| {
@@ -321,6 +322,7 @@ pub fn list_boms(conn: &Connection) -> rusqlite::Result<Vec<BomSummary>> {
             name: r.get(1)?,
             updated_at: r.get(2)?,
             row_count: r.get(3)?,
+            is_linked: r.get(4)?,
         })
     })?;
     it.collect()
@@ -339,10 +341,18 @@ pub fn load_bom(conn: &Connection, id: &str) -> rusqlite::Result<Option<BomDoc>>
                     imported_from: r.get(2)?,
                     updated_at: r.get(3)?,
                     order_no_separator: r.get(4)?,
+                    linked: false, // filled below from bom_link existence
                 })
             },
         )
         .optional()?;
+    let meta = match meta {
+        Some(mut m) => {
+            m.linked = is_linked(conn, id)?;
+            Some(m)
+        }
+        None => None,
+    };
     let Some(meta) = meta else {
         return Ok(None);
     };
@@ -412,11 +422,47 @@ pub fn load_bom(conn: &Connection, id: &str) -> rusqlite::Result<Option<BomDoc>>
 /// Full-replace upsert (columns + rows) inside a transaction. Returns the BOM id.
 pub fn save_bom(conn: &mut Connection, doc: &BomDoc) -> rusqlite::Result<String> {
     let id = doc.id.clone().unwrap_or_else(new_id);
+    // A linked BOM's columns/rows are a display cache regenerated from the Excel
+    // contract on every open (§1.3) — a full-replace save would overwrite that
+    // cache and undo the link normalization. The UI hides the save path for
+    // linked BOMs; this guard covers direct command invocation (PR-6). Meta
+    // edits go through update_bom_meta instead.
+    if is_linked(conn, &id)? {
+        return Err(rusqlite::Error::ToSqlConversionFailure(
+            "リンク BOM は保存できません (Excel が正)。数量倍率・名前の変更のみ可能です"
+                .to_string()
+                .into(),
+        ));
+    }
     let tx = conn.transaction()?;
     upsert_bom_meta(&tx, &id, &doc.meta)?;
     write_columns_rows(&tx, &id, doc)?;
     tx.commit()?;
     Ok(id)
+}
+
+/// Meta-only update (name / qty multiplier / order-no separator) — the ONLY save
+/// path linked BOMs may use: qty_multiplier is DB-owned meta (§4.8 exception)
+/// while columns/rows stay Excel-owned. Works for conventional BOMs too.
+pub fn update_bom_meta(conn: &Connection, id: &str, meta: &BomMeta) -> rusqlite::Result<()> {
+    let n = conn.execute(
+        "UPDATE bom SET name = ?2, qty_multiplier = ?3, order_no_separator = ?4, \
+         updated_at = datetime('now', 'localtime') WHERE id = ?1",
+        params![id, meta.name, meta.qty_multiplier, meta.order_no_separator],
+    )?;
+    if n == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    Ok(())
+}
+
+/// bom_link row existence = "this BOM is linked" (the DDL's single criterion).
+pub fn is_linked(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bom_link WHERE bom_id = ?1)",
+        [id],
+        |r| r.get(0),
+    )
 }
 
 /// Upsert the `bom` row (meta only) inside the caller's transaction. Shared by
@@ -619,6 +665,7 @@ mod tests {
                 qty_multiplier: 3.0,
                 order_no_separator: None,
                 updated_at: None,
+                linked: false,
             },
             columns: vec![ColumnDef {
                 key: "partsNo".into(),
