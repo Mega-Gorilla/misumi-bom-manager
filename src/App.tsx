@@ -242,6 +242,47 @@ export default function App() {
     };
   }, [linkedId, view]);
 
+  // ファイル監視 (PR-7・§4.2.3): リンクエディタ表示中のみ有効 (既定 ON)。
+  // 生イベントの判断は Rust 側 (親 dir 監視・デバウンス・~$ フィルタ) — ここは
+  // 合成イベントを受けて既存導線を呼ぶだけ。ハンドラは ref 経由で最新を参照する。
+  const watchRef = useRef({
+    busy: false,
+    pending: false,
+    refresh: () => {},
+    apply: () => {},
+  });
+  useEffect(() => {
+    if (!linkedId || view !== "editor") return;
+    let alive = true;
+    let unChanged: (() => void) | undefined;
+    let unClosed: (() => void) | undefined;
+    void (async () => {
+      try {
+        await api.excelLinkWatch(linkedId, true);
+        unChanged = await api.onExcelLinkChanged((p) => {
+          // §9-7: 保存検知 → 自動再読込 (Safe のみ自動適用 — open の既存経路)。
+          if (alive && p.bomId === linkedId && !watchRef.current.busy) {
+            watchRef.current.refresh();
+          }
+        });
+        unClosed = await api.onExcelLinkExcelClosed((p) => {
+          // §9-5 完成: Excel が閉じられた → 反映待ちがあれば自動再試行。
+          if (alive && p.bomId === linkedId && watchRef.current.pending && !watchRef.current.busy) {
+            watchRef.current.apply();
+          }
+        });
+      } catch (e) {
+        if (alive) setStatus(String(e));
+      }
+    })();
+    return () => {
+      alive = false;
+      unChanged?.();
+      unClosed?.();
+      void api.excelLinkWatch(linkedId, false).catch(() => {});
+    };
+  }, [linkedId, view]);
+
   /** リンク先ワークブックの実体パス (「Excel で編集」「フォルダを開く」用)。 */
   const linkWorkbookPath = (): string | undefined =>
     link?.env.readTarget ?? link?.env.resolvedPath ?? doc?.meta.importedFrom ?? undefined;
@@ -320,6 +361,14 @@ export default function App() {
     }
   };
 
+  // watch ハンドラが常に最新の状態・関数を見るための ref 更新 (毎レンダー)。
+  watchRef.current = {
+    busy: linkBusy || quoting,
+    pending: !!link?.pending,
+    refresh: () => void refreshLink(),
+    apply: () => void applyLink(),
+  };
+
   /** 数量倍率の変更 (§4.8: リンク BOM でも編集可な DB 所有メタ)。即時永続化。 */
   const setLinkMultiplier = async (mult: number) => {
     if (!doc?.id || !Number.isFinite(mult) || mult <= 0) return;
@@ -358,6 +407,7 @@ export default function App() {
     )
       return;
     try {
+      await api.excelLinkWatch(doc.id, false).catch(() => {});
       await api.excelLinkUnlink(doc.id);
       setStatus("リンクを解除しました");
       await openBom(doc.id); // 従来 BOM として開き直す

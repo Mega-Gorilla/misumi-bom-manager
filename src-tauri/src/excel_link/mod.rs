@@ -14,6 +14,7 @@ pub mod env;
 pub mod fingerprint;
 pub mod reader;
 pub mod store;
+pub mod watch;
 pub mod writeback;
 pub mod xlsx;
 
@@ -1110,14 +1111,24 @@ pub fn status(conn: &Connection, bom_id: &str) -> Result<crate::model::LinkStatu
 /// beside the READ target so a `.lnk` link probes the real workbook's folder; an
 /// unresolvable link yields false (the hint must never fail the status call).
 fn excel_lock_hint(header: &store::LinkHeader) -> bool {
-    // Poll-friendly contract: NO env re-resolution here (check_env resolves .lnk
-    // chains, spawns a COM thread, canonicalizes, inspects reparse points — far
-    // too heavy under the DB mutex). The RESOLVED path the last create/open
-    // recorded is the probe target; a bare stored path works as fallback unless
-    // it is a .lnk (whose target only check_env could find — open/apply stay the
-    // authority for that, and the hint simply reads false until then).
-    let target = match &header.env_resolved_path {
-        Some(p) => std::path::PathBuf::from(p),
+    match stored_read_path(header) {
+        Some(target) => match (target.parent(), target.file_name()) {
+            (Some(dir), Some(name)) => dir.join(format!("~${}", name.to_string_lossy())).exists(),
+            _ => false,
+        },
+        None => false,
+    }
+}
+
+/// The workbook path CHEAP consumers (status hint, watch) may use — NO env
+/// re-resolution (check_env resolves .lnk chains, spawns a COM thread,
+/// canonicalizes, inspects reparse points — far too heavy under the DB mutex).
+/// The RESOLVED path the last create/open recorded comes first; a bare stored
+/// path works as fallback unless it is a .lnk (whose target only check_env
+/// could find — open/apply stay the authority for that; callers read None).
+pub(crate) fn stored_read_path(header: &store::LinkHeader) -> Option<std::path::PathBuf> {
+    match &header.env_resolved_path {
+        Some(p) => Some(std::path::PathBuf::from(p)),
         None => {
             let p = Path::new(&header.workbook_path);
             let is_lnk = p
@@ -1125,14 +1136,11 @@ fn excel_lock_hint(header: &store::LinkHeader) -> bool {
                 .map(|e| e.eq_ignore_ascii_case("lnk"))
                 .unwrap_or(false);
             if is_lnk {
-                return false;
+                None
+            } else {
+                Some(p.to_path_buf())
             }
-            p.to_path_buf()
         }
-    };
-    match (target.parent(), target.file_name()) {
-        (Some(dir), Some(name)) => dir.join(format!("~${}", name.to_string_lossy())).exists(),
-        _ => false,
     }
 }
 
@@ -4616,5 +4624,36 @@ mod tests {
                 .meta
                 .linked
         );
+    }
+
+    /// PR-7: watch target resolution follows the stored-path rule (no check_env).
+    #[test]
+    fn watch_target_resolution() {
+        let path = temp_xlsx(
+            "watch-target.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+
+        let (dir, name) = watch::watch_target(&conn, &bom_id).unwrap();
+        assert_eq!(dir, path.parent().unwrap());
+        assert_eq!(name.to_string_lossy(), "watch-target.xlsx");
+
+        // Not linked → Err.
+        let err = watch::watch_target(&conn, "no-such").unwrap_err();
+        assert!(err.contains("リンクされていません"), "{err}");
+
+        // A .lnk without a stored resolved path cannot be watched (open records
+        // the resolution first).
+        conn.execute(
+            "UPDATE bom_link SET env_resolved_path = NULL, workbook_path = ?2 WHERE bom_id = ?1",
+            rusqlite::params![bom_id, "C:/nowhere/link.lnk"],
+        )
+        .unwrap();
+        let err = watch::watch_target(&conn, &bom_id).unwrap_err();
+        assert!(err.contains("解決できません"), "{err}");
     }
 }

@@ -62,6 +62,24 @@ export const excelLinkRemap = (
   bomId: string,
   request: LinkRemapRequest,
 ): Promise<LinkedBomView> => invoke("excel_link_remap", { bomId, request });
+/** ファイル監視の開始/停止 (PR-7・§4.2.3)。検知は下記イベントで通知される。 */
+export const excelLinkWatch = (bomId: string, enable: boolean): Promise<void> =>
+  invoke("excel_link_watch", { bomId, enable });
+
+/** watch の合成イベント payload。 */
+export interface LinkWatchPayload {
+  bomId: string;
+}
+/** ワークブック変化 (Excel 保存・外部書込・同期到着) — 受けたら excelLinkOpen で再読込。 */
+export const onExcelLinkChanged = (
+  cb: (p: LinkWatchPayload) => void,
+): Promise<UnlistenFn> =>
+  listen<LinkWatchPayload>("excel-link:changed", (e) => cb(e.payload));
+/** `~$` オーナーファイル消滅 = Excel が閉じた — 反映待ちがあれば excelLinkApply を再試行 (§9-5)。 */
+export const onExcelLinkExcelClosed = (
+  cb: (p: LinkWatchPayload) => void,
+): Promise<UnlistenFn> =>
+  listen<LinkWatchPayload>("excel-link:excel-closed", (e) => cb(e.payload));
 
 /** One price/delivery observation for a (supplier, part number), newest first. */
 export interface PriceHistoryEntry {
