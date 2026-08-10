@@ -79,6 +79,29 @@ impl std::fmt::Display for ContractError {
 }
 
 impl Contract {
+    /// The column whose values are the part numbers the EC fetch keys on: the
+    /// role-designated column first, the legacy core key as fallback — the SAME
+    /// resolution rule as `roleColumn()` in src/types/bom.ts (partNoColumn). The
+    /// read side (compose) and the write side (plan_writeback) must both use this,
+    /// or a BOM whose partNo role moved to a custom column fetches by one column
+    /// and writes back by another (PR-4 review #1).
+    pub fn part_no_column(&self) -> Option<&MappedColumn> {
+        self.role_column("partNo", "partsNo")
+    }
+
+    /// The column whose value selects the EC source (matched against the payload's
+    /// supplier code) — same fallback rule as `sourceColumn()` in types/bom.ts.
+    pub fn source_column(&self) -> Option<&MappedColumn> {
+        self.role_column("source", "order")
+    }
+
+    fn role_column(&self, role: &str, fallback_key: &str) -> Option<&MappedColumn> {
+        self.mapped
+            .iter()
+            .find(|m| m.role.as_deref() == Some(role))
+            .or_else(|| self.mapped.iter().find(|m| m.app_key == fallback_key))
+    }
+
     /// Build + validate from the stored link header and column rows.
     pub fn try_from_store(
         header: &LinkHeader,

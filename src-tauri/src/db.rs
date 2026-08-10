@@ -21,7 +21,7 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
 
 // Append-only list of migrations. Index i => schema version i+1.
 // NEVER edit a shipped migration string — only append a new one.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
 
 pub(crate) fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     let mut v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -278,6 +278,25 @@ CREATE INDEX idx_bom_link_backup_open_conflict
   ON bom_link_backup(is_conflict) WHERE is_conflict = 1 AND resolved_at IS NULL;
 "#;
 
+// V6: 書き込みジャーナル (plan.md §4.2.1 fs+DB 非原子性への回復プロトコル)。
+// ReplaceFileW の直前に「復旧に必要な全情報」を永続化し、置換成功〜台帳/state commit の
+// 間でクラッシュ・障害が起きても、次回 open/apply の reconcile が台帳化を完遂できるようにする。
+// ReplaceFileW は原子的なので「backup_path のファイルが存在する ⟺ 置換は実行された」が
+// 復旧時の判定基準になる (excel_link::reconcile_write_journal)。
+// 正常系では置換後の 1 トランザクション (台帳+state+pending) が本行を同時に削除する。
+const V6: &str = r#"
+CREATE TABLE bom_link_write_journal (
+  bom_id      TEXT PRIMARY KEY REFERENCES bom_link(bom_id) ON DELETE CASCADE,
+  backup_path TEXT NOT NULL,   -- 置換で選んだ backup の一意名 (存在チェックが復旧判定)
+  temp_path   TEXT NOT NULL,   -- 置換前 temp (置換未実行のまま残置された場合の掃除対象)
+  fp_algo     TEXT NOT NULL DEFAULT 'sha256-v1',
+  f0_fp       TEXT NOT NULL,   -- 書き込みの基になった内容の指紋 F0 (§4.2.2 手順2)
+  new_fp      TEXT NOT NULL,   -- アプリが書いた temp の指紋 (復旧時の state 確定に使用)
+  generation  INTEGER NOT NULL,-- 反映しようとした EC 世代 (applied_generation の復旧値)
+  created_at  TEXT NOT NULL
+);
+"#;
+
 pub fn new_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -474,6 +493,21 @@ pub(crate) fn clear_column_links(conn: &Connection, id: &str) -> rusqlite::Resul
 }
 
 pub fn delete_bom(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    // A pending Excel-link write journal cascades away with the BOM, and it is the
+    // only recovery pointer for a displaced backup that never reached the ledger
+    // (V6; 3rd review #1). Deleting is fine once a link open has reconciled it.
+    let pending: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bom_link_write_journal WHERE bom_id = ?1)",
+        [id],
+        |r| r.get(0),
+    )?;
+    if pending {
+        return Err(rusqlite::Error::ToSqlConversionFailure(
+            "中断された書き込みの復旧が完了していません。先にリンクを開いて復旧してから削除してください"
+                .to_string()
+                .into(),
+        ));
+    }
     conn.execute("DELETE FROM bom WHERE id = ?1", [id])?; // cascades to columns/rows
     Ok(())
 }
@@ -695,7 +729,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v as usize, MIGRATIONS.len()); // fresh DB lands on the latest version (5)
+        assert_eq!(v as usize, MIGRATIONS.len()); // fresh DB lands on the latest version
 
         let mut stmt = conn
             .prepare(
@@ -717,6 +751,7 @@ mod tests {
                 "bom_link_pending",
                 "bom_link_quote",
                 "bom_link_state",
+                "bom_link_write_journal",
             ]
         );
 
@@ -762,7 +797,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v as usize, MIGRATIONS.len());
 
         let doc = load_bom(&conn, "legacy").unwrap().unwrap();
         assert_eq!(doc.meta.qty_multiplier, 2.0);

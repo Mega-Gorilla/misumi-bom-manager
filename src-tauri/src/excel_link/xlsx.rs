@@ -245,6 +245,240 @@ pub fn calc_mode(workbook_xml: &str) -> Option<String> {
     slice_between(workbook_xml, "calcMode=\"", "\"").map(|s| s.to_string())
 }
 
+// ---- write path (PR-4): multi-cell patch + surgical zip rewrite ---------------------
+
+/// A value the app writes into an app-owned cell (§4.3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CellValue {
+    Number(f64),
+    /// Written as an inline string — sharedStrings.xml is never touched, so the
+    /// byte-preservation guarantee of the raw-copy path stays intact.
+    Text(String),
+}
+
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn cell_markup(cell_ref: &str, style: &str, v: &CellValue) -> String {
+    match v {
+        CellValue::Number(n) => format!("<c r=\"{cell_ref}\"{style}><v>{n}</v></c>"),
+        CellValue::Text(s) => format!(
+            "<c r=\"{cell_ref}\"{style} t=\"inlineStr\"><is><t>{}</t></is></c>",
+            escape_xml(s)
+        ),
+    }
+}
+
+/// One `<c>` occurrence inside a row: byte range + parsed bits.
+struct CellSpan {
+    start: usize,
+    end: usize,
+    col0: u32,
+    matches: bool,
+    style: String,
+}
+
+/// Apply many cell edits (keyed by A1 ref) to a sheet part in one go.
+/// Generalizes the PoC patch_cell and fills its known holes (PR #30 review /
+/// implementation.md §2.2): attribute-order-insensitive matching, string values,
+/// and INSERTION of absent cells at the correct column-ordered position inside the
+/// row. A missing `<row>` element is an error (fail closed — the data rows were
+/// existence-checked at read time, so reaching it means the file changed under us).
+pub fn patch_cells(
+    sheet_xml: &str,
+    edits: &std::collections::BTreeMap<String, CellValue>,
+) -> Result<String, String> {
+    use crate::excel_link::calc_state::parse_cell;
+
+    // Group edits by 1-based row, keeping column order within the row.
+    let mut by_row: BTreeMap<u32, Vec<(u32, &String, &CellValue)>> = BTreeMap::new();
+    for (cell_ref, v) in edits {
+        let (row0, col0) =
+            parse_cell(cell_ref).ok_or_else(|| format!("セル参照を解釈できません: {cell_ref}"))?;
+        by_row
+            .entry(row0 + 1)
+            .or_default()
+            .push((col0, cell_ref, v));
+    }
+
+    let mut xml = sheet_xml.to_string();
+    for (row1, mut cells) in by_row {
+        cells.sort_by_key(|(col0, _, _)| *col0);
+        xml = patch_row(&xml, row1, &cells)?;
+    }
+    Ok(xml)
+}
+
+fn patch_row(
+    sheet_xml: &str,
+    row1: u32,
+    edits: &[(u32, &String, &CellValue)],
+) -> Result<String, String> {
+    let row_attr = row1.to_string();
+    // Locate the <row> whose r attribute equals row1 (attribute-order-insensitive).
+    let mut search = 0usize;
+    let (row_start, row_open_end, row_self_closing) = loop {
+        let Some(i) = sheet_xml[search..].find("<row") else {
+            return Err(format!("行 {row1} が見つかりません (fail closed)"));
+        };
+        let start = search + i;
+        let Some(gt) = sheet_xml[start..].find('>') else {
+            return Err(format!("行 {row1} の開始タグが不正です"));
+        };
+        let open = &sheet_xml[start..start + gt];
+        if slice_between(open, "r=\"", "\"") == Some(row_attr.as_str()) {
+            break (start, start + gt + 1, open.ends_with('/'));
+        }
+        search = start + gt + 1;
+    };
+
+    let (inner_start, inner_end, tail_start) = if row_self_closing {
+        // `<row r="5"/>`: no cells yet — synthesize an open/close pair.
+        (row_open_end, row_open_end, row_open_end)
+    } else {
+        let close = sheet_xml[row_open_end..]
+            .find("</row>")
+            .map(|j| row_open_end + j)
+            .ok_or_else(|| format!("行 {row1} の終了タグが見つかりません"))?;
+        (row_open_end, close, close)
+    };
+    let inner = &sheet_xml[inner_start..inner_end];
+
+    // Scan existing cells with byte ranges (attribute-order-insensitive).
+    let mut spans: Vec<CellSpan> = Vec::new();
+    let mut pos = 0usize;
+    while let Some(i) = inner[pos..].find("<c ") {
+        let start = pos + i;
+        let Some(gt) = inner[start..].find('>') else {
+            return Err(format!("行 {row1} 内のセルタグが不正です (fail closed)"));
+        };
+        let open = &inner[start..start + gt];
+        let self_closing = open.ends_with('/');
+        let end = if self_closing {
+            start + gt + 1
+        } else {
+            inner[start + gt..]
+                .find("</c>")
+                .map(|j| start + gt + j + 4)
+                .ok_or_else(|| format!("行 {row1} 内のセルが閉じていません (fail closed)"))?
+        };
+        let cell_ref = slice_between(open, "r=\"", "\"").unwrap_or("");
+        let col0 = crate::excel_link::calc_state::parse_cell(cell_ref)
+            .map(|(_, c)| c)
+            .unwrap_or(u32::MAX);
+        let style = open
+            .split_whitespace()
+            .find(|a| a.starts_with("s=\""))
+            .map(|s| format!(" {}", s.trim_end_matches('/')))
+            .unwrap_or_default();
+        spans.push(CellSpan {
+            start,
+            end,
+            col0,
+            matches: false,
+            style,
+        });
+        pos = end;
+    }
+
+    // Rebuild the row content: replace matching cells, insert absent ones in
+    // column order.
+    let mut new_inner = String::with_capacity(inner.len() + edits.len() * 48);
+    let mut edit_iter = edits.iter().peekable();
+    let mut cursor = 0usize;
+    for span in &mut spans {
+        // Emit all pending edits whose column precedes this existing cell.
+        while let Some((col0, cell_ref, v)) = edit_iter.peek() {
+            if *col0 < span.col0 {
+                new_inner.push_str(&cell_markup(cell_ref, "", v));
+                edit_iter.next();
+            } else if *col0 == span.col0 {
+                span.matches = true;
+                break;
+            } else {
+                break;
+            }
+        }
+        new_inner.push_str(&inner[cursor..span.start]);
+        if span.matches {
+            let (_, cell_ref, v) = edit_iter.next().unwrap();
+            new_inner.push_str(&cell_markup(cell_ref, &span.style, v));
+        } else {
+            new_inner.push_str(&inner[span.start..span.end]);
+        }
+        cursor = span.end;
+    }
+    new_inner.push_str(&inner[cursor..]);
+    for (_, cell_ref, v) in edit_iter {
+        new_inner.push_str(&cell_markup(cell_ref, "", v));
+    }
+
+    let mut out = String::with_capacity(sheet_xml.len() + new_inner.len());
+    if row_self_closing {
+        // Reopen the self-closing row around the inserted cells.
+        let open = &sheet_xml[row_start..row_open_end];
+        let reopened = format!("{}>", open[..open.len() - 2].trim_end());
+        out.push_str(&sheet_xml[..row_start]);
+        out.push_str(&reopened);
+        out.push_str(&new_inner);
+        out.push_str("</row>");
+        out.push_str(&sheet_xml[tail_start..]);
+    } else {
+        out.push_str(&sheet_xml[..inner_start]);
+        out.push_str(&new_inner);
+        out.push_str(&sheet_xml[tail_start..]);
+    }
+    Ok(out)
+}
+
+/// Surgical read-modify-write (PoC cmd_rmw_zip port, §3.9): every untouched part is
+/// raw-copied byte for byte; only the target sheet (cell edits) and workbook.xml
+/// (fullCalcOnLoad, §4.4.1) are re-encoded. calcChain.xml is kept on purpose —
+/// deleting it leaves dangling OPC references, and fullCalcOnLoad forces the full
+/// recalculation anyway.
+pub fn write_patched(
+    src: &Path,
+    dst: &Path,
+    sheet_part: &str,
+    edits: &std::collections::BTreeMap<String, CellValue>,
+    set_fco: bool,
+) -> Result<(), String> {
+    let mut zin = open_zip(src)?;
+    let out = File::create(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+    let mut zout = zip::ZipWriter::new(out);
+    let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    for i in 0..zin.len() {
+        let entry = zin.by_index_raw(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_string();
+        let must_patch = name == sheet_part || (name == "xl/workbook.xml" && set_fco);
+        if !must_patch {
+            zout.raw_copy_file(entry).map_err(|e| e.to_string())?;
+            continue;
+        }
+        drop(entry);
+        let xml = read_part(&mut zin, &name)?;
+        let patched = if name == sheet_part {
+            patch_cells(&xml, edits)?
+        } else {
+            patch_calc_pr(&xml)
+        };
+        use std::io::Write;
+        zout.start_file(name, opts).map_err(|e| e.to_string())?;
+        zout.write_all(patched.as_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    let file = zout.finish().map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +567,81 @@ mod tests {
     #[test]
     fn sheet_name_entities_are_unescaped() {
         assert_eq!(unescape("A &amp; B &lt;2&gt;"), "A & B <2>");
+    }
+
+    fn edits(list: &[(&str, CellValue)]) -> std::collections::BTreeMap<String, CellValue> {
+        list.iter()
+            .map(|(r, v)| (r.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn patch_cells_replaces_attribute_order_insensitively_and_keeps_style() {
+        // C2 has its style attribute FIRST — a positional `<c r=` match would treat
+        // it as absent and duplicate the cell instead of replacing it.
+        let xml = r#"<sheetData><row r="2"><c r="A2"><v>1</v></c><c s="7" r="C2"><v>9</v></c></row></sheetData>"#;
+        let out = patch_cells(xml, &edits(&[("C2", CellValue::Number(115.0))])).unwrap();
+        assert!(out.contains(r#"<c r="C2" s="7"><v>115</v></c>"#), "{out}");
+        assert!(!out.contains("<v>9</v>"), "old value must be gone: {out}");
+        assert!(
+            out.contains(r#"<c r="A2"><v>1</v></c>"#),
+            "untouched cell kept"
+        );
+    }
+
+    #[test]
+    fn patch_cells_inserts_absent_cells_in_column_order() {
+        // B2 (between existing A2/C2) and D2 (after the last cell) are absent.
+        let xml = r#"<row r="2"><c r="A2"><v>1</v></c><c r="C2"><v>3</v></c></row>"#;
+        let out = patch_cells(
+            xml,
+            &edits(&[
+                ("B2", CellValue::Number(2.0)),
+                ("D2", CellValue::Text("x".into())),
+            ]),
+        )
+        .unwrap();
+        let a = out.find(r#"r="A2""#).unwrap();
+        let b = out.find(r#"r="B2""#).unwrap();
+        let c = out.find(r#"r="C2""#).unwrap();
+        let d = out.find(r#"r="D2""#).unwrap();
+        assert!(a < b && b < c && c < d, "column order broken: {out}");
+        assert!(out.contains(r#"<c r="B2"><v>2</v></c>"#));
+        assert!(out.contains(r#"<c r="D2" t="inlineStr"><is><t>x</t></is></c>"#));
+    }
+
+    #[test]
+    fn patch_cells_writes_strings_as_escaped_inline_strings() {
+        let xml = r#"<row r="1"><c r="A1"><v>0</v></c></row>"#;
+        let out = patch_cells(
+            xml,
+            &edits(&[("A1", CellValue::Text("a&b <2> \"q\"".into()))]),
+        )
+        .unwrap();
+        assert!(
+            out.contains("<is><t>a&amp;b &lt;2&gt; &quot;q&quot;</t></is>"),
+            "{out}"
+        );
+        // sharedStrings is never involved: the patched cell is self-contained.
+        assert!(out.contains(r#"t="inlineStr""#));
+    }
+
+    #[test]
+    fn patch_cells_reopens_self_closing_row() {
+        let xml = r#"<sheetData><row r="1"><c r="A1"/></row><row r="5"/></sheetData>"#;
+        let out = patch_cells(xml, &edits(&[("B5", CellValue::Number(7.0))])).unwrap();
+        assert!(
+            out.contains(r#"<row r="5"><c r="B5"><v>7</v></c></row>"#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn patch_cells_fails_closed_on_missing_row() {
+        // Data rows were existence-checked at read time; a missing <row> means the
+        // file changed under us → Err, never a silent skip.
+        let xml = r#"<row r="1"><c r="A1"/></row>"#;
+        let err = patch_cells(xml, &edits(&[("A9", CellValue::Number(1.0))])).unwrap_err();
+        assert!(err.contains("行 9"), "{err}");
     }
 }

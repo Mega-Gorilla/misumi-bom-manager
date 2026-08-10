@@ -258,9 +258,16 @@ pub(crate) fn compose(
         if !any {
             continue; // fully empty user cells → not a BOM row
         }
-        // Adopted EC snapshot for this (supplier, part) if present.
-        if let Some(parts_no) = row.parts_no.clone() {
-            let supplier = row.order.clone().unwrap_or_else(|| "MISUMI".into());
+        // Adopted EC snapshot for this (supplier, part) if present. The lookup keys
+        // resolve via the ROLE columns (fallback: core app_key) — the same rule the
+        // fetch uses (partNoColumn/sourceColumn), so a partNo role moved to a
+        // custom column still finds its snapshot (PR-4 review #1).
+        let key_of = |m: Option<&crate::excel_link::contract::MappedColumn>| {
+            m.and_then(|m| outcome.values.get(&(row0, m.excel_col)).cloned())
+                .filter(|v| !v.trim().is_empty())
+        };
+        if let Some(parts_no) = key_of(contract.part_no_column()) {
+            let supplier = key_of(contract.source_column()).unwrap_or_else(|| "MISUMI".into());
             if let Some(q) = quote_by_key.get(&(supplier, parts_no)) {
                 row.supplier = q
                     .payload_json

@@ -479,6 +479,66 @@ pub struct SheetProbe {
     pub truncated: bool,
 }
 
+/// Outcome of the quote command (implementation.md §2.3). `generation` is Some only
+/// when the BOM is linked AND the adopted snapshot actually changed this run.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteOutcome {
+    pub results: Vec<SupplierQuote>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
+    pub failed: Vec<QuoteFailure>,
+}
+
+#[derive(Serialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteFailure {
+    pub parts_no: String,
+    pub message: String,
+}
+
+/// Outcome of excel_link_apply = §4.2.2 steps 1-9 (implementation.md §2.3).
+#[derive(Serialize, Clone, PartialEq, Debug)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ApplyOutcome {
+    /// Written and verified: backup fingerprint matched F0. `warnings` carries
+    /// non-fatal after-effects (backup transfer/retention issues) — the write
+    /// itself succeeded.
+    Applied {
+        generation: i64,
+        fingerprint: String,
+        warnings: Vec<String>,
+    },
+    /// Could not obtain the write handle (Excel has the file open) —
+    /// bom_link_pending is recorded (§4.2.1; retry orchestration is PR-5).
+    Pending { reason: String },
+    /// Nothing was written (fail closed) — the reason names the guard.
+    Refused { reason: RefuseReason },
+    /// Replace happened but backup≠F0 (§4.2.2 step 8): sync stopped, the displaced
+    /// external version is preserved in the backup.
+    Conflict {
+        backup_id: i64,
+        backup_path: String,
+        warnings: Vec<String>,
+    },
+}
+
+/// Why a write was refused without touching the file (§4.2.2 guards).
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum RefuseReason {
+    Env,
+    Structure,
+    FingerprintChanged,
+    /// An unresolved conflict backup exists for this BOM (§1.3: conflict stops
+    /// sync until the USER resolves it) — no further write may run before that.
+    UnresolvedConflict,
+    Spill,
+    FormulaCell,
+    Truncated,
+    NothingToWrite,
+}
+
 /// Input of excel_link_create (the wizard's outcome).
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]

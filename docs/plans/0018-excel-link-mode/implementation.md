@@ -312,9 +312,21 @@ excel_link/
   - snapshot が無い初回失敗の型番で Excel 側にアプリ所有列の既存値がある場合、UI は「保持値」として
     警告表示するが、**DB 正本値・業務計算には採用しない**（§4.3: Excel 上のアプリ所有値は取り込まない）
   - Excel へは成功行のみ書く（失敗行のセルはスキップ）
+- 「変わった」の判定は payload の**意味内容**(status/product/quote/errors/warnings)で行い、
+  **fetched_at と raw は除外**する(除外しないと再取得のたびに世代が進み「全件同値は進めない」が成立しない — PR-4 実装)
 - 戻り値: `QuoteOutcome { results: Vec<SupplierQuote>, generation: Option<i64>, failed: Vec<…> }`。
   現行の `Promise<SupplierQuote[]>`（src/api/bom.ts）と App.tsx の呼び出しも **PR-4 で同時に更新**し、
   従来 BOM 経路は §9-26 の回帰テスト対象に含める
+- **計算フィールド**(PR-4 実装): 契約の `source_field` は payload への dotted path に加え、
+  行文脈から §4.5 の式で計算する2種を定義する — `quote.subtotal` = unitPrice × 行qty × qtyMultiplier
+  (フロントの LIVE 導出 columns.ts と同一式)、`quote.moqNote` = 行qty < MOQ のとき警告文字列
+  (それ以外は空文字で古い警告をクリア)。payload に値が無い一般 path はセルをスキップする
+- **行文脈の解決規則は UI と完全一致させる**(PR-4 レビュー対応): 型番/発注先列は
+  **role(partNo/source)優先・旧 core キー(partsNo/order)フォールバック**
+  (= types/bom.ts の roleColumn と同一規則。`Contract::part_no_column/source_column` に集約し
+  compose(読み)と plan_writeback(書き)の両方が使う)。Qty は欠落・解析不能を **1 扱い**
+  (`row.qty ?? 1`)、倍率は **`qtyMultiplier || 1`**(0/NaN→1、それ以外はそのまま)、
+  MOQ 比較は浮動小数のまま行う
 - 実装・テストは **PR-4**（同型番複数行〔§9-18〕・部分失敗の世代/警告接続・cache hit 初採用で世代が
   進むこと・他 BOM の取得でこの BOM の世代が進まないこと）。latest-wins〔§9-17〕は **PR-5**、
   失敗行の「前回値・手動値の可能性あり」UI 表示は **PR-6**
@@ -335,12 +347,33 @@ pub enum StructureVerdict {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ApplyOutcome {
-    Applied  { generation: i64, fingerprint: String },
+    Applied  { generation: i64, fingerprint: String, warnings: Vec<String> },
+                                      // warnings = backup 移送/保持の非致命な後処理警告 (書き込み自体は成功)
     Pending  { reason: String },      // "fileOpen" 等 → bom_link_pending 記録済み (§4.2.1)
     Refused  { reason: RefuseReason },// 構造NG/指紋変化/スピル交差/5000行超/env降格 — 書かずに終了
-    Conflict { backup_id: i64, backup_path: String },  // backup≠F0 (§4.2.2)。同期停止済み
+    Conflict { backup_id: i64, backup_path: String, warnings: Vec<String> },  // backup≠F0 (§4.2.2)。同期停止済み
 }
 ```
+
+- **書き込みジャーナル(V6・PR-4 レビュー対応)**: fs と SQLite は同一トランザクションにできない
+  (§4.2.1)ため、ReplaceFileW の**直前**に `bom_link_write_journal`(backup_path/temp_path/
+  F0/new_fp/generation)を **INSERT のみ**で永続化する(既存行は未完了置換の唯一の復旧情報の
+  ため上書き禁止 — PK で強制)。置換成功後の 1 トランザクション(台帳+state+pending)が
+  ジャーナルを同時に削除して確定。置換〜確定の間でクラッシュ・障害が起きた場合は、次回の
+  open/apply 冒頭の reconcile が「backup ファイルの存在 ⟺ 置換は実行された」(ReplaceFileW の
+  原子性)で判定し、実 backup の指紋から競合を導出して台帳・state を完遂した上で、
+  **§4.2.2 の6段階移送も同時に完遂する**(open も app-data の backup ディレクトリを受け取る)。
+  backup 不在ならジャーナル破棄+temp 掃除のみ。**reconcile が失敗してジャーナルが残っている間、
+  apply・リンク解除・BOM 削除はいずれも fail closed で拒否**する(ジャーナルは bom_link への
+  FK cascade で消えるため、復旧完了前の削除経路を Rust 側で全て塞ぐ。ジャーナルは不変のまま
+  次回再試行)。**§4.2.2 の移送は open のたびに当該 BOM の未移送 volume_temp 行へ全件実行**
+  (ジャーナル・競合状態と独立。一過性の移送失敗は次回 open で再試行される)。apply も
+  **reconcile 直後(競合ゲートより前)**と成功経路の両方で同じ全件掃き出しを行う —
+  open を挟まず apply が競合を復旧して Refused になる経路でも移送は完遂する
+- **競合ゲート(§1.3 の固定)**: 未解決競合 backup(`is_conflict=1 AND resolved_at IS NULL`)が
+  存在する間、open は読み取りを継続しつつ `sync_status=conflict` を維持し(Safe 再読込でも
+  Linked へ自動復元しない)、apply はファイルに触れる前に `Refused(unresolved_conflict)` で
+  拒否する。解除は ユーザーの競合解決(`mark_resolved`・PR-5 のコマンド)のみ
 
 `LinkedBomView` は `doc: BomDoc`（合成済み。Broken 時は前回スナップショット）＋ `verdict`＋
 `calc_state`＋`sync_status`＋`env_verdict`＋`pending`＋`formula_cells`（fx 表示用）。
