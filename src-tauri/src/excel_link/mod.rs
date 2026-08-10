@@ -1109,10 +1109,25 @@ pub fn status(conn: &Connection, bom_id: &str) -> Result<crate::model::LinkStatu
 /// beside the READ target so a `.lnk` link probes the real workbook's folder; an
 /// unresolvable link yields false (the hint must never fail the status call).
 fn excel_lock_hint(header: &store::LinkHeader) -> bool {
-    let input = Path::new(&header.workbook_path);
-    let env = env::check_env(input);
-    let Some(target) = io_path_of(&env, input) else {
-        return false;
+    // Poll-friendly contract: NO env re-resolution here (check_env resolves .lnk
+    // chains, spawns a COM thread, canonicalizes, inspects reparse points — far
+    // too heavy under the DB mutex). The RESOLVED path the last create/open
+    // recorded is the probe target; a bare stored path works as fallback unless
+    // it is a .lnk (whose target only check_env could find — open/apply stay the
+    // authority for that, and the hint simply reads false until then).
+    let target = match &header.env_resolved_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let p = Path::new(&header.workbook_path);
+            let is_lnk = p
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("lnk"))
+                .unwrap_or(false);
+            if is_lnk {
+                return false;
+            }
+            p.to_path_buf()
+        }
     };
     match (target.parent(), target.file_name()) {
         (Some(dir), Some(name)) => dir.join(format!("~${}", name.to_string_lossy())).exists(),
@@ -1185,12 +1200,50 @@ pub fn confirm_link(
             return Err("提示されていない候補が含まれています".into());
         }
     }
+    // Selection-consistency guards: the wire format is a flat list, so mutually
+    // EXCLUSIVE alternatives for one anomaly (KeepSkipped vs ImportSkippedAsUser
+    // vs SkipColumn, keyed by the same excel_col) must not arrive together —
+    // otherwise application order would silently pick the winner. Duplicates and
+    // an empty selection are refused for the same reason: the user's choice has
+    // to be explicit, never an artifact of list order.
+    if req.accepted.is_empty() {
+        return Err("確定する候補が指定されていません".into());
+    }
+    for (i, c) in req.accepted.iter().enumerate() {
+        if req.accepted[i + 1..].contains(c) {
+            return Err("同じ候補が重複しています".into());
+        }
+    }
+    {
+        use crate::model::LinkResolutionCandidate as C;
+        let mut seen_cols = BTreeSet::new();
+        for c in &req.accepted {
+            let col = match c {
+                C::KeepSkipped { excel_col, .. }
+                | C::ImportSkippedAsUser { excel_col, .. }
+                | C::SkipColumn { excel_col } => Some(*excel_col),
+                _ => None,
+            };
+            if let Some(col) = col {
+                if !seen_cols.insert(col) {
+                    return Err(format!(
+                        "同じ列 (excel_col={col}) に対して排他的な候補が複数指定されています"
+                    ));
+                }
+            }
+        }
+    }
 
-    // Map candidates onto the stored contract (pure — unit-tested) and commit
-    // header + columns atomically.
+    // Map candidates onto the stored contract (pure — unit-tested), prove the
+    // RESULT is still a well-formed contract, then commit header + columns
+    // atomically. Partial resolution is allowed by design: with several
+    // anomalies the user may confirm a subset, and the closing open reports the
+    // remaining ones as a fresh Confirm verdict (documented in §2.3).
     let mut header = rec.header.clone();
     let mut columns = rec.columns.clone();
     apply_candidates(&mut header, &mut columns, &req.accepted);
+    Contract::try_from_store(&header, &columns)
+        .map_err(|e| format!("候補適用後の契約が不正です: {e}"))?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     store::update_link_header(
         &tx,
@@ -4051,5 +4104,231 @@ mod tests {
         let xml = sheet_xml_of(&path, "Sheet1");
         assert!(xml.contains(r#"<c r="C2"><v>115</v></c>"#), "{xml}");
         assert!(xml.contains(r#"<c r="C3"><v>115</v></c>"#), "{xml}");
+    }
+
+    /// 3rd-review #1: the lock hint must probe the STORED resolved path — no env
+    /// re-resolution (check_env is far too heavy under the DB mutex for polling).
+    #[test]
+    fn status_lock_hint_uses_stored_resolved_path() {
+        let path = temp_xlsx(
+            "status-resolved.xlsx",
+            &["型番", "数量", "EC単価"],
+            &[&["TEST-PART-001", "2", ""]],
+        );
+        let mut conn = mem();
+        let view = create_link(&mut conn, &config(&path)).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+
+        // Point the stored resolved path at a DIFFERENT directory: the hint must
+        // probe there, not beside workbook_path.
+        let other = std::env::temp_dir().join("mbm-status-resolved-target");
+        let _ = std::fs::remove_dir_all(&other);
+        std::fs::create_dir_all(&other).unwrap();
+        let target = other.join("real.xlsx");
+        std::fs::write(&target, b"x").unwrap();
+        conn.execute(
+            "UPDATE bom_link SET env_resolved_path = ?2 WHERE bom_id = ?1",
+            rusqlite::params![bom_id, target.to_string_lossy()],
+        )
+        .unwrap();
+
+        // An owner file beside the WORKBOOK path must not count...
+        let local_owner = path.parent().unwrap().join("~$status-resolved.xlsx");
+        std::fs::write(&local_owner, b"lock").unwrap();
+        assert!(
+            !status(&conn, &bom_id).unwrap().excel_lock_hint,
+            "must probe the resolved path, not workbook_path"
+        );
+        std::fs::remove_file(&local_owner).unwrap();
+        // ...while one beside the RESOLVED target does.
+        std::fs::write(other.join("~$real.xlsx"), b"lock").unwrap();
+        assert!(status(&conn, &bom_id).unwrap().excel_lock_hint);
+
+        // A .lnk workbook path WITHOUT a stored resolved path cannot be probed
+        // cheaply — the hint reads false (open/apply stay the authority).
+        conn.execute(
+            "UPDATE bom_link SET env_resolved_path = NULL, workbook_path = ?2 WHERE bom_id = ?1",
+            rusqlite::params![bom_id, "C:/nowhere/link.lnk"],
+        )
+        .unwrap();
+        assert!(!status(&conn, &bom_id).unwrap().excel_lock_hint);
+    }
+
+    /// Confirm fixture with a SKIPPED column relabel — the anomaly that offers
+    /// mutually exclusive alternatives (KeepSkipped vs ImportSkippedAsUser).
+    fn skipped_relabel_fixture(
+        conn: &mut Connection,
+        name: &str,
+        headers2: &[&str],
+    ) -> (String, Vec<LinkResolutionCandidate>, String) {
+        let path = temp_xlsx(
+            name,
+            &["型番", "数量", "EC単価", "備考"],
+            &[&["TEST-PART-001", "2", "", "m"]],
+        );
+        let mut cfg = config(&path);
+        cfg.columns.push(LinkColumnConfig {
+            excel_col: 3,
+            header_label: Some("備考".into()),
+            app_key: None,
+            ownership: LinkOwnership::Skipped,
+            required: false,
+            role: None,
+            source_field: None,
+            projection: None,
+        });
+        let view = create_link(conn, &cfg).unwrap();
+        let bom_id = view.doc.id.clone().unwrap();
+        temp_xlsx(name, headers2, &[&["TEST-PART-001", "2", "", "m"]]);
+        let view = open_link(conn, &bom_id, &test_bk()).unwrap();
+        let crate::model::StructureVerdict::Confirm {
+            candidates,
+            structure_fp,
+            ..
+        } = view.verdict
+        else {
+            panic!("expected Confirm, got {:?}", view.verdict);
+        };
+        (bom_id, candidates, structure_fp)
+    }
+
+    /// 3rd-review #2: exclusive alternatives for one column, duplicates and an
+    /// empty selection are all refused — application order must never decide.
+    #[test]
+    fn confirm_rejects_exclusive_duplicate_and_empty_selections() {
+        let mut conn = mem();
+        let (bom_id, candidates, structure_fp) = skipped_relabel_fixture(
+            &mut conn,
+            "confirm-excl.xlsx",
+            &["型番", "数量", "EC単価", "備考2"],
+        );
+        let keep = candidates
+            .iter()
+            .find(|c| matches!(c, LinkResolutionCandidate::KeepSkipped { .. }))
+            .cloned()
+            .unwrap();
+        let import = candidates
+            .iter()
+            .find(|c| matches!(c, LinkResolutionCandidate::ImportSkippedAsUser { .. }))
+            .cloned()
+            .unwrap();
+
+        // Both exclusive alternatives at once → refused.
+        let err = expect_err(confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp: structure_fp.clone(),
+                accepted: vec![keep.clone(), import],
+            },
+            &test_bk(),
+        ));
+        assert!(err.contains("排他的な候補"), "{err}");
+        // The same candidate twice → refused.
+        let err = expect_err(confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp: structure_fp.clone(),
+                accepted: vec![keep.clone(), keep.clone()],
+            },
+            &test_bk(),
+        ));
+        assert!(err.contains("重複"), "{err}");
+        // Nothing selected → refused (a no-op re-save is not a confirmation).
+        let err = expect_err(confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp: structure_fp.clone(),
+                accepted: vec![],
+            },
+            &test_bk(),
+        ));
+        assert!(err.contains("指定されていません"), "{err}");
+        // Contract untouched by all three refusals.
+        let rec = store::get_link(&conn, &bom_id).unwrap().unwrap();
+        assert!(rec
+            .columns
+            .iter()
+            .any(|c| c.header_label.as_deref() == Some("備考")));
+
+        // A single unambiguous choice still works.
+        let view = confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp,
+                accepted: vec![keep],
+            },
+            &test_bk(),
+        )
+        .unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
+        let rec = store::get_link(&conn, &bom_id).unwrap().unwrap();
+        assert!(rec
+            .columns
+            .iter()
+            .any(|c| c.header_label.as_deref() == Some("備考2")));
+    }
+
+    /// Partial resolution is allowed BY DESIGN: confirming one of two anomalies
+    /// commits it and honestly reports the remainder as a fresh Confirm verdict;
+    /// a second confirm with the re-echoed fingerprint finishes the job.
+    #[test]
+    fn confirm_partial_resolution_reports_remaining_anomalies() {
+        let mut conn = mem();
+        // TWO anomalies at once: 数量→数 (rename) + 備考→備考2 (skipped relabel).
+        let (bom_id, candidates, structure_fp) = skipped_relabel_fixture(
+            &mut conn,
+            "confirm-partial.xlsx",
+            &["型番", "数", "EC単価", "備考2"],
+        );
+        let rename: Vec<_> = candidates
+            .iter()
+            .filter(|c| matches!(c, LinkResolutionCandidate::AdoptRename { .. }))
+            .cloned()
+            .collect();
+        assert!(!rename.is_empty(), "{candidates:?}");
+
+        // Confirm only the rename: committed, but the view honestly stays
+        // NeedsReview with the remaining skipped-relabel candidates.
+        let view = confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp,
+                accepted: rename,
+            },
+            &test_bk(),
+        )
+        .unwrap();
+        assert_eq!(view.sync_status, SyncStatus::NeedsReview);
+        let crate::model::StructureVerdict::Confirm {
+            candidates,
+            structure_fp,
+            ..
+        } = view.verdict
+        else {
+            panic!("expected remaining Confirm, got {:?}", view.verdict);
+        };
+        let keep = candidates
+            .iter()
+            .find(|c| matches!(c, LinkResolutionCandidate::KeepSkipped { .. }))
+            .cloned()
+            .unwrap();
+
+        // Second confirm with the RE-ECHOED fingerprint finishes the resolution.
+        let view = confirm_link(
+            &mut conn,
+            &bom_id,
+            &LinkConfirmRequest {
+                structure_fp,
+                accepted: vec![keep],
+            },
+            &test_bk(),
+        )
+        .unwrap();
+        assert_eq!(view.sync_status, SyncStatus::Linked, "{:?}", view.verdict);
     }
 }

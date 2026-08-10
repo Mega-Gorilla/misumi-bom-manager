@@ -289,15 +289,24 @@ PR-5 実装の確定事項:
 - `LinkStatus`(PR-5 実装) = `{ sync_status, sync_error?, calc_state, ec_generation, applied_generation,
   pending?: PendingInfo, conflicts: ConflictInfo[], untransferred: i64, recovery_pending: bool,
   excel_lock_hint: bool }`。DB 読みと `~$` オーナーファイルの**存在チェック1回のみ**(§4.2.1:
-  予告であって権威ではない — 権威は write-open 試行)。`untransferred`/`recovery_pending` は
+  予告であって権威ではない — 権威は write-open 試行)。**env 再判定(check_env)は呼ばない** —
+  `~$` の探索先は契約に保存済みの `env_resolved_path`(無ければ非 .lnk の workbook_path、
+  .lnk で未解決なら常に false)。retarget・環境再判定の権威は従来どおり open/apply
+  (PR-5 レビュー対応)。`untransferred`/`recovery_pending` は
   PR-4 レビュー引き継ぎ(移送失敗・復旧未完の可視化)
 - `PendingInfo` = `bom_link_pending` 行の写像 `{ requested_generation, requested_at,
   last_attempt_at?, attempt_count, blocked_reason? }`。`LinkedBomView` にも `pending?` を追加
 - `excel_link_confirm` の入力 `LinkConfirmRequest = { structure_fp, accepted: LinkResolutionCandidate[] }`。
-  適用前に2つの fail closed ガード: **鮮度**(現在の verify の structure_fp と echo back の一致)+
-  **メンバーシップ**(accepted ⊆ 現在の verify が提示する候補 — contract.rs が提示を決める唯一の
-  場所という規定を入力側でも強制)。適用は header(sheet_name/header_row/data_start_row)+列を
-  1トランザクションで書き換え、最後に通常 open を実行して返す(Safe→Linked 復帰は open の一本道)
+  適用前の fail closed ガード(PR-5 レビューで4段に確定): **鮮度**(現在の verify の structure_fp と
+  echo back の一致)+**メンバーシップ**(accepted ⊆ 現在の verify が提示する候補)+
+  **選択整合**(空選択・同一候補の重複・同一 excel_col への排他候補
+  〔KeepSkipped/ImportSkippedAsUser/SkipColumn〕の同時指定を拒否 — 適用順で勝敗が決まる
+  動作を許さない)+**適用後契約の妥当性**(Contract::try_from_store が通ることを commit 前に確認)。
+  適用は header(sheet_name/header_row/data_start_row)+列を1トランザクションで書き換え、
+  最後に通常 open を実行して返す(Safe→Linked 復帰は open の一本道)。
+  **部分確定は仕様として許容**: 複数異常のうち一部だけ確定した場合、確定分は commit され、
+  戻り値の view が残りの異常を新しい Confirm verdict(新 structure_fp+残候補)として正直に返す
+  — 2回目の confirm で完結する
 - `ConflictAction` は `resolved` のみ(PR-6+ で restoreBackup 等を拡張し得る enum として導入)。
   resolve は台帳検証(当該 BOM・is_conflict・未解決)→ `mark_resolved` + state 復帰
   (未解決競合が尽き、かつ現 state が conflict の場合のみ linked へ。broken/needs_review は上書きしない)
