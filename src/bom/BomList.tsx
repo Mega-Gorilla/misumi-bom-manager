@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { FilePlus2, Upload, Trash2, FileSpreadsheet, Search } from "lucide-react";
+import { FilePlus2, Upload, Trash2, FileSpreadsheet, Search, Link2 } from "lucide-react";
 import type { BomSummary } from "../types/bom";
 
 interface Props {
@@ -9,6 +9,8 @@ interface Props {
   onNew: () => void;
   onDelete: (id: string) => void;
   onImport: () => void;
+  /** Excel リンクモード: リンク BOM の新規作成 (probe → ウィザード)。 */
+  onLinkExcel: () => void;
 }
 
 type SortKey = "updated" | "name" | "rows";
@@ -42,6 +44,12 @@ export function BomList(p: Props) {
           </button>
           <button onClick={p.onImport} title="Excel / CSV から取込">
             <Upload size={16} /> 取込 (Excel/CSV)
+          </button>
+          <button
+            onClick={p.onLinkExcel}
+            title="Excel ファイルと同期するリンク BOM を作成（編集は Excel・アプリは EC 取得と閲覧）"
+          >
+            <Link2 size={16} /> Excel にリンク
           </button>
         </div>
       </header>
@@ -98,6 +106,11 @@ export function BomList(p: Props) {
                   <button className="link" onClick={() => p.onOpen(b.id)}>
                     <FileSpreadsheet size={15} />
                     {b.name || "(無題)"}
+                    {b.isLinked && (
+                      <span className="kind kind-link" title="Excel リンク BOM">
+                        <Link2 size={11} /> リンク
+                      </span>
+                    )}
                   </button>
                 </td>
                 <td className="num">{b.rowCount}</td>

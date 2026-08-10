@@ -77,6 +77,8 @@ export interface BomMeta {
   /** Separator joining お客様注文番号1/2/3 into customerItemSubReference (undefined → default space). */
   orderNoSeparator?: string;
   updatedAt?: string;
+  /** Excel リンクモード: bom_link 行が存在する (load 時に設定・保存時は無視される表示専用)。 */
+  linked?: boolean;
 }
 
 export interface BomDoc {
@@ -92,6 +94,8 @@ export interface BomSummary {
   name?: string | null;
   rowCount: number;
   updatedAt?: string | null;
+  /** Excel リンクモード: 一覧バッジ+開く時の経路分岐 (excel_link_open) に使う。 */
+  isLinked: boolean;
 }
 
 /** One sheet parsed by the backend `spreadsheet_read` command: a flat string grid.

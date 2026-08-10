@@ -322,6 +322,7 @@ pub(crate) fn probe_sheets(path: &Path) -> Result<Vec<crate::model::SheetProbe>,
         out.push(crate::model::SheetProbe {
             name,
             preview,
+            start_row: start.0 as i64 + 1,
             suggested_header_row: best.map(|(_, r)| r as i64),
             truncated: total_rows > MAX_ROWS,
         });

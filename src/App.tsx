@@ -22,7 +22,22 @@ import {
 } from "./types/bom";
 import type { Workbook } from "./types/bom";
 import { applyLinkedColumns, getCellValue, buildExportGrid } from "./lib/columns";
+import type { LinkGridOptions } from "./lib/columns";
 import * as api from "./api/bom";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+import type {
+  CalcState,
+  EnvCheck,
+  FormulaCell,
+  LinkColumnMeta,
+  LinkProbe,
+  LinkStatus,
+  LinkedBomView,
+  PendingInfo,
+  StructureVerdict,
+  SyncStatus,
+} from "./types/link";
+import { calcUsable } from "./types/link";
 import { BomEditor } from "./bom/BomEditor";
 import { Toolbar } from "./bom/Toolbar";
 import { BomList } from "./bom/BomList";
@@ -30,6 +45,10 @@ import { ColumnManager } from "./bom/ColumnManager";
 import { ImportWizard } from "./bom/ImportWizard";
 import { HistoryDrawer, type HistoryTarget } from "./bom/HistoryDrawer";
 import { SummaryBar } from "./bom/SummaryBar";
+import { LinkBanner } from "./bom/LinkBanner";
+import { LinkWizard, type LinkWizardMode } from "./bom/LinkWizard";
+import { LinkConfirmDialog } from "./bom/LinkConfirmDialog";
+import { LinkConflictDialog } from "./bom/LinkConflictDialog";
 
 // ORDER values that map to a supported EC provider (history/quotes exist only for these).
 const SUPPORTED_EC = ["MISUMI"];
@@ -94,6 +113,27 @@ export default function App() {
     totalQty: number;
     mode: "selection" | "all";
   } | null>(null);
+  // ---- Excel リンクモード (docs/plans/0018-excel-link-mode) ----
+  // link != null = 開いている BOM はリンク BOM (グリッド読み取り専用・§4.8)。
+  const [link, setLink] = useState<{
+    verdict: StructureVerdict;
+    calcState: CalcState;
+    syncStatus: SyncStatus;
+    env: EnvCheck;
+    columnsMeta: LinkColumnMeta[];
+    formulaCells: FormulaCell[];
+    warnings: string[];
+    pending?: PendingInfo;
+    status?: LinkStatus;
+  } | null>(null);
+  const [linkWizard, setLinkWizard] = useState<{
+    mode: LinkWizardMode;
+    workbookPath: string;
+    probe: LinkProbe;
+  } | null>(null);
+  const [linkConfirmOpen, setLinkConfirmOpen] = useState(false);
+  const [linkConflictOpen, setLinkConflictOpen] = useState(false);
+  const [linkBusy, setLinkBusy] = useState(false);
   const gridRef = useRef<AgGridReact<BomRow>>(null);
   // JSON snapshot of the doc as of the last load/save; back() compares against it to detect
   // unsaved changes. A freshly created (untouched) BOM counts as clean, like Notepad.
@@ -120,27 +160,270 @@ export default function App() {
     }
   }, [historyOpen]);
 
+  // LinkedBomView をエディタ状態へ反映する共通経路 (open/create/confirm/remap の戻り)。
+  const adoptLinkView = useCallback((view: LinkedBomView) => {
+    setDoc(view.doc);
+    savedSnapRef.current = JSON.stringify(view.doc); // リンク BOM は常にクリーン (編集不可)
+    setLink({
+      verdict: view.verdict,
+      calcState: view.calcState,
+      syncStatus: view.syncStatus,
+      env: view.env,
+      columnsMeta: view.columnsMeta,
+      formulaCells: view.formulaCells,
+      warnings: view.warnings,
+      pending: view.pending,
+    });
+    if (view.warnings.length > 0) setStatus(view.warnings[0]);
+  }, []);
+
   const openBom = useCallback(async (id: string) => {
     try {
       const d = await api.bomLoad(id);
-      if (d) {
-        setDoc(d);
-        savedSnapRef.current = JSON.stringify(d);
+      if (!d) return;
+      if (d.meta.linked) {
+        // リンク BOM は excel_link_open が入口 (§2.3): 読込→構造検証→復元→合成。
+        const view = await api.excelLinkOpen(id);
+        adoptLinkView(view);
         setStatus("");
         setView("editor");
+        return;
       }
+      setLink(null);
+      setDoc(d);
+      savedSnapRef.current = JSON.stringify(d);
+      setStatus("");
+      setView("editor");
     } catch (e) {
       setStatus(String(e));
     }
-  }, []);
+  }, [adoptLinkView]);
 
   const createBom = useCallback(() => {
     const d = newBom();
+    setLink(null);
     setDoc(d);
     savedSnapRef.current = JSON.stringify(d);
     setStatus("");
     setView("editor");
   }, []);
+
+  // ---- リンク BOM の操作群 ----
+
+  /** 軽量ステータスのポーリング (エディタ表示中のみ・5s)。反映待ち/競合/ロック予兆を追従。 */
+  const linkedId = link ? doc?.id : undefined;
+  useEffect(() => {
+    if (!linkedId || view !== "editor") return;
+    let alive = true;
+    const tick = async () => {
+      try {
+        const st = await api.excelLinkStatus(linkedId);
+        if (!alive) return;
+        setLink((l) =>
+          l
+            ? {
+                ...l,
+                status: st,
+                syncStatus: st.syncStatus,
+                calcState: st.calcState,
+                pending: st.pending,
+              }
+            : l,
+        );
+      } catch {
+        /* ポーリング失敗は無視 (次周期で再試行) */
+      }
+    };
+    void tick();
+    const h = setInterval(() => void tick(), 5000);
+    return () => {
+      alive = false;
+      clearInterval(h);
+    };
+  }, [linkedId, view]);
+
+  /** リンク先ワークブックの実体パス (「Excel で編集」「フォルダを開く」用)。 */
+  const linkWorkbookPath = (): string | undefined =>
+    link?.env.readTarget ?? link?.env.resolvedPath ?? doc?.meta.importedFrom ?? undefined;
+
+  /** 「更新」= excel_link_open で再読込。 */
+  const refreshLink = async () => {
+    if (!doc?.id || linkBusy) return;
+    setLinkBusy(true);
+    setStatus("Excel から再読込しています…");
+    try {
+      const view = await api.excelLinkOpen(doc.id);
+      adoptLinkView(view);
+      setStatus(view.warnings[0] ?? "更新しました");
+    } catch (e) {
+      setStatus(String(e));
+    } finally {
+      setLinkBusy(false);
+    }
+  };
+
+  /** 「Excel へ反映」= excel_link_apply。結果 kind ごとに UI を分岐 (§2.3)。 */
+  const applyLink = async () => {
+    if (!doc?.id || linkBusy) return;
+    setLinkBusy(true);
+    setStatus("Excel へ反映しています…");
+    try {
+      const out = await api.excelLinkApply(doc.id);
+      const warn = out.warnings.length > 0 ? `（警告: ${out.warnings[0]}）` : "";
+      if (out.kind === "applied") {
+        setStatus(`Excel へ反映しました（第${out.generation}世代）${warn}`);
+      } else if (out.kind === "pending") {
+        setStatus(`反映待ちになりました（Excel が開いています。閉じてから再実行してください）${warn}`);
+      } else if (out.kind === "conflict") {
+        setStatus("外部の変更と競合しました。バックアップに外部版を保全しています");
+        setLinkConflictOpen(true);
+      } else {
+        const msg: Record<string, string> = {
+          env: "この保存場所には書き戻しできません（読み取り専用リンク）",
+          structure: "構造の変更が検出されたため反映を中止しました。「更新」で確認してください",
+          fingerprint_changed:
+            "Excel 側が変更されています。自動では書き込みません — 「更新」で再読込してから再実行してください",
+          unresolved_conflict: "未解決の競合があります。先に競合を解決してください",
+          spill: "書き込み先がスピル範囲と交差しています",
+          formula_cell: "書き込み先セルに数式があります",
+          truncated: "5,000 行を超えるファイルには書き込めません",
+          nothing_to_write: "書き込む EC 取得値がありません（先に MISUMI 一括取得を実行してください）",
+        };
+        setStatus(`反映できません: ${msg[out.reason] ?? out.reason}${warn}`);
+        if (out.reason === "unresolved_conflict") setLinkConflictOpen(true);
+      }
+      // 反映後の状態 (Stale 遷移・pending 解消・競合) を一度の再読込で取り込む。
+      const view = await api.excelLinkOpen(doc.id);
+      adoptLinkView(view);
+    } catch (e) {
+      setStatus(String(e));
+    } finally {
+      setLinkBusy(false);
+    }
+  };
+
+  /** 「Excel で編集」= ファイル起動のみ (ロックも受け渡しも無い・§9-6)。 */
+  const editInExcel = async () => {
+    const path = linkWorkbookPath();
+    if (!path) {
+      setStatus("ワークブックのパスを解決できません");
+      return;
+    }
+    try {
+      await openPath(path);
+    } catch (e) {
+      setStatus(String(e));
+    }
+  };
+
+  const unlinkBom = async () => {
+    if (!doc?.id) return;
+    if (
+      !window.confirm(
+        "リンクを解除しますか？\n現在の表示内容は従来 BOM として残ります（Excel との同期は停止します）。",
+      )
+    )
+      return;
+    try {
+      await api.excelLinkUnlink(doc.id);
+      setStatus("リンクを解除しました");
+      await openBom(doc.id); // 従来 BOM として開き直す
+      await reloadList();
+    } catch (e) {
+      setStatus(String(e));
+    }
+  };
+
+  /** Confirm 候補の確定 (部分確定可 — 残異常は返却 view の Confirm verdict に残る)。 */
+  const confirmLinkCandidates = async (accepted: Parameters<typeof api.excelLinkConfirm>[1]["accepted"]) => {
+    if (!doc?.id || link?.verdict.kind !== "confirm") return;
+    setLinkBusy(true);
+    try {
+      const view = await api.excelLinkConfirm(doc.id, {
+        structureFp: link.verdict.structureFp,
+        accepted,
+      });
+      adoptLinkView(view);
+      if (view.verdict.kind !== "confirm") setLinkConfirmOpen(false);
+      setStatus(view.syncStatus === "linked" ? "変更を確定しました" : "残りの変更を確認してください");
+    } catch (e) {
+      setStatus(String(e));
+    } finally {
+      setLinkBusy(false);
+    }
+  };
+
+  const resolveLinkConflict = async (backupId: number) => {
+    if (!doc?.id) return;
+    setLinkBusy(true);
+    try {
+      await api.excelLinkResolveConflict(doc.id, backupId);
+      const view = await api.excelLinkOpen(doc.id);
+      adoptLinkView(view);
+      const st = await api.excelLinkStatus(doc.id);
+      setLink((l) => (l ? { ...l, status: st } : l));
+      if (st.conflicts.length === 0) {
+        setLinkConflictOpen(false);
+        setStatus("競合を解決しました（同期を再開します）");
+      }
+    } catch (e) {
+      setStatus(String(e));
+    } finally {
+      setLinkBusy(false);
+    }
+  };
+
+  /** リンク作成 (一覧から): ファイル選択 → probe → ウィザード。 */
+  const startLinkCreate = async () => {
+    try {
+      const picked = await api.pickSpreadsheetToOpen();
+      if (!picked) return;
+      setStatus("ファイルを確認しています…");
+      const probe = await api.excelLinkProbe(picked.path);
+      setStatus("");
+      setLinkWizard({
+        mode: { kind: "create", name: picked.name },
+        workbookPath: picked.path,
+        probe,
+      });
+    } catch (e) {
+      setStatus(String(e));
+    }
+  };
+
+  /** 再マッピング (Broken 修復・要確認からの再指定)。既存契約の列を初期値に。 */
+  const startLinkRemap = async () => {
+    const path = linkWorkbookPath();
+    if (!doc?.id || !path) {
+      setStatus("ワークブックのパスを解決できません（リンクを解除して作り直してください）");
+      return;
+    }
+    try {
+      setStatus("ファイルを確認しています…");
+      const probe = await api.excelLinkProbe(path);
+      setStatus("");
+      setLinkConfirmOpen(false);
+      setLinkWizard({
+        mode: { kind: "remap", bomId: doc.id, current: { columns: link?.columnsMeta ?? [] } },
+        workbookPath: path,
+        probe,
+      });
+    } catch (e) {
+      setStatus(String(e));
+    }
+  };
+
+  const linkWizardDone = async (view: LinkedBomView) => {
+    setLinkWizard(null);
+    adoptLinkView(view);
+    setView("editor");
+    setStatus(
+      view.syncStatus === "linked"
+        ? "Excel にリンクしました"
+        : "リンクしました（確認が必要な項目があります）",
+    );
+    await reloadList();
+  };
 
   const selectedRows = (): BomRow[] => gridRef.current?.api?.getSelectedRows() ?? [];
 
@@ -291,6 +574,19 @@ export default function App() {
         setStatus(p.total > 0 ? `取得中 ${p.done}/${p.total}…` : "キャッシュから取得中…"),
       );
       const items = targets.map((r) => ({ partNo: partOf(r) }));
+      if (link && doc.id) {
+        // リンク BOM: 採用スナップショット (DB 正本) に取り込まれるので、再 open で
+        // 合成済み表示に統一する (§2.3)。失敗行は「前回値・手動値の可能性あり」(§0)。
+        const { results, generation, failed } = await api.quote("MISUMI", items, force, doc.id);
+        const view = await api.excelLinkOpen(doc.id);
+        adoptLinkView(view);
+        const failNote = failed.length
+          ? ` / 失敗 ${failed.length} 型番 — 前回値・手動値の可能性あり`
+          : "";
+        const genNote = generation != null ? `・第${generation}世代` : "";
+        setStatus(`取得完了（${results.length} 件${failNote}${genNote}）`);
+        return;
+      }
       const { results } = await api.quote("MISUMI", items, force, doc.id);
       const byId = new Map<string, SupplierQuote>();
       // Store the raw quote only. Subtotal and the MOQ note are derived LIVE in the
@@ -473,6 +769,19 @@ export default function App() {
 
   const saveBom = async () => {
     if (!doc) return;
+    // リンク BOM の列・行は Excel が正 (save_bom はバックエンドでも拒否される)。
+    // 保存できるのはメタ (名前等) だけ。
+    if (link) {
+      if (!doc.id) return;
+      try {
+        await api.bomUpdateMeta(doc.id, doc.meta);
+        savedSnapRef.current = JSON.stringify(doc);
+        setStatus("設定を保存しました");
+      } catch (e) {
+        setStatus(String(e));
+      }
+      return;
+    }
     try {
       const id = await api.bomSave(doc);
       const saved = { ...doc, id };
@@ -488,12 +797,23 @@ export default function App() {
     setConfirmBack(false);
     setView("list");
     setDoc(null);
+    setLink(null);
+    setLinkConfirmOpen(false);
+    setLinkConflictOpen(false);
     setStatus("");
     await reloadList();
   };
 
   // Leaving the editor with unsaved changes prompts 保存/破棄/キャンセル (Windows convention).
   const back = () => {
+    if (link) {
+      // リンク BOM はグリッド編集不可 — 変わり得るのはメタ (名前) だけなので黙って永続化。
+      if (doc?.id && JSON.stringify(doc) !== savedSnapRef.current) {
+        void api.bomUpdateMeta(doc.id, doc.meta).catch(() => {});
+      }
+      void doBack();
+      return;
+    }
     if (doc && JSON.stringify(doc) !== savedSnapRef.current) {
       setConfirmBack(true);
       return;
@@ -619,6 +939,7 @@ export default function App() {
           onNew={createBom}
           onDelete={doDelete}
           onImport={doImport}
+          onLinkExcel={() => void startLinkCreate()}
         />
       ) : (
         <>
@@ -648,13 +969,49 @@ export default function App() {
             quoting={quoting}
             onAddToCart={addToCart}
             addingCart={addingCart}
+            link={
+              link
+                ? {
+                    onEditInExcel: () => void editInExcel(),
+                    onRefresh: () => void refreshLink(),
+                    onApply: () => void applyLink(),
+                    onUnlink: () => void unlinkBom(),
+                    refreshing: linkBusy,
+                    applying: linkBusy,
+                    calcUsable: calcUsable(link.calcState),
+                  }
+                : undefined
+            }
           />
+          {link && (
+            <LinkBanner
+              syncStatus={link.syncStatus}
+              calcState={link.calcState}
+              envVerdict={link.env.verdict}
+              verdict={link.verdict}
+              pending={link.pending}
+              status={link.status}
+              warnings={link.warnings}
+              onOpenConfirm={() => setLinkConfirmOpen(true)}
+              onOpenConflict={() => setLinkConflictOpen(true)}
+              onRemap={() => void startLinkRemap()}
+              onApply={() => void applyLink()}
+            />
+          )}
           <BomEditor
             doc={doc}
             onChange={setDoc}
             gridRef={gridRef}
             quickFilter={quickFilter}
             onActiveRowChange={(row) => setActiveTarget(historyTargetOf(row))}
+            link={
+              link
+                ? ({
+                    formulaCells: link.formulaCells,
+                    columnsMeta: link.columnsMeta,
+                  } satisfies LinkGridOptions)
+                : undefined
+            }
           />
           {historyOpen && (
             <HistoryDrawer target={activeTarget} onClose={() => setHistoryOpen(false)} />
@@ -778,6 +1135,33 @@ export default function App() {
             />
           )}
         </>
+      )}
+      {linkConfirmOpen && link?.verdict.kind === "confirm" && (
+        <LinkConfirmDialog
+          verdict={link.verdict}
+          busy={linkBusy}
+          onConfirm={(accepted) => void confirmLinkCandidates(accepted)}
+          onRemap={() => void startLinkRemap()}
+          onClose={() => setLinkConfirmOpen(false)}
+        />
+      )}
+      {linkConflictOpen && (
+        <LinkConflictDialog
+          conflicts={link?.status?.conflicts ?? []}
+          busy={linkBusy}
+          onResolve={(id) => void resolveLinkConflict(id)}
+          onOpenFolder={(path) => void revealItemInDir(path).catch((e) => setStatus(String(e)))}
+          onClose={() => setLinkConflictOpen(false)}
+        />
+      )}
+      {linkWizard && (
+        <LinkWizard
+          mode={linkWizard.mode}
+          workbookPath={linkWizard.workbookPath}
+          probe={linkWizard.probe}
+          onCancel={() => setLinkWizard(null)}
+          onDone={(v) => void linkWizardDone(v)}
+        />
       )}
       {importSrc && (
         <ImportWizard

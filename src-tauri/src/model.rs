@@ -492,6 +492,9 @@ pub struct SheetProbe {
     pub name: String,
     /// First rows × columns as display strings (wizard preview).
     pub preview: Vec<Vec<String>>,
+    /// 1-based ABSOLUTE row of preview[0] (the used range may not start at row 1 —
+    /// without this the wizard cannot label preview rows with real Excel rows).
+    pub start_row: i64,
     /// 1-based heuristic suggestion (row with the most non-empty string cells).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggested_header_row: Option<i64>,
