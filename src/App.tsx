@@ -23,6 +23,8 @@ import {
 import type { Workbook } from "./types/bom";
 import { applyLinkedColumns, getCellValue, buildExportGrid } from "./lib/columns";
 import type { LinkGridOptions } from "./lib/columns";
+import { createWatchQueue } from "./lib/watchQueue";
+import type { WatchQueue } from "./lib/watchQueue";
 import * as api from "./api/bom";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type {
@@ -265,43 +267,17 @@ export default function App() {
     apply: () => Promise<void>;
   }>({ busy: false, refresh: async () => {}, apply: async () => {} });
 
-  // watch 由来の処理は1本のキューで直列化する: 保存して閉じた場合 Changed と
-  // ExcelClosed が同じバーストで届くため、並行実行すると apply が古い
-  // last_read_fp を見て fingerprint_changed になり pending が残る (PR-7 レビュー)。
-  const watchQueueRef = useRef<Promise<unknown>>(Promise.resolve());
-  const enqueueWatchTask = (task: () => Promise<void>) => {
-    watchQueueRef.current = watchQueueRef.current
-      .catch(() => {})
-      .then(task)
-      .catch(() => {});
-  };
-  /** 進行中の操作 (更新・反映・EC 取得・ウィザード) の完了を待つ。
-   *  戻り値 false = 上限まで待っても idle にならなかった。 */
-  const waitLinkIdle = async (timeoutMs = 8000): Promise<boolean> => {
-    const started = Date.now();
-    while (linkBusyRef.current || quotingRef.current || watchRef.current.busy) {
-      if (Date.now() - started > timeoutMs) return false;
-      await new Promise((r) => setTimeout(r, 120));
-    }
-    return true;
-  };
-
-  /** busy 中は watch 由来の処理を「開始も破棄もしない」— idle になるまで再キューする。
-   *  EC 取得は 8 秒を超え得るため、待機上限で押し切ると古い世代を反映して pending を
-   *  消し、latest-wins (§4.2.1) と §9-5 の自動再試行が崩れる (PR-7 レビュー)。
-   *  それでも idle にならないまま上限回数に達したら諦める — 監視は利便性トリガであり、
-   *  バナーの「反映待ち・再実行」導線が最後の受け皿になる。 */
-  const enqueueWhenIdle = (isAlive: () => boolean, task: () => Promise<void>, attempts = 8) => {
-    enqueueWatchTask(async () => {
-      if (!isAlive()) return;
-      if (!(await waitLinkIdle())) {
-        if (isAlive() && attempts > 0) enqueueWhenIdle(isAlive, task, attempts - 1);
-        return;
-      }
-      if (!isAlive()) return;
-      await task();
+  // watch 由来の処理は1本のキューで直列化する (lib/watchQueue.ts に切り出し・単体
+  // テストで固定): FIFO 厳守で Changed の再読込が完了してから ExcelClosed の
+  // apply が走り、busy 中は自分のキュー位置を保持したまま待つ (再キューしない —
+  // 後続に追い越されるため)。破棄は離脱 (cleanup) 時のみ (PR-7 レビュー)。
+  const watchQueueRef = useRef<WatchQueue | null>(null);
+  if (!watchQueueRef.current) {
+    watchQueueRef.current = createWatchQueue({
+      isBusy: () => linkBusyRef.current || quotingRef.current || watchRef.current.busy,
     });
-  };
+  }
+  const watchQueue = watchQueueRef.current;
 
   // watch の所有権トークン: StrictMode の setup→cleanup→setup や素早い再入場で、
   // 旧 effect の cleanup が新 effect の watch を止めてしまうのを防ぐ (PR-7 レビュー)。
@@ -326,7 +302,7 @@ export default function App() {
         unChanged = await api.onExcelLinkChanged((p) => {
           if (!alive || p.bomId !== linkedId) return;
           // §9-7: 保存検知 → 自動再読込 (Safe のみ自動適用は open の既存経路)。
-          enqueueWhenIdle(isAlive, () => watchRef.current.refresh());
+          watchQueue.enqueue(isAlive, () => watchRef.current.refresh());
         });
         if (!alive) return;
         unClosed = await api.onExcelLinkExcelClosed((p) => {
@@ -334,7 +310,7 @@ export default function App() {
           // §9-5 完成: Excel が閉じた → 反映待ちがあれば自動再試行。先行する
           // Changed の再読込が終わってから、pending は DB へ問い合わせて判断する
           // (React state は再レンダー待ちで古い可能性がある)。
-          enqueueWhenIdle(isAlive, async () => {
+          watchQueue.enqueue(isAlive, async () => {
             try {
               const st = await api.excelLinkStatus(linkedId);
               if (!alive || !st.pending) return;

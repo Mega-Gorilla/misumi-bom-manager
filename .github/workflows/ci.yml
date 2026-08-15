@@ -69,3 +69,5 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx tsc --noEmit
+      # フロントの純ロジック単体テスト (現状は watch キューの順序・非破棄の不変条件)。
+      - run: npm test

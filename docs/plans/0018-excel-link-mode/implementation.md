@@ -360,9 +360,11 @@ PR-7 実装の確定事項:
   (a) watch 由来の処理は1本のキューで**直列化**し、`Changed` の再読込完了 → 最新 status の
   pending 確認 → `apply` の順を保証する（並行実行だと apply が古い `last_read_fp` を見て
   `fingerprint_changed` になり pending が残る）。
-  (b) 進行中の操作（更新・反映・**EC 取得**・ウィザード）中は watch タスクを**開始も破棄もせず
-  再キュー**する（EC 取得は 8 秒を超え得るため、待機上限で押し切ると古い世代を反映して
-  pending を消し、latest-wins〔§4.2.1〕が崩れる）。
+  (b) 進行中の操作（更新・反映・**EC 取得**・ウィザード）中の watch タスクは**開始も破棄もせず、
+  自分のキュー位置を保持したまま待つ**（再キューすると後続の ExcelClosed に追い越されて (a) が
+  崩れる。時間上限も設けない — EC 取得は数十秒に及び得るため、押し切ると古い世代を反映して
+  pending を消し latest-wins〔§4.2.1〕が崩れる）。破棄するのは離脱（cleanup で isAlive=false）
+  のときだけ。キュー実装は `src/lib/watchQueue.ts` に分離し、順序と非破棄を単体テストで固定する。
   (c) effect の**所有権トークン**（世代＋bom_id）で、旧 cleanup が新しい watch を
   `watch(false)` で止めないようにする（`React.StrictMode` の setup→cleanup→setup で実際に起きる）
 
