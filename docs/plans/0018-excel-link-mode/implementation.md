@@ -14,7 +14,7 @@
 | §6.2.1 EC 取得失敗時のアプリ所有列既存値 | **残して警告**（暫定方針を正式化） | ユーザー決定（2026-08-05）。既存値を残し、アプリ UI で「前回値・手動値の可能性あり」を行単位に警告。古い価格が残るリスクは警告表示で緩和。plan.md §6.2.1 を【決定済み】に更新 |
 | CI | **GitHub Actions を導入**（PR-0） | ユーザー決定（2026-08-05）。恒久回帰テスト（§7.1.1）の価値を PR ごとに自動化 |
 | backup 保持ポリシー（§4.2.2「実装時に決定」） | **最新5件は必ず残し、かつ30日以内のものも残す。削除条件 = 同一 BOM 内で新しい順の順位 > 5 **AND** 経過 > 30日** | 台帳（`bom_link_backup`）で管理。**削除対象外**: 未解決競合（`is_conflict=1 AND resolved_at IS NULL`）・`volume_temp`（移送途中）。ファイル削除に**成功したときだけ** `deleted_at` を記録し、失敗時は台帳・ファイルとも残して警告。台帳行は削除後も残す（監査可能性） |
-| デバウンス幅（§4.2.3/§7.2） | **PR-7 実装時に実測で決定**（初期値 500ms から調整） | Excel 保存のイベント発火回数は環境依存のため計画では固定しない |
+| デバウンス幅（§4.2.3/§7.2） | **初期値 500ms を実装**（`WATCH_DEBOUNCE`・PR-7）。実 Excel での発火回数は debug ビルドの校正ログ（watch.rs: 「N raw events → 合成」）で実測し、必要なら定数を調整する | Excel 保存のイベント発火回数は環境依存のため計画では固定しない |
 
 ## 1. V5 マイグレーション（ステップ4）
 
@@ -339,6 +339,34 @@ PR-6 実装の確定事項(フロント接続):
   tauri-plugin-opener をフロント直用(規定どおり)
 | `excel_link_remap(bom_id, request)` | **再マッピング**(Broken 修復・全列再指定 — PR-6 実装)。契約全置換 | `LinkedBomView` |
 | `excel_link_watch(bom_id, enable)` | 監視の開始/停止。検知は `emit("excel-link:changed")` → フロントが `excel_link_open` | `()` |
+
+PR-7 実装の確定事項:
+
+- **合成イベントは2種**: `excel-link:changed`（ワークブック変化 → フロントが `excel_link_open` で
+  再読込。Safe のみ自動適用は open の既存経路が担う = §4.2.3/§9-7）と
+  `excel-link:excel-closed`（`~$` オーナーファイルの**削除**を検知 = Excel が閉じた →
+  フロントが反映待ちありなら `excel_link_apply` を自動再試行 = **§9-5 の完成**）。
+  payload はどちらも `{ bomId }`。`~$` の作成等は §4.2.3 のフィルタ要件どおり無視
+- **ライフサイクル**: リンクエディタ表示中のみ有効（既定 ON・§4.2.3）。フロントの
+  useEffect が表示時に `watch(true)`+2イベント購読、離脱時に unlisten+`watch(false)`。
+  バックエンドは bom_id キーの HashMap（managed state）で BOM 単位トグル
+- **監視対象の解決は保存済み resolved path**（status の lock hint と同じ規則を
+  `stored_read_path` に共有化。check_env の再解決はしない — DB ロック下の軽量規約）。
+  未解決 .lnk は「一度リンクを開いてから」の Err
+- **リトライは watch に持たない**: 保存途中の部分読みは `read_stable` の指紋サンドイッチが
+  吸収し、open 失敗は次のデバウンス済みイベントが再トリガする（§4.2.3 の責任分界どおり、
+  監視は利便性トリガに徹する）
+- **フロント側の3不変条件**（PR-7 レビューで固定）:
+  (a) watch 由来の処理は1本のキューで**直列化**し、`Changed` の再読込完了 → 最新 status の
+  pending 確認 → `apply` の順を保証する（並行実行だと apply が古い `last_read_fp` を見て
+  `fingerprint_changed` になり pending が残る）。
+  (b) 進行中の操作（更新・反映・**EC 取得**・ウィザード）中の watch タスクは**開始も破棄もせず、
+  自分のキュー位置を保持したまま待つ**（再キューすると後続の ExcelClosed に追い越されて (a) が
+  崩れる。時間上限も設けない — EC 取得は数十秒に及び得るため、押し切ると古い世代を反映して
+  pending を消し latest-wins〔§4.2.1〕が崩れる）。破棄するのは離脱（cleanup で isAlive=false）
+  のときだけ。キュー実装は `src/lib/watchQueue.ts` に分離し、順序と非破棄を単体テストで固定する。
+  (c) effect の**所有権トークン**（世代＋bom_id）で、旧 cleanup が新しい watch を
+  `watch(false)` で止めないようにする（`React.StrictMode` の setup→cleanup→setup で実際に起きる）
 
 - 「Excel で編集」はファイル起動のみ（§4.2）→ 既存 `tauri-plugin-opener` をフロント直用、専用コマンドなし
 

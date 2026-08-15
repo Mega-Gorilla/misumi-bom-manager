@@ -23,6 +23,8 @@ import {
 import type { Workbook } from "./types/bom";
 import { applyLinkedColumns, getCellValue, buildExportGrid } from "./lib/columns";
 import type { LinkGridOptions } from "./lib/columns";
+import { createWatchQueue } from "./lib/watchQueue";
+import type { WatchQueue } from "./lib/watchQueue";
 import * as api from "./api/bom";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type {
@@ -95,7 +97,14 @@ export default function App() {
   const [confirmBack, setConfirmBack] = useState(false);
   const [activeTarget, setActiveTarget] = useState<HistoryTarget>({ kind: "empty", reason: "no-row" });
   const [quickFilter, setQuickFilter] = useState("");
-  const [quoting, setQuoting] = useState(false);
+  const [quoting, setQuotingState] = useState(false);
+  // EC 取得中かどうかは watch タスクの実行可否を決めるため、再レンダーを待たない
+  // 同期 ref を併設する (setQuoting 直後の窓を閉じる — PR-7 レビュー)。
+  const quotingRef = useRef(false);
+  const setQuoting = (v: boolean) => {
+    quotingRef.current = v;
+    setQuotingState(v);
+  };
   const [addingCart, setAddingCart] = useState(false);
   const [confirmCart, setConfirmCart] = useState<{
     items: api.CartItem[];
@@ -133,7 +142,14 @@ export default function App() {
   } | null>(null);
   const [linkConfirmOpen, setLinkConfirmOpen] = useState(false);
   const [linkConflictOpen, setLinkConflictOpen] = useState(false);
-  const [linkBusy, setLinkBusy] = useState(false);
+  const [linkBusy, setLinkBusyState] = useState(false);
+  // React state は再レンダーまで更新されないため、同時実行ガードには同期的な ref を
+  // 使う (watch 由来のイベントは同一ティックで連続到着し得る — PR-7 レビュー)。
+  const linkBusyRef = useRef(false);
+  const setLinkBusy = (v: boolean) => {
+    linkBusyRef.current = v;
+    setLinkBusyState(v);
+  };
   const gridRef = useRef<AgGridReact<BomRow>>(null);
   // JSON snapshot of the doc as of the last load/save; back() compares against it to detect
   // unsaved changes. A freshly created (untouched) BOM counts as clean, like Notepad.
@@ -242,6 +258,89 @@ export default function App() {
     };
   }, [linkedId, view]);
 
+  // ファイル監視 (PR-7・§4.2.3): リンクエディタ表示中のみ有効 (既定 ON)。
+  // 生イベントの判断は Rust 側 (親 dir 監視・デバウンス・~$ フィルタ) — ここは
+  // 合成イベントを受けて既存導線を呼ぶだけ。ハンドラは ref 経由で最新を参照する。
+  const watchRef = useRef<{
+    busy: boolean;
+    refresh: () => Promise<void>;
+    apply: () => Promise<void>;
+  }>({ busy: false, refresh: async () => {}, apply: async () => {} });
+
+  // watch 由来の処理は1本のキューで直列化する (lib/watchQueue.ts に切り出し・単体
+  // テストで固定): FIFO 厳守で Changed の再読込が完了してから ExcelClosed の
+  // apply が走り、busy 中は自分のキュー位置を保持したまま待つ (再キューしない —
+  // 後続に追い越されるため)。破棄は離脱 (cleanup) 時のみ (PR-7 レビュー)。
+  const watchQueueRef = useRef<WatchQueue | null>(null);
+  if (!watchQueueRef.current) {
+    watchQueueRef.current = createWatchQueue({
+      isBusy: () => linkBusyRef.current || quotingRef.current || watchRef.current.busy,
+    });
+  }
+  const watchQueue = watchQueueRef.current;
+
+  // watch の所有権トークン: StrictMode の setup→cleanup→setup や素早い再入場で、
+  // 旧 effect の cleanup が新 effect の watch を止めてしまうのを防ぐ (PR-7 レビュー)。
+  // 同じ BOM を新しい世代が所有していれば旧 cleanup は watch(false) を呼ばない
+  // (別 BOM なら必ず止める — 監視の残留を作らない)。
+  const watchGenRef = useRef(0);
+  const watchOwnerRef = useRef<{ gen: number; bomId: string } | null>(null);
+
+  useEffect(() => {
+    if (!linkedId || view !== "editor") return;
+    let alive = true;
+    const gen = ++watchGenRef.current;
+    watchOwnerRef.current = { gen, bomId: linkedId };
+    const isAlive = () => alive;
+    let unChanged: (() => void) | undefined;
+    let unClosed: (() => void) | undefined;
+    // listener を先に登録してから watch を有効化する (登録前に届いたイベントを
+    // 取りこぼさない)。cleanup は初期化 Promise の完了後に走らせ、watch(false) が
+    // watch(true) を追い越したり listener が残ったりしないようにする。
+    const ready = (async () => {
+      try {
+        unChanged = await api.onExcelLinkChanged((p) => {
+          if (!alive || p.bomId !== linkedId) return;
+          // §9-7: 保存検知 → 自動再読込 (Safe のみ自動適用は open の既存経路)。
+          watchQueue.enqueue(isAlive, () => watchRef.current.refresh());
+        });
+        if (!alive) return;
+        unClosed = await api.onExcelLinkExcelClosed((p) => {
+          if (!alive || p.bomId !== linkedId) return;
+          // §9-5 完成: Excel が閉じた → 反映待ちがあれば自動再試行。先行する
+          // Changed の再読込が終わってから、pending は DB へ問い合わせて判断する
+          // (React state は再レンダー待ちで古い可能性がある)。
+          watchQueue.enqueue(isAlive, async () => {
+            try {
+              const st = await api.excelLinkStatus(linkedId);
+              if (!alive || !st.pending) return;
+              await watchRef.current.apply();
+            } catch {
+              /* 次のイベント / 手動導線に委ねる (監視は利便性トリガ) */
+            }
+          });
+        });
+        if (!alive) return;
+        await api.excelLinkWatch(linkedId, true);
+      } catch (e) {
+        if (alive) setStatus(String(e));
+      }
+    })();
+    return () => {
+      alive = false;
+      void ready.then(() => {
+        unChanged?.();
+        unClosed?.();
+        // 同じ BOM をより新しい世代が所有していれば、その watch を止めてしまうため
+        // 呼ばない (バックエンドは bom_id キーの単一 handle なので、旧 cleanup の
+        // watch(false) が新しい watch を消し得る)。
+        const owner = watchOwnerRef.current;
+        const superseded = !!owner && owner.gen !== gen && owner.bomId === linkedId;
+        if (!superseded) void api.excelLinkWatch(linkedId, false).catch(() => {});
+      });
+    };
+  }, [linkedId, view]);
+
   /** リンク先ワークブックの実体パス (「Excel で編集」「フォルダを開く」用)。 */
   const linkWorkbookPath = (): string | undefined =>
     link?.env.readTarget ?? link?.env.resolvedPath ?? doc?.meta.importedFrom ?? undefined;
@@ -264,11 +363,13 @@ export default function App() {
 
   /** 「更新」= excel_link_open で再読込。 */
   const refreshLink = async () => {
-    if (!doc?.id || linkBusy) return;
-    if (!(await flushLinkedMeta())) return;
+    // 同期 ref で先にガードを立ててから await する (メタ保存中に2本目が
+    // 走り込むのを防ぐ — PR-7 レビュー)。
+    if (!doc?.id || linkBusyRef.current) return;
     setLinkBusy(true);
     setStatus("Excel から再読込しています…");
     try {
+      if (!(await flushLinkedMeta())) return;
       const view = await api.excelLinkOpen(doc.id);
       adoptLinkView(view);
       setStatus(view.warnings[0] ?? "更新しました");
@@ -281,11 +382,11 @@ export default function App() {
 
   /** 「Excel へ反映」= excel_link_apply。結果 kind ごとに UI を分岐 (§2.3)。 */
   const applyLink = async () => {
-    if (!doc?.id || linkBusy) return;
-    if (!(await flushLinkedMeta())) return;
+    if (!doc?.id || linkBusyRef.current) return;
     setLinkBusy(true);
     setStatus("Excel へ反映しています…");
     try {
+      if (!(await flushLinkedMeta())) return;
       const out = await api.excelLinkApply(doc.id);
       const warn = out.warnings.length > 0 ? `（警告: ${out.warnings[0]}）` : "";
       if (out.kind === "applied") {
@@ -318,6 +419,14 @@ export default function App() {
     } finally {
       setLinkBusy(false);
     }
+  };
+
+  // watch ハンドラが常に最新の状態・関数を見るための ref 更新 (毎レンダー)。
+  // refresh/apply は Promise を返す — キューが完了を待って直列化する。
+  watchRef.current = {
+    busy: linkBusy || quoting || !!linkWizard,
+    refresh: () => refreshLink(),
+    apply: () => applyLink(),
   };
 
   /** 数量倍率の変更 (§4.8: リンク BOM でも編集可な DB 所有メタ)。即時永続化。 */
@@ -358,6 +467,7 @@ export default function App() {
     )
       return;
     try {
+      await api.excelLinkWatch(doc.id, false).catch(() => {});
       await api.excelLinkUnlink(doc.id);
       setStatus("リンクを解除しました");
       await openBom(doc.id); // 従来 BOM として開き直す

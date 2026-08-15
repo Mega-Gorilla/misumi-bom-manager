@@ -32,6 +32,7 @@ csv = "1"                  # read/write CSV
 encoding_rs = "0.8"        # CSV decode (Shift-JIS fallback) / BOM handling
 sha2 = "0.10"              # content fingerprints for Excel link mode (plan §4.6.1)
 zip = "2"                  # xlsx zip walkers for Excel link mode (already in the tree via calamine)
+notify = "8"               # file watching for Excel link mode (plan §4.2.3 / PR-7)
 
 # Excel link mode environment checks (plan §4.10): reparse-tag walk, volume FS name,
 # .lnk resolution. Versions match what the dependency tree already locks.

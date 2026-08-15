@@ -41,6 +41,17 @@ use supplier::{provider_for, QuoteItem};
 /// DB commands are synchronous so the lock is never held across an `.await`.
 struct DbState(std::sync::Mutex<rusqlite::Connection>);
 
+/// Live file watchers for linked BOMs (PR-7), keyed by bom_id. Dropping a handle
+/// stops that watch; excel_link_watch(enable) inserts/removes entries.
+#[derive(Default)]
+struct LinkWatchers(
+    std::sync::Mutex<std::collections::HashMap<String, excel_link::watch::WatchHandle>>,
+);
+
+/// §0 初期値 500ms — Excel 保存の生イベント発火回数は環境依存のため、debug ビルドの
+/// 校正ログ (watch.rs) で実測して調整する。
+const WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+
 const BRIDGE_URL: &str = "https://jp.misumi-ec.com/order/part-number/create";
 /// MISUMI cart page — shown (in the authenticated bridge) by `misumi_open_cart`.
 const CART_URL: &str = "https://jp.misumi-ec.com/order/cart";
@@ -519,6 +530,42 @@ fn excel_link_confirm(
     excel_link::confirm_link(&mut conn, &bom_id, &resolution, &backup_dir)
 }
 
+/// Watch toggle (PR-7, §4.2.3): raw filesystem events are judged in Rust
+/// (parent-dir watch, debounce, `~$` filter) and only synthesized events reach
+/// the frontend — `excel-link:changed` (re-open) and `excel-link:excel-closed`
+/// (retry a pending apply, §9-5). Watching is a convenience trigger only;
+/// correctness stays with read-time verification and the pre-write fingerprint
+/// check.
+#[tauri::command]
+fn excel_link_watch(
+    app: AppHandle,
+    db: State<DbState>,
+    watchers: State<LinkWatchers>,
+    bom_id: String,
+    enable: bool,
+) -> Result<(), String> {
+    let mut map = watchers.0.lock().map_err(|e| e.to_string())?;
+    map.remove(&bom_id); // toggle/replace: any previous watch stops first
+    if !enable {
+        return Ok(());
+    }
+    let (dir, name) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        excel_link::watch::watch_target(&conn, &bom_id)?
+    };
+    let emitter = app.clone();
+    let id = bom_id.clone();
+    let handle = excel_link::watch::start_watch(&dir, &name, WATCH_DEBOUNCE, move |ev| {
+        let event = match ev {
+            excel_link::watch::WatchEvent::Changed => "excel-link:changed",
+            excel_link::watch::WatchEvent::ExcelClosed => "excel-link:excel-closed",
+        };
+        let _ = emitter.emit(event, serde_json::json!({ "bomId": id }));
+    })?;
+    map.insert(bom_id, handle);
+    Ok(())
+}
+
 /// Full contract remap — the Broken-repair path (PR-6). Keeps state/generation/
 /// EC snapshots, unlike unlink+create.
 #[tauri::command]
@@ -672,6 +719,7 @@ pub fn run() {
             std::fs::create_dir_all(&db_dir)?;
             let conn = db::open(&db_dir.join("misumi-bom.db"))?;
             app.manage(DbState(std::sync::Mutex::new(conn)));
+            app.manage(LinkWatchers::default());
 
             let bridge = Arc::new(Bridge::default());
             app.manage(bridge.clone());
@@ -752,6 +800,7 @@ pub fn run() {
             excel_link_confirm,
             excel_link_resolve_conflict,
             excel_link_remap,
+            excel_link_watch,
             bom_update_meta
         ])
         .run(tauri::generate_context!())
