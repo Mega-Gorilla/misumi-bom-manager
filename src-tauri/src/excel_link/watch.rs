@@ -41,6 +41,14 @@ pub enum WatchEvent {
     ExcelClosed,
 }
 
+/// What a RELEVANT raw event contributed. Classification happens in the notify
+/// callback so unrelated files never reach the debouncer (see start_watch).
+#[derive(Debug, Clone, Copy)]
+enum Raw {
+    Changed,
+    OwnerRemoved,
+}
+
 /// Keep this alive to keep watching; dropping it stops the watcher, which closes
 /// the event channel and ends the debounce thread.
 pub struct WatchHandle {
@@ -75,11 +83,28 @@ pub fn start_watch(
     let target = file_name.to_string_lossy().to_lowercase();
     let owner = format!("~${target}");
 
-    let (tx, rx) = mpsc::channel::<notify::Event>();
+    let (tx, rx) = mpsc::channel::<Raw>();
     let mut watcher =
         notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(ev) = res {
-                let _ = tx.send(ev); // receiver gone = watcher being dropped: ignore
+            let Ok(ev) = res else { return };
+            let removal = matches!(ev.kind, notify::EventKind::Remove(_));
+            for p in &ev.paths {
+                let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_lowercase()) else {
+                    continue;
+                };
+                // Filtering happens HERE, not in the debounce thread: an unrelated
+                // file in the same directory (cloud-sync churn, other workbooks)
+                // must not restart the quiet period and starve a synthesized event
+                // that is already due (PR-7 review).
+                if name == target {
+                    // Any raw kind counts: the atomic-replace save shows up as
+                    // remove/create/rename bursts depending on the OS.
+                    let _ = tx.send(Raw::Changed);
+                } else if name == owner && removal {
+                    // Owner-file CREATION (Excel opened the file) is noise for us
+                    // (§4.2.3: filter); only its removal means "Excel closed".
+                    let _ = tx.send(Raw::OwnerRemoved);
+                }
             }
         })
         .map_err(|e| format!("監視の初期化に失敗しました: {e}"))?;
@@ -93,24 +118,11 @@ pub fn start_watch(
         let mut raw_count = 0usize;
         loop {
             match rx.recv_timeout(debounce) {
-                Ok(ev) => {
+                Ok(raw) => {
                     raw_count += 1;
-                    for p in &ev.paths {
-                        let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_lowercase())
-                        else {
-                            continue;
-                        };
-                        if name == target {
-                            // Any raw kind counts: the atomic-replace save shows up
-                            // as remove/create/rename bursts depending on the OS.
-                            changed = true;
-                        } else if name == owner {
-                            // Owner-file CREATION (Excel opened the file) is noise
-                            // for us (§4.2.3: filter); only its removal matters.
-                            if matches!(ev.kind, notify::EventKind::Remove(_)) {
-                                excel_closed = true;
-                            }
-                        }
+                    match raw {
+                        Raw::Changed => changed = true,
+                        Raw::OwnerRemoved => excel_closed = true,
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -247,6 +259,34 @@ mod tests {
 
         std::fs::remove_file(&owner).unwrap();
         assert_eq!(drain(&rx), vec![WatchEvent::ExcelClosed]);
+    }
+
+    /// PR-7 review: unrelated churn in the SAME directory must not postpone a
+    /// synthesized event that is already due (cloud-sync folders produce exactly
+    /// this). The Changed must arrive while the noise is still flowing.
+    #[test]
+    fn unrelated_events_do_not_starve_the_debounce() {
+        let d = dir("starve");
+        let target = d.join("bom.xlsx");
+        std::fs::write(&target, b"v0").unwrap();
+        let (_h, rx) = start(&d, "bom.xlsx");
+
+        std::fs::write(&target, b"v1").unwrap(); // the one relevant change
+        let noise_dir = d.clone();
+        let noise = std::thread::spawn(move || {
+            // ~1.5s of churn at a shorter interval than the debounce window.
+            for i in 0..20 {
+                let _ = std::fs::write(noise_dir.join(format!("noise{i}.tmp")), b"x");
+                std::thread::sleep(DEBOUNCE / 2);
+            }
+        });
+
+        // Must land well before the noise stops (it would be starved otherwise).
+        let ev = rx
+            .recv_timeout(Duration::from_millis(1000))
+            .expect("Changed was starved by unrelated events");
+        assert_eq!(ev, WatchEvent::Changed);
+        noise.join().unwrap();
     }
 
     /// Dropping the handle stops the watcher (the excel_link_watch(enable=false)

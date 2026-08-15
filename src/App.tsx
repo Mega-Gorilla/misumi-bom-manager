@@ -133,7 +133,14 @@ export default function App() {
   } | null>(null);
   const [linkConfirmOpen, setLinkConfirmOpen] = useState(false);
   const [linkConflictOpen, setLinkConflictOpen] = useState(false);
-  const [linkBusy, setLinkBusy] = useState(false);
+  const [linkBusy, setLinkBusyState] = useState(false);
+  // React state は再レンダーまで更新されないため、同時実行ガードには同期的な ref を
+  // 使う (watch 由来のイベントは同一ティックで連続到着し得る — PR-7 レビュー)。
+  const linkBusyRef = useRef(false);
+  const setLinkBusy = (v: boolean) => {
+    linkBusyRef.current = v;
+    setLinkBusyState(v);
+  };
   const gridRef = useRef<AgGridReact<BomRow>>(null);
   // JSON snapshot of the doc as of the last load/save; back() compares against it to detect
   // unsaved changes. A freshly created (untouched) BOM counts as clean, like Notepad.
@@ -245,41 +252,83 @@ export default function App() {
   // ファイル監視 (PR-7・§4.2.3): リンクエディタ表示中のみ有効 (既定 ON)。
   // 生イベントの判断は Rust 側 (親 dir 監視・デバウンス・~$ フィルタ) — ここは
   // 合成イベントを受けて既存導線を呼ぶだけ。ハンドラは ref 経由で最新を参照する。
-  const watchRef = useRef({
-    busy: false,
-    pending: false,
-    refresh: () => {},
-    apply: () => {},
-  });
+  const watchRef = useRef<{
+    busy: boolean;
+    refresh: () => Promise<void>;
+    apply: () => Promise<void>;
+  }>({ busy: false, refresh: async () => {}, apply: async () => {} });
+
+  // watch 由来の処理は1本のキューで直列化する: 保存して閉じた場合 Changed と
+  // ExcelClosed が同じバーストで届くため、並行実行すると apply が古い
+  // last_read_fp を見て fingerprint_changed になり pending が残る (PR-7 レビュー)。
+  const watchQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const enqueueWatchTask = (task: () => Promise<void>) => {
+    watchQueueRef.current = watchQueueRef.current
+      .catch(() => {})
+      .then(task)
+      .catch(() => {});
+  };
+  /** 進行中のユーザー操作 (更新・反映・取得) の完了を待つ。上限つき。 */
+  const waitLinkIdle = async (timeoutMs = 8000) => {
+    const started = Date.now();
+    while (linkBusyRef.current || watchRef.current.busy) {
+      if (Date.now() - started > timeoutMs) return;
+      await new Promise((r) => setTimeout(r, 120));
+    }
+  };
+
   useEffect(() => {
     if (!linkedId || view !== "editor") return;
     let alive = true;
     let unChanged: (() => void) | undefined;
     let unClosed: (() => void) | undefined;
-    void (async () => {
+    // listener を先に登録してから watch を有効化する (登録前に届いたイベントを
+    // 取りこぼさない)。cleanup は初期化 Promise の完了後に走らせ、watch(false) が
+    // watch(true) を追い越したり listener が残ったりしないようにする。
+    const ready = (async () => {
       try {
-        await api.excelLinkWatch(linkedId, true);
         unChanged = await api.onExcelLinkChanged((p) => {
-          // §9-7: 保存検知 → 自動再読込 (Safe のみ自動適用 — open の既存経路)。
-          if (alive && p.bomId === linkedId && !watchRef.current.busy) {
-            watchRef.current.refresh();
-          }
+          if (!alive || p.bomId !== linkedId) return;
+          // §9-7: 保存検知 → 自動再読込 (Safe のみ自動適用は open の既存経路)。
+          enqueueWatchTask(async () => {
+            if (!alive) return;
+            await waitLinkIdle();
+            if (!alive) return;
+            await watchRef.current.refresh();
+          });
         });
+        if (!alive) return;
         unClosed = await api.onExcelLinkExcelClosed((p) => {
-          // §9-5 完成: Excel が閉じられた → 反映待ちがあれば自動再試行。
-          if (alive && p.bomId === linkedId && watchRef.current.pending && !watchRef.current.busy) {
-            watchRef.current.apply();
-          }
+          if (!alive || p.bomId !== linkedId) return;
+          // §9-5 完成: Excel が閉じた → 反映待ちがあれば自動再試行。先行する
+          // Changed の再読込が終わってから、pending は DB へ問い合わせて判断する
+          // (React state は再レンダー待ちで古い可能性がある)。
+          enqueueWatchTask(async () => {
+            if (!alive) return;
+            await waitLinkIdle();
+            if (!alive) return;
+            try {
+              const st = await api.excelLinkStatus(linkedId);
+              if (!alive || !st.pending) return;
+              await watchRef.current.apply();
+            } catch {
+              /* 次のイベント / 手動導線に委ねる (監視は利便性トリガ) */
+            }
+          });
         });
+        if (!alive) return;
+        await api.excelLinkWatch(linkedId, true);
       } catch (e) {
         if (alive) setStatus(String(e));
       }
     })();
     return () => {
       alive = false;
-      unChanged?.();
-      unClosed?.();
-      void api.excelLinkWatch(linkedId, false).catch(() => {});
+      void ready.then(() => {
+        unChanged?.();
+        unClosed?.();
+        void api.excelLinkWatch(linkedId, false).catch(() => {});
+      });
     };
   }, [linkedId, view]);
 
@@ -305,11 +354,13 @@ export default function App() {
 
   /** 「更新」= excel_link_open で再読込。 */
   const refreshLink = async () => {
-    if (!doc?.id || linkBusy) return;
-    if (!(await flushLinkedMeta())) return;
+    // 同期 ref で先にガードを立ててから await する (メタ保存中に2本目が
+    // 走り込むのを防ぐ — PR-7 レビュー)。
+    if (!doc?.id || linkBusyRef.current) return;
     setLinkBusy(true);
     setStatus("Excel から再読込しています…");
     try {
+      if (!(await flushLinkedMeta())) return;
       const view = await api.excelLinkOpen(doc.id);
       adoptLinkView(view);
       setStatus(view.warnings[0] ?? "更新しました");
@@ -322,11 +373,11 @@ export default function App() {
 
   /** 「Excel へ反映」= excel_link_apply。結果 kind ごとに UI を分岐 (§2.3)。 */
   const applyLink = async () => {
-    if (!doc?.id || linkBusy) return;
-    if (!(await flushLinkedMeta())) return;
+    if (!doc?.id || linkBusyRef.current) return;
     setLinkBusy(true);
     setStatus("Excel へ反映しています…");
     try {
+      if (!(await flushLinkedMeta())) return;
       const out = await api.excelLinkApply(doc.id);
       const warn = out.warnings.length > 0 ? `（警告: ${out.warnings[0]}）` : "";
       if (out.kind === "applied") {
@@ -362,11 +413,11 @@ export default function App() {
   };
 
   // watch ハンドラが常に最新の状態・関数を見るための ref 更新 (毎レンダー)。
+  // refresh/apply は Promise を返す — キューが完了を待って直列化する。
   watchRef.current = {
     busy: linkBusy || quoting,
-    pending: !!link?.pending,
-    refresh: () => void refreshLink(),
-    apply: () => void applyLink(),
+    refresh: () => refreshLink(),
+    apply: () => applyLink(),
   };
 
   /** 数量倍率の変更 (§4.8: リンク BOM でも編集可な DB 所有メタ)。即時永続化。 */
