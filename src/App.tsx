@@ -95,7 +95,14 @@ export default function App() {
   const [confirmBack, setConfirmBack] = useState(false);
   const [activeTarget, setActiveTarget] = useState<HistoryTarget>({ kind: "empty", reason: "no-row" });
   const [quickFilter, setQuickFilter] = useState("");
-  const [quoting, setQuoting] = useState(false);
+  const [quoting, setQuotingState] = useState(false);
+  // EC 取得中かどうかは watch タスクの実行可否を決めるため、再レンダーを待たない
+  // 同期 ref を併設する (setQuoting 直後の窓を閉じる — PR-7 レビュー)。
+  const quotingRef = useRef(false);
+  const setQuoting = (v: boolean) => {
+    quotingRef.current = v;
+    setQuotingState(v);
+  };
   const [addingCart, setAddingCart] = useState(false);
   const [confirmCart, setConfirmCart] = useState<{
     items: api.CartItem[];
@@ -268,18 +275,47 @@ export default function App() {
       .then(task)
       .catch(() => {});
   };
-  /** 進行中のユーザー操作 (更新・反映・取得) の完了を待つ。上限つき。 */
-  const waitLinkIdle = async (timeoutMs = 8000) => {
+  /** 進行中の操作 (更新・反映・EC 取得・ウィザード) の完了を待つ。
+   *  戻り値 false = 上限まで待っても idle にならなかった。 */
+  const waitLinkIdle = async (timeoutMs = 8000): Promise<boolean> => {
     const started = Date.now();
-    while (linkBusyRef.current || watchRef.current.busy) {
-      if (Date.now() - started > timeoutMs) return;
+    while (linkBusyRef.current || quotingRef.current || watchRef.current.busy) {
+      if (Date.now() - started > timeoutMs) return false;
       await new Promise((r) => setTimeout(r, 120));
     }
+    return true;
   };
+
+  /** busy 中は watch 由来の処理を「開始も破棄もしない」— idle になるまで再キューする。
+   *  EC 取得は 8 秒を超え得るため、待機上限で押し切ると古い世代を反映して pending を
+   *  消し、latest-wins (§4.2.1) と §9-5 の自動再試行が崩れる (PR-7 レビュー)。
+   *  それでも idle にならないまま上限回数に達したら諦める — 監視は利便性トリガであり、
+   *  バナーの「反映待ち・再実行」導線が最後の受け皿になる。 */
+  const enqueueWhenIdle = (isAlive: () => boolean, task: () => Promise<void>, attempts = 8) => {
+    enqueueWatchTask(async () => {
+      if (!isAlive()) return;
+      if (!(await waitLinkIdle())) {
+        if (isAlive() && attempts > 0) enqueueWhenIdle(isAlive, task, attempts - 1);
+        return;
+      }
+      if (!isAlive()) return;
+      await task();
+    });
+  };
+
+  // watch の所有権トークン: StrictMode の setup→cleanup→setup や素早い再入場で、
+  // 旧 effect の cleanup が新 effect の watch を止めてしまうのを防ぐ (PR-7 レビュー)。
+  // 同じ BOM を新しい世代が所有していれば旧 cleanup は watch(false) を呼ばない
+  // (別 BOM なら必ず止める — 監視の残留を作らない)。
+  const watchGenRef = useRef(0);
+  const watchOwnerRef = useRef<{ gen: number; bomId: string } | null>(null);
 
   useEffect(() => {
     if (!linkedId || view !== "editor") return;
     let alive = true;
+    const gen = ++watchGenRef.current;
+    watchOwnerRef.current = { gen, bomId: linkedId };
+    const isAlive = () => alive;
     let unChanged: (() => void) | undefined;
     let unClosed: (() => void) | undefined;
     // listener を先に登録してから watch を有効化する (登録前に届いたイベントを
@@ -290,12 +326,7 @@ export default function App() {
         unChanged = await api.onExcelLinkChanged((p) => {
           if (!alive || p.bomId !== linkedId) return;
           // §9-7: 保存検知 → 自動再読込 (Safe のみ自動適用は open の既存経路)。
-          enqueueWatchTask(async () => {
-            if (!alive) return;
-            await waitLinkIdle();
-            if (!alive) return;
-            await watchRef.current.refresh();
-          });
+          enqueueWhenIdle(isAlive, () => watchRef.current.refresh());
         });
         if (!alive) return;
         unClosed = await api.onExcelLinkExcelClosed((p) => {
@@ -303,10 +334,7 @@ export default function App() {
           // §9-5 完成: Excel が閉じた → 反映待ちがあれば自動再試行。先行する
           // Changed の再読込が終わってから、pending は DB へ問い合わせて判断する
           // (React state は再レンダー待ちで古い可能性がある)。
-          enqueueWatchTask(async () => {
-            if (!alive) return;
-            await waitLinkIdle();
-            if (!alive) return;
+          enqueueWhenIdle(isAlive, async () => {
             try {
               const st = await api.excelLinkStatus(linkedId);
               if (!alive || !st.pending) return;
@@ -327,7 +355,12 @@ export default function App() {
       void ready.then(() => {
         unChanged?.();
         unClosed?.();
-        void api.excelLinkWatch(linkedId, false).catch(() => {});
+        // 同じ BOM をより新しい世代が所有していれば、その watch を止めてしまうため
+        // 呼ばない (バックエンドは bom_id キーの単一 handle なので、旧 cleanup の
+        // watch(false) が新しい watch を消し得る)。
+        const owner = watchOwnerRef.current;
+        const superseded = !!owner && owner.gen !== gen && owner.bomId === linkedId;
+        if (!superseded) void api.excelLinkWatch(linkedId, false).catch(() => {});
       });
     };
   }, [linkedId, view]);
@@ -415,7 +448,7 @@ export default function App() {
   // watch ハンドラが常に最新の状態・関数を見るための ref 更新 (毎レンダー)。
   // refresh/apply は Promise を返す — キューが完了を待って直列化する。
   watchRef.current = {
-    busy: linkBusy || quoting,
+    busy: linkBusy || quoting || !!linkWizard,
     refresh: () => refreshLink(),
     apply: () => applyLink(),
   };

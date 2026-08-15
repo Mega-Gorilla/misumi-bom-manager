@@ -356,6 +356,15 @@ PR-7 実装の確定事項:
 - **リトライは watch に持たない**: 保存途中の部分読みは `read_stable` の指紋サンドイッチが
   吸収し、open 失敗は次のデバウンス済みイベントが再トリガする（§4.2.3 の責任分界どおり、
   監視は利便性トリガに徹する）
+- **フロント側の3不変条件**（PR-7 レビューで固定）:
+  (a) watch 由来の処理は1本のキューで**直列化**し、`Changed` の再読込完了 → 最新 status の
+  pending 確認 → `apply` の順を保証する（並行実行だと apply が古い `last_read_fp` を見て
+  `fingerprint_changed` になり pending が残る）。
+  (b) 進行中の操作（更新・反映・**EC 取得**・ウィザード）中は watch タスクを**開始も破棄もせず
+  再キュー**する（EC 取得は 8 秒を超え得るため、待機上限で押し切ると古い世代を反映して
+  pending を消し、latest-wins〔§4.2.1〕が崩れる）。
+  (c) effect の**所有権トークン**（世代＋bom_id）で、旧 cleanup が新しい watch を
+  `watch(false)` で止めないようにする（`React.StrictMode` の setup→cleanup→setup で実際に起きる）
 
 - 「Excel で編集」はファイル起動のみ（§4.2）→ 既存 `tauri-plugin-opener` をフロント直用、専用コマンドなし
 
